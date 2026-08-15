@@ -3,7 +3,12 @@ pub mod disconnected_overlay;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 mod migrate;
-#[cfg(target_os = "macos")]
+// omega: `open_listener` is cross-platform machinery (open-urls, CLI
+// handoff, single-instance forwarding). The `#[cfg(target_os = "macos")]`
+// above it was orphaned from `move_to_applications` (upstream zed#54719,
+// 602cf8f6c7e) when 6ebe8fd159 deleted that module; it wrongly gated
+// `open_listener` to macOS and broke Windows/Linux builds (E0432 at
+// zed.rs:57, main.rs:70/75, open_url_modal.rs:10, windows_only_instance.rs:26).
 mod open_listener;
 mod open_url_modal;
 mod quick_action_bar;
