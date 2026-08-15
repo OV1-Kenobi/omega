@@ -121,7 +121,7 @@ fn send_args_to_instance(args: &Args) -> anyhow::Result<()> {
     let request = {
         let mut paths = vec![];
         let mut urls = vec![];
-        let mut diff_paths = vec![];
+        let diff_paths = vec![];
         for path in args.paths_or_urls.iter() {
             match std::fs::canonicalize(&path) {
                 Ok(path) => paths.push(path.to_string_lossy().into_owned()),
@@ -140,17 +140,6 @@ fn send_args_to_instance(args: &Args) -> anyhow::Result<()> {
             }
         }
 
-        for path in args.diff.chunks(2) {
-            let old = std::fs::canonicalize(&path[0]).log_err();
-            let new = std::fs::canonicalize(&path[1]).log_err();
-            if let Some((old, new)) = old.zip(new) {
-                diff_paths.push([
-                    old.to_string_lossy().into_owned(),
-                    new.to_string_lossy().into_owned(),
-                ]);
-            }
-        }
-
         CliRequest::Open {
             paths,
             urls,
@@ -161,7 +150,6 @@ fn send_args_to_instance(args: &Args) -> anyhow::Result<()> {
             open_behavior: Default::default(),
             env: None,
             user_data_dir: args.user_data_dir.clone(),
-            dev_container: args.dev_container,
             cwd: std::env::current_dir().ok(),
         }
     };
