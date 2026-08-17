@@ -6,6 +6,8 @@ import { createInterface } from "node:readline";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createCredentialStoreSigner } from "./source-summarization-signer.mjs";
+
 export const PROTOCOL_VERSION = "2025-11-25";
 export const SERVER_NAME = "omega-source-summarization";
 export const SERVER_VERSION = "0.1.0";
@@ -1266,7 +1268,7 @@ export async function parseAndHandleLine(server, line) {
   }
 }
 
-export function runStdio(server = createServer()) {
+export function runStdio(server = createServer({ signer: createCredentialStoreSigner() })) {
   const input = createInterface({ input: process.stdin });
   input.on("line", (line) => {
     void parseAndHandleLine(server, line).then((response) => {
