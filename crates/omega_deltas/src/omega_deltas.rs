@@ -252,6 +252,7 @@ pub const ENFORCED_DELTAS: &[&str] = &[
     "OMEGA-DELTA-0279",
     "OMEGA-DELTA-0280",
     "OMEGA-DELTA-0281",
+    "OMEGA-DELTA-0282",
 ];
 
 /// OMEGA-DELTA-0281. `eval_cli` is a headless production tool. These direct
@@ -274,6 +275,14 @@ pub const EVAL_CLI_FORBIDDEN_DIRECT_DEPENDENCIES: &[&str] = &[
     "webrtc-sys",
     "workspace",
 ];
+
+/// OMEGA-DELTA-0282. Where the library store extension lives (max_dbs,
+/// `library.db`, the personal-only write gate, the search layer).
+pub const PROMPT_STORE_PATH: &str = "crates/prompt_store/src/prompt_store.rs";
+
+/// OMEGA-DELTA-0282. Where the library record shapes, scope enum, and search
+/// filters live.
+pub const LIBRARY_MODULE_PATH: &str = "crates/prompt_store/src/library.rs";
 
 /// OMEGA-DELTA-0204. Every control the composer's bar offers, written twice:
 /// what draws it before a session exists, and what draws it after.
@@ -32039,5 +32048,55 @@ mod tests {
              Keep the production evaluator headless; do not restore the desktop UI, workspace, \
              terminal-view, or LiveKit/WebRTC graph."
         );
+    }
+
+    /// OMEGA-DELTA-0282. The prompt library store carries saved-analysis and
+    /// capability records in a sibling `library.db`, with serde-defaulted
+    /// organization fields and a personal-only write path. Upstream Zed's
+    /// prompt store has none of these, so reinstating the upstream-only shape
+    /// (or dropping the library fields) fails this check.
+    #[test]
+    fn library_store_carries_saved_analyses_and_capabilities() {
+        let store = without_comments(&read_repository_file(PROMPT_STORE_PATH));
+        for required in [
+            ".max_dbs(6)",
+            "Some(\"library.db\")",
+            "pub fn save_library_record",
+            "pub fn get_library_record",
+            "pub fn search_library",
+            "pub fn delete_library_record",
+            "shared library records are not writable in V1",
+            // Serde-defaulted organization fields on PromptMetadata: without
+            // defaults the fail-open cache would drop every legacy row.
+            "pub scope: LibraryScope",
+            "pub folder: Option<String>",
+            "pub tags: Vec<String>",
+            "pub category: Option<String>",
+        ] {
+            assert!(
+                store.contains(required),
+                "OMEGA-DELTA-0282: prompt_store lost `{required}`"
+            );
+        }
+        let library = without_comments(&read_repository_file(LIBRARY_MODULE_PATH));
+        for required in [
+            "pub enum LibraryScope",
+            "#[default]",
+            "SavedAnalysis(SavedAnalysisRecord)",
+            "#[serde(rename = \"saved-analysis\")]",
+            "Capability(CapabilityRecord)",
+            "#[serde(rename = \"capability\")]",
+            "pub struct SavedAnalysisRecord",
+            "pub struct CapabilityRecord",
+            "pub struct PaymentTerms",
+            "pub struct OperatorIdentity",
+            "pub struct LibrarySearchFilters",
+            "pub struct LibrarySearchResult",
+        ] {
+            assert!(
+                library.contains(required),
+                "OMEGA-DELTA-0282: library module lost `{required}`"
+            );
+        }
     }
 }

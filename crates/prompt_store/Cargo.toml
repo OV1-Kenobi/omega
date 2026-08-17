@@ -11,6 +11,12 @@ workspace = true
 [lib]
 path = "src/prompt_store.rs"
 
+# OMEGA-DELTA-0282. Headless stdio bridge the source-summarization MCP
+# server shells out to; no new dependencies, reuse the [dependencies] set.
+[[bin]]
+name = "library_cli"
+path = "src/bin/library_cli.rs"
+
 [dependencies]
 agent_skills.workspace = true
 anyhow.workspace = true

@@ -10921,3 +10921,26 @@ tracked pre-push policy gate as adding it to the ordinary dependency table.
 
 - **Enforced by:** `eval_cli_direct_dependencies_remain_headless` in
   `omega_deltas`, run by `script/omega-preflight` on every tracked push.
+
+### OMEGA-DELTA-0282 - The prompt library store carries saved analyses and capabilities
+
+Upstream Zed's `prompt_store` is exactly what its name says: prompt records
+(id, title, default, saved_at) in `metadata.v2`/`bodies.v2` with no
+search, organization, or scope. Omega's prompt library store additionally
+holds two record kinds (`saved-analysis` — the M5 discoverable mirror of a
+digest-signed source analysis, and `capability` — the M9 discovery-catalog
+shape) in a sibling `library.db`, plus searchable organization metadata
+(folder/tag/category) and a modeled personal-vs-shared scope boundary on
+every record (PRD §5.6, WP10 design note).
+
+Why: the founder-approved source-summarization program (PRD 2026-08-16,
+M5/M8/M9) needs saved analyses to be searchable and reopenable inside Omega
+and capability records to seed the discovery catalog, with no new datastore
+(PRD §5.6) and no invented schema beyond #316's requested primitives. Prompt
+records stay backward compatible (serde-defaulted new fields) so existing
+rows decode unchanged; the personal-only write path rejects `shared` in V1;
+search is a full in-memory substring pass over the existing cache seam (the
+WP10 scale guard is the re-evaluation trigger, not a schema change).
+
+- **Enforced by:** `library_store_carries_saved_analyses_and_capabilities` in
+  `omega_deltas` plus the `prompt_store` migration and round-trip tests.
