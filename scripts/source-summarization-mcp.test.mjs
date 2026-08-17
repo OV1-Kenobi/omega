@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -14,6 +15,7 @@ import {
   parseAndHandleLine,
   sha256Hex,
 } from "./source-summarization-mcp.mjs";
+import { provisionSignerIdentity } from "./source-summarization-signer.mjs";
 
 const SCRIPT_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "source-summarization-mcp.mjs");
 const FIXED_TIME = new Date("2026-08-16T12:00:00.000Z");
@@ -325,49 +327,124 @@ test("the default signer fails closed without a fake production signature", asyn
 });
 
 test("stdio is newline-delimited JSON-RPC and stderr contains no request content", async () => {
-  const requests = [
-    { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
-    {
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: {
-        name: "summarize_source",
-        arguments: {
-          url: "https://private.example.test/secret-path",
-          content: "PRIVATE_SYNTHETIC_SOURCE_CONTENT",
-          source_title: "PRIVATE_SYNTHETIC_TITLE",
-          summary: "Private synthetic summary.",
-          key_points: ["Private synthetic point."],
+  // Isolate the spawned server's signer store from ambient machine state so the
+  // child is deterministically UNPROVISIONED and fails closed, regardless of
+  // whether a real signer has been provisioned on this machine.
+  const unprovisionedDir = mkdtempSync(join(tmpdir(), "omega-ss-unprovisioned-"));
+  try {
+    const requests = [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "summarize_source",
+          arguments: {
+            url: "https://private.example.test/secret-path",
+            content: "PRIVATE_SYNTHETIC_SOURCE_CONTENT",
+            source_title: "PRIVATE_SYNTHETIC_TITLE",
+            summary: "Private synthetic summary.",
+            key_points: ["Private synthetic point."],
+          },
         },
       },
-    },
-  ];
-  const child = spawn(process.execPath, [SCRIPT_PATH], { stdio: ["pipe", "pipe", "pipe"] });
-  let stdout = "";
-  let stderr = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => {
-    stdout += chunk;
-  });
-  child.stderr.on("data", (chunk) => {
-    stderr += chunk;
-  });
-  for (const request of requests) child.stdin.write(`${JSON.stringify(request)}\n`);
-  child.stdin.end();
-  const exitCode = await new Promise((resolveExit, rejectExit) => {
-    child.once("error", rejectExit);
-    child.once("close", resolveExit);
-  });
-  assert.equal(exitCode, 0);
-  const responses = stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line));
-  assert.equal(responses.length, 2);
-  assert.equal(responses[0].result.protocolVersion, "2025-11-25");
-  assert.equal(responses[1].result.isError, true);
-  assert.equal(stderr, "");
-  for (const secret of ["private.example.test", "PRIVATE_SYNTHETIC_SOURCE_CONTENT", "PRIVATE_SYNTHETIC_TITLE"]) {
-    assert.equal(stderr.includes(secret), false);
+    ];
+    const child = spawn(process.execPath, [SCRIPT_PATH], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, OMEGA_SOURCE_SUMMARIZATION_SIGNER_DIR: unprovisionedDir },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    for (const request of requests) child.stdin.write(`${JSON.stringify(request)}\n`);
+    child.stdin.end();
+    const exitCode = await new Promise((resolveExit, rejectExit) => {
+      child.once("error", rejectExit);
+      child.once("close", resolveExit);
+    });
+    assert.equal(exitCode, 0);
+    const responses = stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    assert.equal(responses.length, 2);
+    assert.equal(responses[0].result.protocolVersion, "2025-11-25");
+    assert.equal(responses[1].result.isError, true);
+    assert.equal(stderr, "");
+    for (const secret of ["private.example.test", "PRIVATE_SYNTHETIC_SOURCE_CONTENT", "PRIVATE_SYNTHETIC_TITLE"]) {
+      assert.equal(stderr.includes(secret), false);
+    }
+  } finally {
+    rmSync(unprovisionedDir, { recursive: true, force: true });
+  }
+});
+
+test("an isolated provisioned signer dir makes the stdio server sign deterministically", async () => {
+  // Mirror of the unprovisioned stdio test: provision a throwaway signer in an
+  // isolated temp dir, point the spawned server at it, and assert the tool now
+  // returns a real signed artifact. Locks in the post-provisioning path
+  // deterministically without touching any real signer store.
+  const provisionedDir = mkdtempSync(join(tmpdir(), "omega-ss-provisioned-"));
+  try {
+    const npub = await provisionSignerIdentity({ storageDir: provisionedDir });
+    const requests = [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "summarize_source",
+          arguments: {
+            url: "https://provisioned.example.test/source",
+            content: "PROVISIONED_SYNTHETIC_SOURCE_CONTENT",
+            source_title: "PROVISIONED_SYNTHETIC_TITLE",
+            summary: "Provisioned synthetic summary.",
+            key_points: ["Provisioned synthetic point."],
+          },
+        },
+      },
+    ];
+    const child = spawn(process.execPath, [SCRIPT_PATH], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, OMEGA_SOURCE_SUMMARIZATION_SIGNER_DIR: provisionedDir },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    for (const request of requests) child.stdin.write(`${JSON.stringify(request)}\n`);
+    child.stdin.end();
+    const exitCode = await new Promise((resolveExit, rejectExit) => {
+      child.once("error", rejectExit);
+      child.once("close", resolveExit);
+    });
+    assert.equal(exitCode, 0);
+    const responses = stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    assert.equal(responses.length, 2);
+    assert.equal(responses[0].result.protocolVersion, "2025-11-25");
+    assert.ok(!responses[1].result.isError, "the second response must not be an error when provisioned");
+    const artifact = JSON.parse(responses[1].result.content[0].text);
+    assert.match(artifact.integrity.publisher_signature, /^[0-9a-f]{128}$/);
+    assert.match(artifact.integrity.publisher_npub, /^npub1[0-9a-z]+$/);
+    assert.equal(artifact.integrity.publisher_npub, npub);
+    assert.equal(stderr, "");
+    for (const secret of ["provisioned.example.test", "PROVISIONED_SYNTHETIC_SOURCE_CONTENT", "PROVISIONED_SYNTHETIC_TITLE"]) {
+      assert.equal(stderr.includes(secret), false);
+    }
+  } finally {
+    rmSync(provisionedDir, { recursive: true, force: true });
   }
 });
 
