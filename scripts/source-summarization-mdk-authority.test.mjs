@@ -38,7 +38,7 @@ const VALID_ARGS = {
   capability: "summarize",
   version: "1.0.0",
   amountSats: 21,
-  serviceIdentity: "Livingry-ops",
+  serviceIdentity: "Livingry Ops",
   clientId: "client-a",
 };
 

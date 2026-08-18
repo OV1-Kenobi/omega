@@ -1,7 +1,7 @@
 # Source-Summarization WP6 — Public L-402 MCP Design Note
 
 - Date: 2026-08-18
-- Author: Livingry Services (Michael Ovsen, founder; Livingry engineering team)
+- Author: Livingry Services / Ov1 (Livingry engineering team)
 - Branch: `feat/source-summarization-wp6-public` (fork: github.com/OV1-Kenobi/omega)
 - Status: IMPLEMENTED AND TESTED LOCALLY (paddock grade). Nothing in this note or the branch is deployed, exposed, or operating live. Live provider behavior (MoneyDevKit hosted node, Zeus NWC, bLIP-26 conformance) is Requires Verification until staging.
 - Evidence labels: **Verified Fact** (supported by the code/tests in this branch or the referenced PR), **Requires Verification** (live/vendor state, to be confirmed at staging), **Strategic Opinion** (engineering judgment).
@@ -46,9 +46,24 @@ We want to seed the marketplace with a working pay-per-use MCP: a capability an 
 
 Implementation and local verification complete. Remaining before exposure: operator provisioning (Tailscale Funnel for public ingress with hidden IP + automatic TLS; MDK account; Windows service identities), staging evidence collection (keyless property, real L-402 round trip, single-winner under real counters, content-free audit, P12 at rest, NWC export below/above thresholds), security re-verification, and staged exposure — alpha (free beta allowance) then paid — each behind an explicit authorization. Nothing is deployed, exposed, or spent yet.
 
-## 7. Open questions for the OpenAgents team (what we need to conform, not guess)
+## 7. Second capability — video/audio review (transcription, summary, discussion)
 
-1. **Plugin Store entry model**: exact fields for a plugin entry (identity, theme, description, bundled MCPs, pricing)? We drafted a provisional model with the URL-summarization MCP as the first bundled capability — please correct to the canonical shape.
+The source-summarization product is planned as a **two-capability bundle**, both behind the same L-402 gate on the public tier:
+
+1. **Source summarization** (this branch, PR 315 lineage) — text/URL/content ingestion, grounded summary, follow-up Q&A, signed artifacts.
+2. **Video/audio review** (planned; groundwork exists) — a local transcription worker (fully local speech-to-text) already provides transcript, summary, and discussion of video/audio for the operator's own OpenCode agents. The plan is to deliver this capability to the operator's Omega agent **locally first, at no cost** (same personal-surface posture as the V1 local MCP), and then **activate the L-402 pay-gate for it on the public tier once it has been tested and staged properly**, exactly like the first capability.
+
+Design notes for the second capability:
+- **Local-first sequencing:** the operator's Omega agent gets video/audio review as a local, no-cost capability first (consistent with the product's "founder uses it at no cost" principle); the public L-402 surface for it activates only after its own staging evidence.
+- **Public-tier content contract:** consistent with this design's no-egress posture, the public tier accepts the transcript provided by the caller (or text derived from the media) rather than the server performing transcription — transcription stays on the operator's local machine (fully local, no cloud transcription). [Requires Verification: exact tool contract for the public video-review capability fixed at implementation.]
+- **Same rails:** the second capability rides the identical keyless L-402 gate, content-free records, receipt, P12, NWC, and sats surfaces — no new payment architecture.
+- **Plugin framing:** the plugin then bundles two L-402 MCP capabilities (source summarization + video/audio review) under one entry — which is why question 1 in section 8 (bundled MCPs in a plugin) matters for both.
+
+Status: **planned — not yet implemented in this branch.** This note records the intent and the design posture so the second capability inherits the same review path rather than being invented later.
+
+## 8. Open questions for the OpenAgents team (what we need to conform, not guess)
+
+1. **Plugin Store entry model**: exact fields for a plugin entry (identity, theme, description, bundled MCPs, pricing)? We drafted a provisional model with the URL-summarization MCP as the first bundled capability, and video/audio review as the second — please correct to the canonical shape.
 2. **Catalog/discovery records and receipts**: a canonical schema for capability records and payment/usage receipts we should conform to? We deliberately committed to none until confirmed.
 3. **Marketplace billing conventions for agent-pays L-402**: budgets (we use NWC/NIP-47), receipt expectations, failure/refund semantics.
 4. **MCP distribution in a plugin**: for a plugin bundling a remote HTTP(S) MCP, what does the store expect (stdio vs remote, endpoint registration, health/readiness)?
