@@ -188,6 +188,26 @@ test("opaque client ids are stable, keyed by the server secret, and never the ma
   assert.notEqual(first, otherClient);
   assert.notEqual(first, otherSecret);
   assert.match(first, /^[0-9a-f]{32}$/);
+  // HMAC contract (O2-P3): secret confusion — the same material under
+  // different server secrets — yields pairwise-distinct ids.
+  const secretConfusion = ["server-secret", "server-secret-2", "server-secret-3"].map((secret) =>
+    deriveOpaqueClientId(secret, "client-a"),
+  );
+  for (const id of secretConfusion) assert.match(id, /^[0-9a-f]{32}$/);
+  for (let i = 0; i < secretConfusion.length; i += 1) {
+    for (let j = i + 1; j < secretConfusion.length; j += 1) {
+      assert.notEqual(secretConfusion[i], secretConfusion[j], `secrets ${i} and ${j} must not collide`);
+    }
+  }
+  // HMAC contract (O2-P3): output is stable under the same secret across
+  // repeated calls, for any material.
+  for (const material of ["client-a", "client-b", "different-material"]) {
+    assert.equal(
+      deriveOpaqueClientId("stable-secret", material),
+      deriveOpaqueClientId("stable-secret", material),
+      `material ${material} must be stable under the same secret`,
+    );
+  }
 });
 
 test("sha256Hex matches node crypto for the preimage check", () => {

@@ -48,6 +48,7 @@
 
 import {
   createHash,
+  createHmac,
   generateKeyPairSync,
   randomBytes,
   randomUUID,
@@ -103,11 +104,14 @@ export function sha256Hex(value) {
   return createHash("sha256").update(typeof value === "string" ? Buffer.from(value) : value).digest("hex");
 }
 
-// Opaque pseudonymous client identifier per PRD P10: HMAC over caller-supplied
-// opaque material with a server-side secret. Never derived from request
-// content; the material itself is never stored.
+// Opaque pseudonymous client identifier per PRD P10: HMAC-SHA256 over the
+// caller-supplied opaque material, keyed with a server-side secret (a real
+// keyed MAC, not a keyed-by-concatenation hash). The version prefix is
+// message content, never key material. Never derived from request content;
+// the material itself is never stored. Output keeps the original 32-hex-char
+// format so callers and stored records remain format-compatible.
 export function deriveOpaqueClientId(secret, material) {
-  return createHash("sha256").update(`client-v1:${secret}:${material}`).digest("hex").slice(0, 32);
+  return createHmac("sha256", secret).update(`client-v1:${material}`).digest("hex").slice(0, 32);
 }
 
 // ---------------------------------------------------------------------------
