@@ -46,29 +46,43 @@ We want to seed the marketplace with a working pay-per-use MCP: a capability an 
 
 Implementation and local verification complete. Remaining before exposure: operator provisioning (Tailscale Funnel for public ingress with hidden IP + automatic TLS; MDK account; Windows service identities), staging evidence collection (keyless property, real L-402 round trip, single-winner under real counters, content-free audit, P12 at rest, NWC export below/above thresholds), security re-verification, and staged exposure — alpha (free beta allowance) then paid — each behind an explicit authorization. Nothing is deployed, exposed, or spent yet.
 
-## 7. Second capability — video/audio review (transcription, summary, discussion)
+## 7. Second capability — media transcription & discussion MCP (video/audio review)
 
-The source-summarization product is planned as a **two-capability bundle**, both behind the same L-402 gate on the public tier:
+The source-summarization product is a **two-capability bundle**, both behind the same L-402 gate family on the public tier:
 
-1. **Source summarization** (this branch, PR 315 lineage) — text/URL/content ingestion, grounded summary, follow-up Q&A, signed artifacts.
-2. **Video/audio review** (planned; groundwork exists) — a local transcription worker (fully local speech-to-text) already provides transcript, summary, and discussion of video/audio for the operator's own OpenCode agents. The plan is to deliver this capability to the operator's Omega agent **locally first, at no cost** (same personal-surface posture as the V1 local MCP), and then **activate the L-402 pay-gate for it on the public tier once it has been tested and staged properly**, exactly like the first capability.
+1. **Source summarization** (this branch, PR 315 lineage) — text/URL/content ingestion, grounded summary, follow-up Q&A, signed artifacts. Capability #1 (`capability_id: "source-summarization"`).
+2. **Media transcription & discussion** (designed; groundwork validated) — uploads, authorized YouTube URLs, and direct media URLs become a timestamped transcript, faithful summary, grounded discussion, exports, and optional still frames, via a fully local engine (faster-whisper; no cloud transcription). Capability #2 (`capability_id: "media-transcription-discussion"`, server id `media-summarization`; tools `transcribe_media`/`summarize_media`/`ask_media`/`export_transcript`/`extract_media_frames`/job tools; duration-band sats pricing). Sequencing set by the operator: local first at no cost in Omega, then L-402-gated on the public tier after its own staging evidence — same rails, no new payment system.
 
 Design notes for the second capability:
-- **Local-first sequencing:** the operator's Omega agent gets video/audio review as a local, no-cost capability first (consistent with the product's "founder uses it at no cost" principle); the public L-402 surface for it activates only after its own staging evidence.
-- **Public-tier content contract:** consistent with this design's no-egress posture, the public tier accepts the transcript provided by the caller (or text derived from the media) rather than the server performing transcription — transcription stays on the operator's local machine (fully local, no cloud transcription). [Requires Verification: exact tool contract for the public video-review capability fixed at implementation.]
-- **Same rails:** the second capability rides the identical keyless L-402 gate, content-free records, receipt, P12, NWC, and sats surfaces — no new payment architecture.
-- **Plugin framing:** the plugin then bundles two L-402 MCP capabilities (source summarization + video/audio review) under one entry — which is why question 1 in section 8 (bundled MCPs in a plugin) matters for both.
+- **Local-first sequencing:** delivered to the operator's Omega agent at no cost first (founder-uses-at-no-cost principle); the public L-402 surface activates only after its own staging evidence.
+- **Public-tier content contract:** caller-provided transcript/text for the public surface where transcription is not server-side; media acquisition egress is allowlist-bounded (YouTube + direct media URLs, SSRF controls, no DRM/cookie/PO-token bypass — honest `host_blocked` errors). [Requires Verification: exact public tool contract fixed at implementation.]
+- **Same rails:** keyless L-402 gate family, one-shot entitlements (job-bound for media), content-free records (P10-media record set), receipts, P12, NWC, sats — no new payment architecture.
+- **Plugin framing:** the plugin bundles both MCP capabilities under one entry (FP-2 amendment).
 
-Status: **planned — not yet implemented in this branch.** This note records the intent and the design posture so the second capability inherits the same review path rather than being invented later.
+## 7a. Identity model — per-capability service identities with unique receiving wallets
+
+**[Verified Fact — this fork's proposal]** The operator's identity proposal `docs/omega/2026-08-15-artifact-provenance-and-identity-boundaries.md` (branch `docs/identity-artifacts-services-proposal`) establishes the artifact-vs-actor boundary: artifacts (skills, plugin packages, local MCP instances) are identified by content digest + publisher signature and hold **no** durable key; actors that operate services, collect L-402, accrue reputation, or receive payment **do** hold durable Nostr identities (rules 6–9; the table's "Remote, paid MCP service → Service-operator pubkey → Yes when public and durable").
+
+**Adopted model (consistent with that proposal):**
+- **Each capability is its own remote paid MCP service actor** — `source-summarization` and `media-transcription-discussion` each get their **own durable service identity (npub)** and their **own unique receiving wallet binding**. Earnings, usage, and performance reputation are tracked **per capability** (per-capability sats-earned ledger views; per-capability NWC export configuration; per-capability receipts and discovery-catalog records). Payment challenges and receipts bind to the per-capability service identity (proposal rule 9).
+- **The plugin package itself stays artifact-identified** (digest + version + signed manifest) — no plugin key. Reputation never transfers to arbitrary forks or redeployments (rule 8).
+- **One capability registry** (`capability_id` → `{ service identity (npub), receiving wallet binding, server_id, tool allowlist, price schedule, receipt fields }`) is the single source of truth; both capabilities register there; the shared keyless L-402 gate, content-free records, P12, and sats rails are never duplicated.
+- **Wallet custody:** each capability's receiving wallet is provisioned on the operator's backend (MDK path; per-wallet attribution Requires Verification against the live platform — a question for the OpenAgents team), keys never on the serving path; NWC export operator-configurable per capability.
+- **Issue 312 alignment:** the operator's proposal was never submitted upstream (PR gap 311→313); it is being submitted as PR 312 and the OpenAgents team's confirmation of the capability-identity/wallet model is requested in section 8 (Q5). [Requires Verification: OpenAgents' canonical identity/wallet model for per-capability services.]
+
+Status: **design-level decision recorded 2026-08-18 — not yet implemented in this branch.** The capability registry and per-capability identity/wallet wiring land with the WP16/implementation work, pending the OpenAgents team's confirmation of the model.
 
 ## 8. Open questions for the OpenAgents team (what we need to conform, not guess)
 
-1. **Plugin Store entry model**: exact fields for a plugin entry (identity, theme, description, bundled MCPs, pricing)? We drafted a provisional model with the URL-summarization MCP as the first bundled capability, and video/audio review as the second — please correct to the canonical shape.
-2. **Catalog/discovery records and receipts**: a canonical schema for capability records and payment/usage receipts we should conform to? We deliberately committed to none until confirmed.
-3. **Marketplace billing conventions for agent-pays L-402**: budgets (we use NWC/NIP-47), receipt expectations, failure/refund semantics.
-4. **MCP distribution in a plugin**: for a plugin bundling a remote HTTP(S) MCP, what does the store expect (stdio vs remote, endpoint registration, health/readiness)?
-5. **NIP-90/DVM**: required before listing, or deferrable?
-6. **PR 315 acceptance**: any architectural concerns in the keyless authority seam, the sidecar boundary, or the P12 client-side-encryption approach that would block upstream acceptance?
-7. **Path to first listing**: what do you need from us (docs, demo, test agent, pricing proposal) and what does the review/approval process look like?
+1. **Plugin Store entry model**: exact fields for a plugin entry (identity, theme, description, bundled MCPs, pricing)? We drafted a provisional model with the URL-summarization MCP as the first bundled capability and media review as the second — please correct to the canonical shape.
+2. **Capability identity & wallet model (ties to PR 312)**: does the store expect each remote paid MCP capability to carry its **own durable Nostr service identity and receiving wallet** (per-capability earnings, usage, and reputation tracking), or a single operator identity with capability-scoped records? We submitted our proposal (`docs/omega/2026-08-15-artifact-provenance-and-identity-boundaries.md`, PR 312) — please confirm alignment with OpenAgents' model, and whether per-capability wallet attribution is expected or supported.
+3. **Catalog/discovery records and receipts**: a canonical schema for capability records and payment/usage receipts we should conform to? We deliberately committed to none until confirmed.
+4. **Marketplace billing conventions for agent-pays L-402**: budgets (we use NWC/NIP-47), receipt expectations, failure/refund semantics.
+5. **MCP distribution in a plugin**: for a plugin bundling remote HTTP(S) MCPs, what does the store expect (stdio vs remote, endpoint registration, health/readiness)?
+6. **NIP-90/DVM**: required before listing, or deferrable?
+7. **User dashboard — branding/theme/layout**: what branding assets, theme, and layout should a merchant/user dashboard (earnings, usage, receipts, capabilities, wallet/export config) use for first drafts on a Windows machine — is there a canonical brand kit, design-system reference, or Figma?
+8. **Database/storage conventions**: what does the store use for catalog/discovery records, receipts, and usage — canonical schemas we must conform to, and who owns/stores them (merchant vs store)?
+9. **PR 315 acceptance**: any architectural concerns in the keyless authority seam, the sidecar boundary, or the P12 client-side-encryption approach that would block upstream acceptance?
+10. **Path to first listing**: what do you need from us (docs, demo, test agent, pricing proposal) and what does the review/approval process look like?
 
 No commitment to any schema is made by us until we agree; we'd rather be corrected than conform to an invented model.
