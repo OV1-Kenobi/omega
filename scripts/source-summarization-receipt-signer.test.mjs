@@ -53,7 +53,7 @@ test("a receipt round trip over the authenticated pipe verifies", async () => {
     assert.match(signed.signature, /^[0-9a-f]{128}$/);
     assert.equal(signed.service_identity, harness.npub);
     assert.equal(verifyReceiptSignature(receipt, signed.signature, harness.npub), true);
-    // Tampered amount or client id fails verification (SEC-2026-036 test pair).
+    // Tampered amount or client id fails verification (receipt-signing custody test pair).
     assert.equal(verifyReceiptSignature(sampleReceipt(harness.npub, { amount_sats: 9999 }), signed.signature, harness.npub), false);
     assert.equal(verifyReceiptSignature(sampleReceipt(harness.npub, { client_id: "attacker-opaque" }), signed.signature, harness.npub), false);
   } finally {

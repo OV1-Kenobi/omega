@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Canonical receipt contract and the serving-plane receipt-signer client for
-// the WP6 public tier (SEC-2026-036 remediation, phase2-implementation-staging-
+// the WP6 public tier (receipt-signing custody remediation, the implementation staging plan
 // plan.md slice 5).
 //
 // TRUST BOUNDARY: this module is imported by the PUBLIC SERVING process. It

@@ -71,7 +71,7 @@ test("round trip decrypts with the user key; wrong key, wrong salt, and tamperin
     /decryption failed/,
   );
 
-  // AAD binding (SEC-2026-032): tampering ANY operator-readable metadata field
+  // AAD binding (AEAD binding): tampering ANY operator-readable metadata field
   // breaks authentication at decryption time.
   for (const tampered of [
     { ...entry, entry_id: "0197f000-0000-7000-8000-00000000dead" },

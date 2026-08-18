@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Public HTTP(S) MCP transport adapter for the Omega source-summarization
-// capability (WP6; phase2-implementation-staging-plan.md slice 2; PRD M7/P1;
+// capability (WP6; the implementation staging plan slice 2; PRD M7/P1;
 // wp6-public-l402-gate.md section 4).
 //
 // BOUNDARY SUMMARY
@@ -18,12 +18,12 @@
 //     caller-held artifacts) is exposed. The local-library tools
 //     (save/get/list) are rejected BEFORE dispatch, and the V1 core is
 //     constructed with a rejecting bridge stub so a bug in the allowlist still
-//     cannot reach the local LMDB library bridge (SEC-2026-027).
+//     cannot reach the local LMDB library bridge (boundary isolation).
 //   - No egress: this module opens LISTENING sockets only (node:http/https
 //     server). It imports no client fetch/TCP code; provider/invoice material
 //     arrives through the injected synthetic authority; signatures through the
 //     authenticated local IPC client.
-//   - Key custody (SEC-2026-036): this module never loads a signing key. It
+//   - Key custody (receipt-signing custody): this module never loads a signing key. It
 //     imports no credential-store code; artifact signatures and receipt
 //     signatures are obtained from the off-serving receipt signer through
 //     source-summarization-receipt.mjs (client) and verified against the
@@ -148,7 +148,7 @@ export function createOperationLog({ clock = () => new Date() } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Rejecting library bridge stub (defense in depth for SEC-2026-027)
+// Rejecting library bridge stub (defense in depth for boundary isolation)
 // ---------------------------------------------------------------------------
 
 export function createRejectingLibraryBridge() {

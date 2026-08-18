@@ -148,7 +148,7 @@ test("full L402 round trip: 402 challenge shape, pay, retry, signed artifact and
     assert.equal(receipt.amount_sats, 21);
     assert.equal(receipt.service_identity, harness.npub);
     assert.equal(verifyReceiptSignature(stripSignature(receipt), receipt.signature, harness.npub), true);
-    // Tampered receipt facts fail verification (SEC-2026-036 test pair).
+    // Tampered receipt facts fail verification (receipt-signing custody test pair).
     assert.equal(verifyReceiptSignature({ ...stripSignature(receipt), amount_sats: 9999 }, receipt.signature, harness.npub), false);
     assert.equal(verifyReceiptSignature({ ...stripSignature(receipt), client_id: "attacker-opaque" }, receipt.signature, harness.npub), false);
     // No library operation occurred.

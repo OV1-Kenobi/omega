@@ -2,7 +2,7 @@
 
 // Synthetic Lightning backend selection, NWC export threshold logic, and
 // credential-masking discipline for the WP6 public tier (PRD P3/P5/P6/P7;
-// phase2-implementation-staging-plan.md slice 7; SEC-2026-034 activation
+// the implementation staging plan slice 7; upgrade-path gate activation
 // gate).
 //
 // SYNTHETIC LOGIC ONLY. No real NWC connection strings, node credentials,
@@ -36,7 +36,7 @@ import { createHash, randomBytes } from "node:crypto";
 
 export const DEFAULT_NWC_EXPORT_THRESHOLD_SATS = 100000;
 export const KNOWN_BACKENDS = ["mdk-hosted", "user-ln-node", "self-hosted-lnbits"];
-export const BACKEND_ACTIVATION_GATE = "sec-2026-034-gate";
+export const BACKEND_ACTIVATION_GATE = "upgrade-path-gate";
 
 const DESTINATION_PREFIXES_SUPPORTED = ["bolt11:", "lnurl:", "lightning:", "lnbits:"];
 const DESTINATION_PREFIXES_UNSUPPORTED = ["bitcoin:", "onchain:", "iban:", "swift:"];
@@ -75,7 +75,7 @@ export function createBackendSelector({ initialBackend = "mdk-hosted", activated
     },
     // Per-user stored choice, reversible (design note section 7.3). Selecting
     // a backend that has not passed its activation gate stores the choice as
-    // PENDING but never switches the active payment path: SEC-2026-034 keeps
+    // PENDING but never switches the active payment path: upgrade-path gate keeps
     // user-configured node credentials inactive until the credential
     // lifecycle is implemented and verified.
     selectBackend(backend) {

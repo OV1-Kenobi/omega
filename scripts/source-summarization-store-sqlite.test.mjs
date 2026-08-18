@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Persistence tests for the durable SQLite stores (plan ECP-2026-08-18-OMEGA-
+// Persistence tests for the durable SQLite stores (plan of 2026-08-18 (OMEGA-
 // WP6-MDK-STORE sections 6.3.7 / acceptance criteria 3-5, 7). Deterministic,
 // offline, temp-directory databases, fixtures only, no live calls. The
 // two-process tests spawn real child node processes racing on the same DB

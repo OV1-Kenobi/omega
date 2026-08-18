@@ -1,7 +1,7 @@
 # Source-Summarization WP6 — Public L-402 MCP Design Note
 
 - Date: 2026-08-18
-- Author: Livingry Services (Michael Ovsen, founder; engineering team of the Livingry Company OS)
+- Author: Livingry Services (Michael Ovsen, founder; Livingry engineering team)
 - Branch: `feat/source-summarization-wp6-public` (fork: github.com/OV1-Kenobi/omega)
 - Status: IMPLEMENTED AND TESTED LOCALLY (paddock grade). Nothing in this note or the branch is deployed, exposed, or operating live. Live provider behavior (MoneyDevKit hosted node, Zeus NWC, bLIP-26 conformance) is Requires Verification until staging.
 - Evidence labels: **Verified Fact** (supported by the code/tests in this branch or the referenced PR), **Requires Verification** (live/vendor state, to be confirmed at staging), **Strategic Opinion** (engineering judgment).

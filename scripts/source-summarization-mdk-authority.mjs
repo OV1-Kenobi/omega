@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 
-// MDK payment authority adapter for the WP6 public tier (plan ECP-2026-08-18-
+// MDK payment authority adapter for the WP6 public tier (plan of 2026-08-18 (
 // OMEGA-WP6-MDK-STORE section 6.1/6.4 Layer 3). Implements the SAME authority
 // seam as the synthetic paddock authority in source-summarization-l402.mjs
 // (issueChallenge + publicKeyPem) so the serving plane changes zero lines:
 // the composition layer injects this authority at staging and the paddock
 // authority in tests.
 //
-// ARCHITECTURE (keyless serving invariant, SEC-2026-033 origin binding):
+// ARCHITECTURE (keyless serving invariant, origin-binding evidence origin binding):
 //   - The MoneyDevKitNode (self-custodial, MNEMONIC + ACCESS_TOKEN under the
-//     sidecar's DPAPI scope per SEC-2026-038) lives in the SIDECAR plane,
+//     sidecar's DPAPI scope per sidecar custody) lives in the SIDECAR plane,
 //     never in the serving process. The serving plane receives only
 //     publicKeyPem (verification).
 //   - issueChallenge mints a BOLT11 invoice via node.invoices.create(amountSats)

@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 
 // P12 client-side encryption and ciphertext ledger boundary for the WP6 public
-// tier (PRD P12; phase2-implementation-staging-plan.md slice 6; wp6-p12-
-// security-review.md conditions; SEC-2026-032 AAD-binding remediation).
+// tier (PRD P12; the implementation staging plan slice 6; wp6-p12-
+// security-review.md conditions; AEAD binding AAD-binding remediation).
 //
 // CRYPTO STATUS — PROVISIONAL, SECURITY-AGENT REVIEW PENDING. The AEAD here is
 // AES-256-GCM from the Node standard library (one of the two candidate
 // algorithms named in the approved design, wp6-public-l402-gate.md section
-// 9.2) with the SEC-2026-032 remediation implemented: the operator-readable
+// 9.2) with the AEAD binding remediation implemented: the operator-readable
 // metadata (entry_id, user_token, timestamp, status) is bound as AEAD
 // associated data, every encryption uses a fresh CSPRNG nonce, and the ledger
 // key is derived into a dedicated subkey (key separation). The FINAL AEAD
@@ -114,7 +114,7 @@ function deriveLedgerKey(keyMaterial, saltHex, mode) {
 }
 
 // The AEAD associated data: the operator-readable metadata tuple. Any change
-// to these fields after encryption breaks authentication (SEC-2026-032).
+// to these fields after encryption breaks authentication (AEAD binding).
 function associatedData({ entry_id, user_token, timestamp, status }) {
   return Buffer.from(canonicalize({ entry_id, user_token, timestamp, status }));
 }

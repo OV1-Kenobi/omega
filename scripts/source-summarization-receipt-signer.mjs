@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Off-serving receipt signer for the WP6 public tier (SEC-2026-036).
+// Off-serving receipt signer for the WP6 public tier (receipt-signing custody).
 //
 // This process runs in the OPERATOR plane, separate from the public serving
 // process. It alone opens the service signing identity (the same DPAPI-backed

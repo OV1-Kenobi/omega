@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 // Synthetic L-402 payment policy and authority boundary for the WP6 public
-// source-summarization transport (planning/2026-08-16-omega-source-
-// summarization-feature, phase2-implementation-staging-plan.md slice 3/4).
+// source-summarization transport (the planning folder (phase-2
+// summarization-feature, the implementation staging plan slice 3/4).
 //
 // SYNTHETIC PADDOCK ONLY. This module implements a local, deterministic,
 // off-serving payment AUTHORITY plus the serving-side policy layer so the
@@ -27,7 +27,7 @@
 //     HTTP transport adapter (serving plane). The serving plane receives only
 //     the authority PUBLIC key (verification), never the private key, so a
 //     compromised serving path cannot mint challenges or substitute invoice
-//     metadata (SEC-2026-033 invoice-origin binding at paddock grade).
+//     metadata (origin-binding evidence invoice-origin binding at paddock grade).
 //   - Capacity for surprise/damage: no sats, no credentials, no content. The
 //     entitlement store is schema-enforced to content-free fields only.
 //

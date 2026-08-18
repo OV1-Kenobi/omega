@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Durable SQLite stores for the WP6 public tier (plan ECP-2026-08-18-OMEGA-
+// Durable SQLite stores for the WP6 public tier (plan of 2026-08-18 (OMEGA-
 // WP6-MDK-STORE sections 6.3.3-6.3.6; Security condition 1: durable
 // single-winner redemption). These implement the SAME public method surfaces
 // as the in-memory paddock stores in source-summarization-l402.mjs and

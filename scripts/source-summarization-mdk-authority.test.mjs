@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Adapter tests for source-summarization-mdk-authority.mjs (plan ECP-2026-08-
+// Adapter tests for source-summarization-mdk-authority.mjs (plan of 2026-08-18 (
 // 18-OMEGA-WP6-MDK-STORE acceptance criterion 6; stop condition 4: no live
 // calls, no static SDK import in the module under test). Deterministic,
 // offline, fixture node only. The fixture mirrors the real
