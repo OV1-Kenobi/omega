@@ -1,0 +1,11 @@
+{
+  "name": "omega-source-summarization-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Node dependencies for the source-summarization paddock/staging scripts (ECP-2026-08-18-OMEGA-WP6-MDK-STORE). Exactly the two founder-approved dependencies, exact-pinned per the plan's pinning policy; node_modules is gitignored and never committed.",
+  "dependencies": {
+    "@moneydevkit/core": "0.22.0",
+    "better-sqlite3": "12.11.1"
+  }
+}

@@ -33,6 +33,7 @@
 /node_modules/
 /plugins/bin
 /script/node_modules
+/scripts/node_modules/
 /snap
 /zed.xcworkspace
 DerivedData/
