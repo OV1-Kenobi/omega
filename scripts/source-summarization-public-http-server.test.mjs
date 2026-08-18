@@ -25,6 +25,7 @@ import {
 const SCRIPT_PATH = new URL("./source-summarization-public-http-server.mjs", import.meta.url);
 const FIXED_CLOCK = () => new Date("2026-08-17T12:00:00.000Z");
 const BOOT_SECRET = "synthetic-paddock-boot-secret";
+const DERIVATION_SECRET = "synthetic-paddock-derivation-secret";
 
 async function startPaddock({ clock = FIXED_CLOCK, abuseControls } = {}) {
   const storage = createInMemoryStorage();
@@ -45,6 +46,7 @@ async function startPaddock({ clock = FIXED_CLOCK, abuseControls } = {}) {
     signer: createRemoteArtifactSigner({ client, serviceNpub: npub }),
     receiptSignerClient: client,
     entitlementStore: createChallengeEntitlementStore(),
+    clientIdDerivationSecret: DERIVATION_SECRET,
     authority,
     bridge,
     clock,
@@ -118,6 +120,108 @@ test("construction requires an explicit entitlement store (no silent in-memory d
       }),
     /entitlementStore is required/,
   );
+});
+
+test("construction requires the client-id derivation secret (no raw-header identity fallback)", () => {
+  // O2-P2: without the server-side secret there is no keyed derivation, so
+  // construction fails rather than silently keying identity on the raw header.
+  assert.throws(
+    () =>
+      createPublicSourceSummarizationServer({
+        plaintextLoopbackPaddock: true,
+        serviceNpub: "npub1synthetic",
+        entitlementStore: createChallengeEntitlementStore(),
+      }),
+    /clientIdDerivationSecret.*is required/,
+  );
+});
+
+test("x-opaque-client-id is derived server-side: distinct headers, stable keys, derived ids everywhere", async () => {
+  const clock = () => new Date("2026-08-17T12:00:00.000Z");
+  const harness = await startPaddock({
+    clock,
+    abuseControls: { requestWindowMs: 60_000, maxRequestsPerWindow: 10, challengeWindowMs: 60_000, maxChallengesPerWindow: 10, freeAllowance: null },
+  });
+  try {
+    const victim = { "x-opaque-client-id": "victim-raw-header" };
+    const other = { "x-opaque-client-id": "other-raw-header" };
+    // Same header twice, then a different header: 402 challenges each time.
+    for (let i = 0; i < 2; i += 1) {
+      const first = await post(harness.base, SUMMARIZE_BODY, victim);
+      assert.equal(first.status, 402);
+    }
+    const challenger = await post(harness.base, SUMMARIZE_BODY, other);
+    assert.equal(challenger.status, 402);
+
+    // Limiter buckets key on the DERIVED ids: distinct headers -> distinct
+    // keys, stable for a repeated header, and never equal to the header text.
+    const snapshot = harness.server.abuseControls.requestLimiter.snapshot();
+    const byCount = Object.fromEntries(snapshot.map((bucket) => [bucket.count, bucket.key]));
+    const victimKey = byCount[2];
+    const otherKey = byCount[1];
+    assert.equal(typeof victimKey, "string");
+    assert.notEqual(victimKey, otherKey);
+    for (const key of [victimKey, otherKey]) assert.match(key, /^[0-9a-f]{32}$/);
+    assert.equal(snapshot.some((bucket) => bucket.key === "victim-raw-header"), false);
+    assert.equal(snapshot.some((bucket) => bucket.key === "other-raw-header"), false);
+    assert.equal(snapshot.find((bucket) => bucket.key === victimKey).count, 2);
+
+    // All downstream records (challenge issuance, operation log) carry the
+    // derived id, never the raw header string.
+    for (const record of harness.server.entitlementStore.listRecords()) {
+      assert.match(record.client_id, /^[0-9a-f]{32}$/);
+      assert.notEqual(record.client_id, "victim-raw-header");
+    }
+    const loggedClients = harness.server.operationLog.list().map((record) => record.client_id).filter(Boolean);
+    for (const id of loggedClients) assert.match(id, /^[0-9a-f]{32}$/);
+    const log = JSON.stringify(harness.server.operationLog.list());
+    assert.equal(log.includes("victim-raw-header"), false);
+    assert.equal(log.includes("other-raw-header"), false);
+  } finally {
+    await harness.server.close();
+    await harness.signerService.close();
+  }
+});
+
+test("a leaked derived id cannot be replayed as the header: the spoof lands in a different bucket", async () => {
+  const clock = () => new Date("2026-08-17T12:00:00.000Z");
+  const harness = await startPaddock({
+    clock,
+    abuseControls: { requestWindowMs: 60_000, maxRequestsPerWindow: 10, challengeWindowMs: 60_000, maxChallengesPerWindow: 10, freeAllowance: null },
+  });
+  try {
+    const rawHeader = "client-victim";
+    const victimRequest = await post(harness.base, SUMMARIZE_BODY, { "x-opaque-client-id": rawHeader });
+    assert.equal(victimRequest.status, 402);
+    const victimBucket = harness.server.abuseControls.requestLimiter.snapshot().find((bucket) => /^[0-9a-f]{32}$/.test(bucket.key));
+    assert.ok(victimBucket);
+
+    // Spoof attempt: the attacker copies the victim's ON-SYSTEM identifier
+    // (the derived id) into the header. The server re-derives it, so the
+    // request keys a DIFFERENT bucket and the victim's bucket count is
+    // untouched — the leaked identifier is useless as a header.
+    const spoof = await post(harness.base, SUMMARIZE_BODY, { "x-opaque-client-id": victimBucket.key });
+    assert.equal(spoof.status, 402);
+    const after = harness.server.abuseControls.requestLimiter.snapshot();
+    const victimAfter = after.find((bucket) => bucket.key === victimBucket.key);
+    assert.equal(victimAfter.count, 1, "the victim's bucket must be untouched by the spoofed request");
+    const attackerBuckets = after.filter((bucket) => bucket.key !== victimBucket.key);
+    assert.equal(attackerBuckets.length, 1, "the spoof lands in exactly one new bucket");
+    assert.notEqual(attackerBuckets[0].key, victimBucket.key);
+    assert.equal(attackerBuckets[0].count, 1);
+
+    // Residual limitation (PR-315 security classification section 2.1): the
+    // raw header is NOT authenticated identity — two callers who send the
+    // IDENTICAL raw header share one pseudonym (same derived bucket). True
+    // per-client quota needs an authenticated identity layer (open question).
+    const twin = await post(harness.base, SUMMARIZE_BODY, { "x-opaque-client-id": rawHeader });
+    assert.equal(twin.status, 402);
+    const victimFinal = harness.server.abuseControls.requestLimiter.snapshot().find((bucket) => bucket.key === victimBucket.key);
+    assert.equal(victimFinal.count, 2, "an identical raw header shares the same pseudonym bucket");
+  } finally {
+    await harness.server.close();
+    await harness.signerService.close();
+  }
 });
 
 test("the paddock loopback server serves health and the filtered tool list without payment", async () => {

@@ -47,7 +47,10 @@
 //   - Network: one LISTENING socket (TLS when configured; loopback-only
 //     plaintext in the named paddock mode). No outbound connections.
 //   - Credentials: none held. The L402 Authorization header is consumed for
-//     verification and never logged or echoed.
+//     verification and never logged or echoed. A server-side client-id
+//     derivation secret is received at construction and used only as the HMAC
+//     key for deriveOpaqueClientId; the raw x-opaque-client-id header is never
+//     used as identity, stored, or logged.
 //   - Persistence: the challenge/entitlement store is injected at construction
 //     (in-memory in the paddock/tests; the durable SQLite store at staging) —
 //     there is no silent in-memory default. The operation log is in-memory.
@@ -74,6 +77,7 @@ import {
   challengeHttpResponse,
   createFixedWindowLimiter,
   createSyntheticPaymentAuthority,
+  deriveOpaqueClientId,
   verifyL402Proof,
 } from "./source-summarization-l402.mjs";
 import { RECEIPT_FIELDS } from "./source-summarization-receipt.mjs";
@@ -189,6 +193,7 @@ export function createPublicSourceSummarizationServer({
   authority = createSyntheticPaymentAuthority({ serviceIdentity: "unset" }),
   authorityPublicKeyPem = authority?.publicKeyPem,
   entitlementStore,
+  clientIdDerivationSecret,
   receiptSignerClient = null,
   serviceNpub,
   pricing = { summarize_source: 21, ask_source: 5, export_source_analysis: 1 },
@@ -226,6 +231,12 @@ export function createPublicSourceSummarizationServer({
     throw new Error(
       "entitlementStore is required: pass an explicit challenge/entitlement store (paddock in-memory or the durable SQLite store)",
     );
+  }
+  // The x-opaque-client-id header is ONLY derivation material. Without a
+  // server-side derivation secret there is no keyed derivation, so
+  // construction fails rather than falling back to raw-header identity (O2-P2).
+  if (typeof clientIdDerivationSecret !== "string" || clientIdDerivationSecret === "") {
+    throw new Error("clientIdDerivationSecret (the server-side secret for deriveOpaqueClientId) is required");
   }
 
   // Abuse controls (P5): per-client request rate limiting, bounded challenge
@@ -544,8 +555,16 @@ export function createPublicSourceSummarizationServer({
     const startedAt = Date.now();
     const url = new URL(req.url ?? "/", "https://public.invalid");
     const authorization = req.headers.authorization;
+    // Identity boundary (O2-P2): the caller-supplied x-opaque-client-id header
+    // is derivation material ONLY — never used verbatim as identity. The
+    // server-side secret keys the derivation, so the derived id keys the
+    // limiter, quota, challenge, receipt, and log records; an absent header
+    // keeps the anonymous shared bucket.
     const clientIdHeader = req.headers["x-opaque-client-id"];
-    const clientId = typeof clientIdHeader === "string" && clientIdHeader !== "" ? clientIdHeader : null;
+    const clientId =
+      typeof clientIdHeader === "string" && clientIdHeader !== ""
+        ? deriveOpaqueClientId(clientIdDerivationSecret, clientIdHeader)
+        : null;
     const send = (status, body, headers = {}) => {
       const payload = JSON.stringify(body);
       res.writeHead(status, { "Content-Type": "application/json", ...headers });
