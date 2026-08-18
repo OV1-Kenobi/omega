@@ -443,7 +443,7 @@ export function createPublicSourceSummarizationServer({
     // Free-allowance quota (P5): consumed atomically BEFORE redemption so a
     // quota denial never burns the paid proof (the proof stays replayable
     // after the quota window resets). The slot is consumed even if a later
-    // step fails closed (receipt signing) — consistent with the entitlement
+    // step fails closed (tool execution) — consistent with the entitlement
     // fail-closed posture recorded as handoff deviation 2.
     if (quotaLimiter) {
       const quotaGate = quotaLimiter.check(limiterKey);
@@ -459,15 +459,13 @@ export function createPublicSourceSummarizationServer({
         };
       }
     }
-    const redemption = entitlementStore.redeem(proof.payment_hash);
-    if (!redemption.ok) {
-      // One-shot replay denial: a fresh challenge, no second grant, no effect.
-      return issueChallengeResponse(clientId, toolName, id, JSONRPC_REPLAYED_PROOF);
-    }
-
-    // Receipt before execution: a paid call never returns content without a
-    // verified content-free receipt (PRD P4). Signer unavailability fails
-    // closed — no tool execution, no content echo.
+    // Receipt signing BEFORE redemption (O2-P5; founder-approved order
+    // sign -> redeem -> execute): signing is a side-effect-free local
+    // operation on an already-verified proof, so signer unavailability fails
+    // closed at 503 WITHOUT burning the entitlement — the proof stays
+    // replayable and a paid caller is never charged with nothing delivered.
+    // A paid call still never returns content without a verified content-free
+    // receipt (PRD P4).
     if (!receiptSignerClient) {
       return { httpStatus: 503, body: errorBody(id, JSONRPC_RECEIPT_SIGNING_FAILED, "Receipt signing is unavailable.") };
     }
@@ -490,6 +488,14 @@ export function createPublicSourceSummarizationServer({
     } catch {
       operationLog.record({ event: "receipt_signing_failed", tool: toolName, outcome: "fail_closed", client_id: clientId ?? undefined });
       return { httpStatus: 503, body: errorBody(id, JSONRPC_RECEIPT_SIGNING_FAILED, "Receipt signing failed.") };
+    }
+
+    // Redemption stays the single-winner gate immediately before execution:
+    // exactly one caller per paid proof executes; every replay is denied here.
+    const redemption = entitlementStore.redeem(proof.payment_hash);
+    if (!redemption.ok) {
+      // One-shot replay denial: a fresh challenge, no second grant, no effect.
+      return issueChallengeResponse(clientId, toolName, id, JSONRPC_REPLAYED_PROOF);
     }
 
     const result = await v1Server.callTool(toolName, args);

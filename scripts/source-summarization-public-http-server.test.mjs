@@ -224,6 +224,72 @@ test("a leaked derived id cannot be replayed as the header: the spoof lands in a
   }
 });
 
+test("signer unavailable after a valid proof does NOT burn the entitlement; the proof replays after recovery", async () => {
+  const clock = () => new Date("2026-08-17T12:00:00.000Z");
+  const storage = createInMemoryStorage();
+  const npub = await provisionSignerIdentity({ storage });
+  const signerService = createReceiptSignerService({
+    signer: createCredentialStoreSigner({ storage }),
+    pipePath: receiptSignerPipePath(randomBytes(6).toString("hex")),
+    authSecret: BOOT_SECRET,
+    allowedPurposes: ["sign_receipt", "artifact_sign"],
+  });
+  await signerService.listen();
+  const realClient = new ReceiptSignerClient({ pipePath: signerService.pipePath, authSecret: BOOT_SECRET, expectedServiceNpub: npub });
+  let signerDown = true;
+  const flakyClient = {
+    requestSignature: async (receipt) => {
+      if (signerDown) throw new Error("signer_offline");
+      return realClient.requestSignature(receipt);
+    },
+  };
+  const authority = createSyntheticPaymentAuthority({ clock, serviceIdentity: npub });
+  const server = createPublicSourceSummarizationServer({
+    plaintextLoopbackPaddock: true,
+    serviceNpub: npub,
+    signer: createRemoteArtifactSigner({ client: realClient, serviceNpub: npub }),
+    receiptSignerClient: flakyClient,
+    entitlementStore: createChallengeEntitlementStore(),
+    clientIdDerivationSecret: DERIVATION_SECRET,
+    authority,
+    bridge: createRejectingLibraryBridge(),
+    clock,
+  });
+  const address = await server.listen(0, "127.0.0.1");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    // Pay first, then call while the signer is down (O2-P5 order:
+    // sign -> redeem -> execute). The 503 must not consume the entitlement.
+    const { macaroon, preimageHex, token } = await payFor(base, authority, SUMMARIZE_BODY);
+    const held = { Authorization: `L402 ${macaroon}:${preimageHex}` };
+    const failed = await post(base, SUMMARIZE_BODY, held);
+    assert.equal(failed.status, 503);
+    assert.equal(failed.json.error.code, -32007);
+    assert.equal(JSON.stringify(failed.json).includes("PRIVATE_PADDOCK"), false);
+    const store = server.entitlementStore;
+    assert.equal(store.isRedeemed(token.payload.payment_hash), false, "signer outage must not burn the proof");
+    assert.equal(store.listRecords().filter((record) => record.status === "redeemed").length, 0);
+
+    // The same proof stays replayable: after the signer recovers it executes,
+    // and exactly one redemption is recorded.
+    signerDown = false;
+    const recovered = await post(base, SUMMARIZE_BODY, held);
+    assert.equal(recovered.status, 200);
+    assert.ok(recovered.json.result.structuredContent.l402_receipt, "a verified receipt is returned");
+    assert.equal(store.listRecords().filter((record) => record.status === "redeemed").length, 1, "exactly one redemption after recovery");
+
+    // The recovered proof is still one-shot: replay is denied with a fresh
+    // challenge and no second redemption.
+    const replay = await post(base, SUMMARIZE_BODY, held);
+    assert.equal(replay.status, 402);
+    assert.match(replay.headers.get("www-authenticate"), /^L402 macaroon=/);
+    assert.equal(store.listRecords().filter((record) => record.status === "redeemed").length, 1, "no second redemption on replay");
+  } finally {
+    await server.close();
+    await signerService.close();
+  }
+});
+
 test("the paddock loopback server serves health and the filtered tool list without payment", async () => {
   const harness = await startPaddock();
   try {
