@@ -14,7 +14,7 @@ import { test } from "node:test";
 import { createCredentialStoreSigner, createInMemoryStorage, provisionSignerIdentity } from "./source-summarization-signer.mjs";
 import { ReceiptSignerClient, createRemoteArtifactSigner, receiptSignerPipePath, verifyReceiptSignature } from "./source-summarization-receipt.mjs";
 import { createReceiptSignerService } from "./source-summarization-receipt-signer.mjs";
-import { createSyntheticPaymentAuthority } from "./source-summarization-l402.mjs";
+import { createChallengeEntitlementStore, createSyntheticPaymentAuthority } from "./source-summarization-l402.mjs";
 import {
   PUBLIC_TOOL_ALLOWLIST,
   createOperationLog,
@@ -44,6 +44,7 @@ async function startPaddock({ clock = FIXED_CLOCK, abuseControls } = {}) {
     serviceNpub: npub,
     signer: createRemoteArtifactSigner({ client, serviceNpub: npub }),
     receiptSignerClient: client,
+    entitlementStore: createChallengeEntitlementStore(),
     authority,
     bridge,
     clock,
@@ -103,6 +104,19 @@ test("construction enforces HTTPS-only at the public edge", () => {
   assert.throws(
     () => createPublicSourceSummarizationServer({ serviceNpub: "npub1synthetic", plaintextLoopbackPaddock: true, host: "0.0.0.0" }),
     /refuses to bind a non-loopback host/,
+  );
+});
+
+test("construction requires an explicit entitlement store (no silent in-memory default)", () => {
+  // O2-P1: omitting the store must fail construction, so no path builds a
+  // public server that unknowingly assumes process-lifetime durable semantics.
+  assert.throws(
+    () =>
+      createPublicSourceSummarizationServer({
+        plaintextLoopbackPaddock: true,
+        serviceNpub: "npub1synthetic",
+      }),
+    /entitlementStore is required/,
   );
 });
 

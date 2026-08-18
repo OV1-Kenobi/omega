@@ -48,7 +48,9 @@
 //     plaintext in the named paddock mode). No outbound connections.
 //   - Credentials: none held. The L402 Authorization header is consumed for
 //     verification and never logged or echoed.
-//   - Persistence: in-memory challenge/entitlement records and operation log.
+//   - Persistence: the challenge/entitlement store is injected at construction
+//     (in-memory in the paddock/tests; the durable SQLite store at staging) —
+//     there is no silent in-memory default. The operation log is in-memory.
 //   - Boundaries: public callers -> this adapter -> V1 tool core (in memory);
 //     adapter -> off-serving receipt signer over authenticated local IPC;
 //     adapter -> injected synthetic payment authority (in-process paddock).
@@ -70,7 +72,6 @@ import {
 import {
   ANONYMOUS_CLIENT_BUCKET,
   challengeHttpResponse,
-  createChallengeEntitlementStore,
   createFixedWindowLimiter,
   createSyntheticPaymentAuthority,
   verifyL402Proof,
@@ -187,7 +188,7 @@ export function createPublicSourceSummarizationServer({
   bridge = createRejectingLibraryBridge(),
   authority = createSyntheticPaymentAuthority({ serviceIdentity: "unset" }),
   authorityPublicKeyPem = authority?.publicKeyPem,
-  entitlementStore = createChallengeEntitlementStore(),
+  entitlementStore,
   receiptSignerClient = null,
   serviceNpub,
   pricing = { summarize_source: 21, ask_source: 5, export_source_analysis: 1 },
@@ -212,6 +213,19 @@ export function createPublicSourceSummarizationServer({
   }
   for (const tool of Object.keys(pricing)) {
     if (!Number.isInteger(pricing[tool]) || pricing[tool] <= 0) throw new Error(`pricing for ${tool} must be positive integer sats`);
+  }
+  // The entitlement store is an explicit construction choice, never a silent
+  // in-memory default: a caller that forgets to inject the durable store must
+  // fail here rather than run with process-lifetime state, so no construction
+  // path unknowingly assumes durable semantics (O2-P1).
+  if (
+    !isObject(entitlementStore) ||
+    typeof entitlementStore.recordChallenge !== "function" ||
+    typeof entitlementStore.redeem !== "function"
+  ) {
+    throw new Error(
+      "entitlementStore is required: pass an explicit challenge/entitlement store (paddock in-memory or the durable SQLite store)",
+    );
   }
 
   // Abuse controls (P5): per-client request rate limiting, bounded challenge
