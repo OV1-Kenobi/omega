@@ -89,6 +89,10 @@ enum InputRequest {
     ChallengeWord { label: SharedString },
     MandateAmount,
     MandateExpiryHours,
+    /// WP-6: the MCP-server id for the Add Mapping control (design §6.4).
+    McpServerId,
+    /// WP-6: the Nostr pubkey (64-hex) for the mapping; empty = unset.
+    McpPrincipalPubkey,
 }
 
 impl InputRequest {
@@ -101,6 +105,8 @@ impl InputRequest {
             Self::ChallengeWord { .. } => "input-challenge-word",
             Self::MandateAmount => "input-mandate-amount",
             Self::MandateExpiryHours => "input-mandate-expiry-hours",
+            Self::McpServerId => "input-mcp-server-id",
+            Self::McpPrincipalPubkey => "input-mcp-principal-pubkey",
         }
     }
 }
@@ -174,6 +180,14 @@ pub struct SovereignDashboardPanel {
     refresh_task: Option<Task<()>>,
     /// Idempotency-key suffix (per-panel uniqueness is enough).
     id_counter: u64,
+    /// WP-6: the L-402 gateway's MCP-server -> Nostr-identity attribution map
+    /// (design §6.4 / §5.4), fetched from the sidecar on refresh. Public
+    /// pubkeys only — never key material.
+    mcp_identity_map: std::collections::HashMap<String, String>,
+    /// WP-6: a mapping-write error surfaced next to the Add Mapping control.
+    mapping_error: Option<SharedString>,
+    /// WP-6: the staged MCP-server id between the two Add Mapping inputs.
+    mapping_server_id: Option<String>,
 }
 
 impl SovereignDashboardPanel {
@@ -203,6 +217,9 @@ impl SovereignDashboardPanel {
             refreshed_at_ms: 0,
             refresh_task: None,
             id_counter: 0,
+            mcp_identity_map: std::collections::HashMap::new(),
+            mapping_error: None,
+            mapping_server_id: None,
         };
         panel.refresh(cx);
         panel
@@ -265,12 +282,38 @@ impl SovereignDashboardPanel {
             let store_error = store
                 .as_ref()
                 .and_then(|store| store.snapshot().err().map(|error| error.to_string()));
+            // WP-6: the L-402 gateway's MCP-server -> Nostr-identity map
+            // (design §6.4). Read-only projection; the Add Mapping control
+            // writes it through `mcp_identity_map_set`.
+            let mcp_identity_map = if status.is_some() {
+                guard
+                    .mcp_identity_map_get()
+                    .await
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("entries")
+                            .and_then(serde_json::Value::as_object)
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .filter_map(|(server, principal)| {
+                                        principal.as_str().map(|pubkey| (server.clone(), pubkey.to_string()))
+                                    })
+                                    .collect::<std::collections::HashMap<String, String>>()
+                            })
+                    })
+                    .unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
             this.update(cx, |this, cx| {
                 this.wallet.status = status;
                 this.wallet.balance = balance;
                 this.wallet.balance_error = balance_error;
                 this.identity.status = identity_status;
                 this.identity.identity_error = identity_error;
+                this.mcp_identity_map = mcp_identity_map;
                 if let Some(snapshot) = snapshot {
                     this.mandates.snapshot = Some(snapshot);
                 }
@@ -873,6 +916,39 @@ impl SovereignDashboardPanel {
                 }
                 cx.notify();
             }
+            InputRequest::McpServerId => {
+                // WP-6: Add Mapping step 1 — the server id, then the pubkey.
+                let server_id = value.trim().to_string();
+                if server_id.is_empty() {
+                    self.mapping_error = Some("the MCP server id must not be empty".into());
+                    cx.notify();
+                    return;
+                }
+                self.pending_input = Some(PendingInput {
+                    request: InputRequest::McpPrincipalPubkey,
+                    label: "Nostr pubkey (64-hex)".into(),
+                    detail: "The pubkey-keyed identity this server's paid tool calls attribute to \
+                             (design §5.4). Leave empty to UNSET an existing mapping. The field is \
+                             not masked; clear it after use."
+                        .into(),
+                });
+                self.mapping_server_id = Some(server_id);
+                cx.notify();
+            }
+            InputRequest::McpPrincipalPubkey => {
+                // WP-6: Add Mapping step 2 — commit the mapping (empty = unset).
+                let server_id = self.mapping_server_id.take().unwrap_or_default();
+                let trimmed = value.trim().to_string();
+                if trimmed.is_empty() {
+                    self.commit_mapping(server_id, None, cx);
+                } else if !is_valid_pubkey_hex(&trimmed) {
+                    self.mapping_error =
+                        Some("the Nostr pubkey must be 64-hex (a public key, never a secret)".into());
+                    cx.notify();
+                } else {
+                    self.commit_mapping(server_id, Some(trimmed), cx);
+                }
+            }
         }
     }
 
@@ -1430,10 +1506,24 @@ impl SovereignDashboardPanel {
             .status
             .as_ref()
             .and_then(|identity| identity.derived_npub.clone());
+        // WP-6: the REAL persisted mapping from the L-402 gateway store
+        // (server -> Nostr identity, design §6.4/§5.4).
         let rows = mcp_mapping_rows(
             context_servers.keys().map(|id| id.as_ref()),
             identity_npub.as_deref(),
+            &self.mcp_identity_map,
         );
+        // WP-6: the L-402 gateway state surfaced honestly (real value from the
+        // sidecar `status` — ready/locked/absent, never a claim without a
+        // gateway behind it).
+        let gateway_state = self
+            .wallet
+            .status
+            .as_ref()
+            .map(|status| status.l402_gateway_state.clone())
+            .unwrap_or_else(|| "absent".into());
+        let gateway_line = format!("L-402 gateway: {gateway_state} — signet/testnet only (D4)");
+        let mapping_error = self.mapping_error.clone();
         let rows_elements: Vec<AnyElement> = rows
             .iter()
             .map(|(server, mapped)| {
@@ -1471,19 +1561,77 @@ impl SovereignDashboardPanel {
             })
             .children(rows_elements)
             .child(
+                Label::new(gateway_line)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .when(mapping_error.is_some(), |this| {
+                this.child(
+                    Label::new(mapping_error.unwrap_or_default())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error),
+                )
+            })
+            .child(
                 Button::new("add-mcp", "Add Mapping")
                     .style(ButtonStyle::Subtle)
                     .tooltip(ui::Tooltip::text(
-                        "Map an MCP server to a Nostr ID (stubbed)",
+                        "Map a configured MCP server to a Nostr pubkey (the L-402 entitlement attribution, design §6.4)",
                     ))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.stub(
-                            "MCP-to-Nostr mapping is stubbed (L-402 entitlement wiring lands in WP-6).",
-                            cx,
-                        );
+                        this.add_mapping_flow(cx);
                     })),
             )
             .into_any_element()
+    }
+
+    /// WP-6: the Add Mapping control — REAL, wired to the L-402 gateway store
+    /// through the sidecar's `mcp-identity-map-set` (design §6.4). Two-step
+    /// input: the MCP server id, then the 64-hex Nostr pubkey (empty = unset).
+    fn add_mapping_flow(&mut self, cx: &mut Context<Self>) {
+        if self.supervisor.is_none() {
+            self.stub_notice =
+                Some("MCP mapping unavailable — the sovereign wallet lane is off (OMEGA_SOVEREIGN_WALLET=1 not set).");
+            cx.notify();
+            return;
+        }
+        self.pending_input = Some(PendingInput {
+            request: InputRequest::McpServerId,
+            label: "MCP server id".into(),
+            detail: "The id of a configured MCP server (e.g. \"om\"). The mapping is persisted in \
+                     the L-402 gateway store and attributes paid tool calls to this identity (design §5.4)."
+                .into(),
+        });
+        cx.notify();
+    }
+
+    fn commit_mapping(&mut self, server_id: String, principal_pubkey: Option<String>, cx: &mut Context<Self>) {
+        let Some(supervisor) = self.supervisor.clone() else {
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let result = supervisor
+                .lock()
+                .await
+                .mcp_identity_map_set(&server_id, principal_pubkey.as_deref())
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => {
+                        this.mapping_error = None;
+                        // Re-read the mapping so the rows reflect the stored state.
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.mapping_error = Some(SharedString::from(format!("mapping failed: {error}")));
+                        cx.notify();
+                    }
+                }
+            })
+            .log_err();
+        });
+        self.refresh_task = Some(task);
+        cx.notify();
     }
 
     fn authorizations_section(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1897,27 +2045,38 @@ fn network_label(network: TradingNetwork) -> &'static str {
     }
 }
 
-/// Map configured MCP server ids to the derived identity npub where an
-/// identity seam exists; "unmapped" otherwise (design §6.4).
+/// A public Nostr pubkey is exactly 64 hex chars (never key material).
+fn is_valid_pubkey_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Map configured MCP server ids to a persisted Nostr identity where the
+/// operator mapped one (design §6.4 — the L-402 entitlement attribution), to
+/// the derived identity npub where the identity seam exists, or to an honest
+/// "unmapped" label otherwise.
 fn mcp_mapping_rows<'a>(
     server_ids: impl Iterator<Item = &'a str>,
     identity_npub: Option<&str>,
+    persisted_map: &std::collections::HashMap<String, String>,
 ) -> Vec<(String, String)> {
     let mut servers = server_ids.map(ToString::to_string).collect::<Vec<_>>();
     servers.sort();
     servers
         .into_iter()
         .map(|server| {
-            let mapped = match identity_npub {
-                Some(npub) => {
-                    let short = if npub.len() > 16 {
-                        format!("{}…{}", &npub[..8], &npub[npub.len() - 4..])
-                    } else {
-                        npub.to_string()
-                    };
-                    format!("nostr: {short} (agent identity)")
+            let short = |npub: &str| {
+                if npub.len() > 16 {
+                    format!("{}…{}", &npub[..8], &npub[npub.len() - 4..])
+                } else {
+                    npub.to_string()
                 }
-                None => "unmapped — no agent identity yet".to_string(),
+            };
+            let mapped = if let Some(principal) = persisted_map.get(&server) {
+                format!("nostr: {} (mapped)", short(principal))
+            } else if let Some(npub) = identity_npub {
+                format!("nostr: {} (agent identity)", short(npub))
+            } else {
+                "unmapped — no agent identity yet".to_string()
             };
             (server, mapped)
         })
@@ -2000,19 +2159,44 @@ mod tests {
             std::sync::Arc::<str>::from("source-summarization"),
             stdio("node"),
         );
+        let empty_map = std::collections::HashMap::new();
         let rows = mcp_mapping_rows(
             servers.keys().map(|id| id.as_ref()),
             Some("npub1az708q3kd9zy6z6f44zav5ygvdwelkzspf6mtusttx47lft2z38sghk0w7"),
+            &empty_map,
         );
         assert_eq!(rows.len(), 2);
         assert!(
             rows.iter().all(|(_, mapped)| mapped.contains("nostr:")),
             "{rows:?}"
         );
-        let unmapped = mcp_mapping_rows(servers.keys().map(|id| id.as_ref()), None);
+        let unmapped = mcp_mapping_rows(servers.keys().map(|id| id.as_ref()), None, &empty_map);
         assert!(
             unmapped.iter().all(|(_, mapped)| mapped.contains("unmapped")),
             "{unmapped:?}"
         );
+    }
+
+    #[test]
+    fn mcp_mapping_prefers_the_persisted_l402_map_and_labels_mapped_rows() {
+        // WP-6 (design §6.4): a persisted server -> Nostr-identity mapping
+        // from the L-402 gateway store is the L-402 entitlement attribution;
+        // the row must show it as "mapped", distinct from the derived-identity
+        // fallback.
+        let mut persisted = std::collections::HashMap::new();
+        persisted.insert(
+            "om".to_string(),
+            "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0".to_string(),
+        );
+        let rows = mcp_mapping_rows(
+            ["om", "other"].into_iter(),
+            Some("npub1az708q3kd9zy6z6f44zav5ygvdwelkzspf6mtusttx47lft2z38sghk0w7"),
+            &persisted,
+        );
+        let om = rows.iter().find(|(server, _)| server == "om").expect("om row");
+        assert!(om.1.contains("(mapped)"), "{}", om.1);
+        assert!(om.1.contains("a1b2c3d4…"), "{}", om.1);
+        let other = rows.iter().find(|(server, _)| server == "other").expect("other row");
+        assert!(other.1.contains("(agent identity)"), "{}", other.1);
     }
 }

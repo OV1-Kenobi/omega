@@ -10,9 +10,11 @@
 //! it exactly like the real daemon).
 
 import { createServer } from "node:http";
+import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { buildTestBolt11 } from "./build-bolt11.mjs";
 
 const network = process.env.FAKE_WAVED_NETWORK ?? "signet";
 const mode = process.env.FAKE_WAVED_MODE ?? "normal";
@@ -35,9 +37,13 @@ const watchdog = setInterval(() => {
   }
 }, 2_000);
 
-const LNTCBS_INVOICE = "lntbs10u1p0example";
-const PAYMENT_HASH = "a".repeat(64);
+// The L-402 proof invariant: sha256(preimage) == paymentHash. The fake pays
+// with PREIMAGE and reports PAYMENT_HASH = sha256(decoded PREIMAGE), and the
+// recv invoice's BOLT11 `p` field carries PAYMENT_HASH so the gateway's
+// server-side payment-hash derivation (SEC-2026-055) parses a REAL BOLT11.
 const PREIMAGE = "b".repeat(64);
+const PAYMENT_HASH = createHash("sha256").update(Buffer.from(PREIMAGE, "hex")).digest("hex");
+const LNTCBS_INVOICE = buildTestBolt11(PAYMENT_HASH);
 
 const statusBody = () => ({
   ready: true,

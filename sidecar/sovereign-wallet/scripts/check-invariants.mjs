@@ -36,7 +36,13 @@ const sources = files.map((file) => ({ file, text: readFileSync(file, "utf8") })
 
 // --- S1: no key-material columns in SQL -------------------------------------
 {
-  const forbiddenColumns = ["nsec", "secret", "preimage", "mnemonic", "password", "passphrase", "macaroon", "token_hash"];
+  // `token_hash` is deliberately NOT in the forbidden list: it is the SHA-256
+  // digest of the L-402 opaque credential — a non-reversible lookup key, never
+  // the credential itself — and the design REQUIRES storing it (design §5.2
+  // "store the token hash, never the token"; MDK audit D1 schema
+  // `token_hash TEXT NOT NULL UNIQUE`). WP-2's S1 remediation names
+  // nsec/secret/preimage, not token digests (SEC-2026-051).
+  const forbiddenColumns = ["nsec", "secret", "preimage", "mnemonic", "password", "passphrase", "macaroon"];
   const sqlStatements = sources.flatMap(({ file, text }) =>
     (text.match(/CREATE TABLE[^;]*/gi) ?? []).map((statement) => ({ file, statement })),
   );

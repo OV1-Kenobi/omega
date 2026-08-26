@@ -49,12 +49,21 @@ export function lockdownPath(target: string): void {
 export function lockdownTree(root: string): void {
   lockdownPath(root);
   if (isWindows()) {
+    // The recursive pass grants BOTH an inherit-only propagation ACE
+    // `(OI)(CI)(IO)F` AND a direct plain `F` to every node. A bare
+    // `(OI)(CI)F` applied to a FILE does not confer file access (OI/CI are
+    // container-inheritance flags), which made files created before a
+    // RE-lockdown (the supervisor restart path re-runs this on the same data
+    // root) undeletable — `EPERM` on the sidecar's stale-lock reclamation.
+    // Verified empirically: existing files, new files, and nested directories
+    // all remain writable/deletable by the owner after this pass.
     const output = runIcacls([
       root,
-      "/inheritance:r",
-      "/grant:r",
-      `${currentUserIdentity()}:(OI)(CI)F`,
       "/T",
+      "/grant:r",
+      `${currentUserIdentity()}:(OI)(CI)(IO)F`,
+      "/grant:r",
+      `${currentUserIdentity()}:F`,
     ]);
     if (!/successfully processed/i.test(output)) {
       throw new Error(`icacls tree lockdown failed for ${root}: ${output}`);

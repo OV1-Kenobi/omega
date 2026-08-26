@@ -50,7 +50,9 @@ pattern).
 | `make-invoice` | host→sidecar | spend-adjacent | mints a signet BOLT11 via WalletService.Recv; prefix guard | yes, but gated by mandate in WP-5 |
 | `pay-invoice` | host→sidecar | spend | PrepareSend + Send; returns preimage when settled | yes, but **only after MandateStore authorization (WP-5, Rust side)** |
 | `activity` | host→sidecar | read | merged activity feed (WalletService.List ACTIVITY view) | yes (read-only) |
-| `identity-status` | host→sidecar | read | WP-4 stub: vault state, derived npub, recovery state (never key material) | yes (read-only projection) |
+| `identity-status` | host→sidecar | read | WP-4: real vault/identity state — vault state, derived npub + pubkey hex, recovery state (never key material) | yes (read-only projection) |
+| `mcp-identity-map-get` | host→sidecar | read | WP-6: the L-402 gateway's MCP-server → Nostr-identity attribution map (`{ entries: { serverId: principalPubkey } }`; public pubkeys only) | yes (read-only projection) |
+| `mcp-identity-map-set` | host→sidecar | operator | WP-6: set/unset a server → Nostr-identity mapping (64-hex principal or null) in the L-402 gateway store | no (stdio only) |
 | `shutdown` | host→sidecar | control | graceful stop (waved first, then exit) | no |
 
 ## 4. Error envelope (wavecli-style, stable codes)
@@ -69,8 +71,8 @@ pattern).
 | `CANCELED` | interrupted while waiting on settlement | no |
 | `DEADLINE_EXCEEDED` / `ABORTED` / `WAIT_TIMEOUT` | fund-moving RPC may have been accepted | **false** (wavecli rule) |
 | `MAINNET_REFUSED` | mainnet config/invoice refused | no |
-| `PAYMENT_HASH_MISMATCH` | preimage does not hash to payment hash (WP-6) | no |
-| `CREDENTIAL_CONSUMED` | L-402 token already redeemed (WP-6) | no |
+| `PAYMENT_HASH_MISMATCH` | preimage does not hash to payment hash (reserved; surfaces as the L-402 HTTP body code `invalid_payment_proof` at the gateway, design §5.6) | no |
+| `CREDENTIAL_CONSUMED` | L-402 token already redeemed (reserved; surfaces as the L-402 HTTP body code `credential_consumed` at the gateway) | no |
 | `STALE_GENERATION` | generation mismatch | no |
 | `ALREADY_RUNNING` | data-root lock held | no |
 | `WAVED_BINARY_MISSING` | no pinned waved artifact configured | no |
@@ -112,6 +114,47 @@ codes by message, `DEADLINE_EXCEEDED`→`DEADLINE_EXCEEDED`,
   `<data_root>/wavelength/data/<network>/admin.macaroon`. `--rpc.notls` /
   `--rpc.no-macaroons` are never passed outside regtest. `--allow-mainnet` is
   never passed.
+
+## 6a. L-402 gateway routes (WP-6; design §5; D3/D5)
+
+The MDK-protocol L-402 gateway is the **only paid boundary** in this phase
+(signet/testnet only; mainnet refused everywhere). It is served on the same
+loopback HTTP surface behind the same bearer token, and its state lives in
+SQLite at `<data_root>/l402/l402-gateway.db` (survives restarts by
+construction). Registered routes:
+
+| Route | Settlement | Scope |
+|---|---|---|
+| `POST /v1/l402/paid/echo` | immediate | the demo paid echo (1 sat) |
+| `POST /v1/l402/mcp/<server>/<tool>` | deferred | the demo paid-MCP-tool lane (`paid:tool:<server>:<tool>`, 1 sat) |
+
+Flow (audit §"Response Contract"; the agent's L-402 client is
+`crates/sovereign_wallet/src/l402.rs`):
+
+```text
+POST /v1/l402/paid/echo  (no proof)
+  <- 402 + WWW-Authenticate: L402 macaroon="<credential>", invoice="<lntbs…>"
+     + JSON { error:{code:"payment_required"}, challengeId, macaroon, invoice,
+              paymentHash, amountSats, expiresAt }
+agent pays the invoice through stdio pay-invoice (mandate-gated Rust-side)
+  -> preimage
+POST /v1/l402/paid/echo  (X-OpenAgents-L402: <macaroon>:<preimage>)
+  <- 200 + the protected response
+```
+
+HTTP body error codes (design §5.6): `payment_required` (402),
+`invalid_credential` / `invalid_payment_proof` / `credential_consumed` (401),
+`resource_mismatch` / `amount_mismatch` (403), `configuration_error` /
+`pricing_error` (500), `mainnet_refused` (500, D4), `invoice_mint_failed`
+(502), `wallet_locked` (503 — SEC-2026-054 fail-closed mint),
+`gateway_locked` (503 — the gateway HMAC key is unavailable until the vault is
+unlocked once). Security conditions SEC-2026-044 (vaulted HMAC key,
+rotation-by-version, constant-time verify), SEC-2026-047 (no preimage
+persisted), SEC-2026-048 (deferred-settlement crash window: `checked` row
+before the handler, settle-after-success, exactly one settled row), SEC-2026-054
+(locked-wallet mint refusal / redemption honored), SEC-2026-055 (paymentHash
+parsed from the minted BOLT11 `p` field, never client-supplied) are
+implemented in `src/l402.ts` + `src/l402-store.ts`.
 
 ## 7. Network posture (D4, SEC-2026-050)
 

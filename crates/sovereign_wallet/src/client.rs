@@ -133,6 +133,29 @@ impl SovereignWalletSupervisor {
         decode(result, "export-nostr-secret result")
     }
 
+    /// WP-6: the L-402 gateway's MCP-server -> Nostr-identity attribution map
+    /// (design §6.4 / §5.4). Returns `{ entries: { serverId: principalPubkey } }`
+    /// — public pubkeys only, never key material.
+    pub async fn mcp_identity_map_get(&mut self) -> Result<Value, SovereignWalletError> {
+        self.request("mcp-identity-map-get", None, self.generation()).await
+    }
+
+    /// WP-6: set (or unset, with `None`) a server -> Nostr-identity mapping in
+    /// the L-402 gateway store. `principal_pubkey` is a public 64-hex Nostr
+    /// pubkey; the sidecar validates the shape.
+    pub async fn mcp_identity_map_set(
+        &mut self,
+        server_id: &str,
+        principal_pubkey: Option<&str>,
+    ) -> Result<Value, SovereignWalletError> {
+        self.request(
+            "mcp-identity-map-set",
+            Some(json!({ "serverId": server_id, "principalPubkey": principal_pubkey })),
+            self.generation(),
+        )
+        .await
+    }
+
     /// Operator-only identity ceremony step 1 (design §4.3): generate + show
     /// the mnemonic once and hold it pending the word-challenge commit.
     /// Returns `{ mnemonic, challengeLabels, note }`.

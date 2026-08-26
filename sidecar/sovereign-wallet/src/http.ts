@@ -38,6 +38,19 @@ export interface LoopbackHttpOptions {
   token: string;
   onStatus: () => unknown;
   onBalance: () => Promise<unknown>;
+  /**
+   * WP-6: the L-402 gateway route handler (design §5). Receives the request
+   * method/path/headers/body of a gateway route and returns the gateway's
+   * response (status + headers + JSON body), or null when the path is not a
+   * gateway route (the surface then 404s). Registered routes:
+   * `POST /v1/l402/paid/echo` and `POST /v1/l402/mcp/<server>/<tool>`.
+   */
+  onL402?: (
+    method: string,
+    pathname: string,
+    headers: Record<string, string | string[] | undefined>,
+    body: string,
+  ) => Promise<{ status: number; headers: Record<string, string>; body: unknown } | null>;
 }
 
 export class LoopbackHttpServer {
@@ -93,6 +106,16 @@ export class LoopbackHttpServer {
       res.end(JSON.stringify(payload));
     };
 
+    const finishRaw = (
+      status: number,
+      headers: Record<string, string>,
+      payload: unknown,
+    ): void => {
+      if (aborted || res.writableEnded) return;
+      res.writeHead(status, { "content-type": "application/json", ...headers });
+      res.end(JSON.stringify(payload));
+    };
+
     req.on("end", () => {
       if (aborted) return;
       const method = req.method ?? "GET";
@@ -109,6 +132,28 @@ export class LoopbackHttpServer {
             finish(500, { error: { code: "internal", message: error instanceof Error ? error.message : "internal" } }),
           );
         return;
+      }
+      // WP-6: the L-402 gateway routes (the ONLY paid boundary). Auth gate
+      // already ran above: a wrong/missing bearer token is 401 before any
+      // gateway logic (SEC-2026-053).
+      if (opts.onL402) {
+        const gatewayPath =
+          url.pathname === "/v1/l402/paid/echo" || url.pathname.startsWith("/v1/l402/mcp/");
+        if (gatewayPath) {
+          void opts
+            .onL402(method, url.pathname, req.headers as Record<string, string | string[] | undefined>, body)
+            .then((result) => {
+              if (result) {
+                finishRaw(result.status, result.headers, result.body);
+              } else {
+                finish(404, { error: { code: "not_found" } });
+              }
+            })
+            .catch((error: unknown) =>
+              finish(500, { error: { code: "internal", message: error instanceof Error ? error.message : "internal" } }),
+            );
+          return;
+        }
       }
       finish(404, { error: { code: "not_found" } });
     });

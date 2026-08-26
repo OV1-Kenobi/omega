@@ -11,6 +11,11 @@ const schema = "openagents.omega.sovereign-wallet.v1";
 let generation = 1;
 let initializedGeneration = null;
 
+// WP-6: deterministic L-402 proof pair (sha256(preimage) == paymentHash).
+const FIXTURE_PREIMAGE = "b".repeat(64);
+const FIXTURE_PAYMENT_HASH = "4ca14526b2751b640d549ce7caf8ac39438592211a0ec370064d57666a682ad6";
+const FIXTURE_INVOICE = "lntbs100u1pfixture";
+
 function respond(id, ok, result, error) {
   process.stdout.write(
     JSON.stringify({ schema, kind: "response", id, generation, ok, result, error }) + "\n",
@@ -56,7 +61,15 @@ process.stdin.on("data", (chunk) => {
           protocolVersion: 1,
           serviceVersion: "fixture",
           generation,
-          capabilities: ["status", "balance"],
+          capabilities: [
+            "status",
+            "balance",
+            "make-invoice",
+            "pay-invoice",
+            "mcp-identity-map-get",
+            "mcp-identity-map-set",
+            "shutdown",
+          ],
           dataRoot: process.env.OMEGA_SOVEREIGN_WALLET_DATA_ROOT ?? "",
           network: FIXTURE_NETWORK,
           wavedNetwork: FIXTURE_NETWORK,
@@ -98,6 +111,52 @@ process.stdin.on("data", (chunk) => {
           pendingOutSat: "0",
           creditAvailableSat: "0",
           creditReservedSat: "0",
+        });
+        break;
+      case "make-invoice":
+        respond(id, true, {
+          invoice: FIXTURE_INVOICE,
+          paymentHash: FIXTURE_PAYMENT_HASH,
+          amountSat: frame.params?.amtSat ?? 1,
+          memo: frame.params?.memo ?? "",
+          hrp: "lntbs",
+        });
+        break;
+      case "pay-invoice": {
+        // The real sidecar refuses mainnet invoices (lnbc prefix guard); the
+        // fixture mirrors that so the L-402 mandate-gated pay tests observe
+        // MAINNET_REFUSED through the typed client.
+        const invoice = frame.params?.invoice ?? "";
+        if (invoice.startsWith("lnbc") && !invoice.startsWith("lnbcrt")) {
+          respond(id, false, undefined, {
+            code: "MAINNET_REFUSED",
+            message: "mainnet BOLT11 invoices are never paid or minted",
+            details: "",
+            retryable: false,
+            remediation: "",
+          });
+          break;
+        }
+        respond(id, true, {
+          paymentHash: FIXTURE_PAYMENT_HASH,
+          status: "ENTRY_STATUS_PENDING",
+          activityId: "fixture-activity-1",
+          actualAmountSat: "1",
+          expectedFeeSat: "0",
+          feeKnown: true,
+          warning: "",
+          preimage: FIXTURE_PREIMAGE,
+        });
+        break;
+      }
+      case "mcp-identity-map-get":
+        respond(id, true, { entries: {} });
+        break;
+      case "mcp-identity-map-set":
+        respond(id, true, {
+          serverId: frame.params?.serverId ?? "",
+          principalPubkey: frame.params?.principalPubkey ?? null,
+          updated: true,
         });
         break;
       case "shutdown":

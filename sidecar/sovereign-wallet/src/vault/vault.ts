@@ -235,7 +235,7 @@ export class Vault {
 
   /** Initialize a fresh vault under a passphrase (argon2id-wrapped master key). */
   async initialize(credential: string): Promise<void> {
-    for (const dir of ["identities", "wallet", "agents", "nip46"]) {
+    for (const dir of ["identities", "wallet", "agents", "nip46", "l402"]) {
       const sentinel = `${this.#config.vaultRoot}/${dir}/.keep`;
       if (!(await this.#storage.exists(sentinel))) {
         await this.#storage.write(sentinel, new Uint8Array(0));
@@ -357,6 +357,32 @@ export class Vault {
   }
 
   // -------------------------------------------------------------------------
+  // L-402 gateway HMAC key (WP-6; SEC-2026-044 custody)
+  // -------------------------------------------------------------------------
+  //
+  // The L-402 credential-signing key is generated once per data root and
+  // stored as an ordinary vault entry (`vault/l402/l402-hmac.key`,
+  // XChaCha20-Poly1305 under the vault master key) — never in the gateway
+  // SQLite, never in logs/frames. The gateway loads it into memory when the
+  // vault is first unlocked and retains it for the process lifetime so
+  // redemption of already-paid challenges stays honored while the wallet is
+  // locked (SEC-2026-054). These methods are the ONLY persistence surface for
+  // the key; the backup envelope includes the `l402` directory so one
+  // operator-held recovery chain restores the whole sovereign surface.
+
+  async storeL402Key(keyBytes: Uint8Array): Promise<void> {
+    const key = this.requireUnlocked();
+    this.resetIdleTimer();
+    await this.writeEncrypted(key, this.path("l402", "l402-hmac.key"), keyBytes);
+  }
+
+  async getL402Key(): Promise<Uint8Array> {
+    const key = this.requireUnlocked();
+    this.resetIdleTimer();
+    return this.readDecrypted(key, this.path("l402", "l402-hmac.key"));
+  }
+
+  // -------------------------------------------------------------------------
   // Generic encryption helpers
   // -------------------------------------------------------------------------
 
@@ -396,7 +422,7 @@ export class Vault {
     if (!encryptedMasterKeyBlob) throw vaultErr(VaultError.DecryptionFailed);
 
     const entries: Record<string, string> = {};
-    for (const dir of ["identities", "wallet", "agents", "nip46"]) {
+    for (const dir of ["identities", "wallet", "agents", "nip46", "l402"]) {
       const files = await this.#storage.list(`${this.#config.vaultRoot}/${dir}`);
       for (const file of files) {
         if (file === ".keep") continue;

@@ -16472,8 +16472,10 @@ name = "sovereign_wallet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "context_server",
  "futures 0.3.32",
  "gpui",
+ "http_client",
  "libc",
  "log",
  "node_runtime",

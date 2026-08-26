@@ -18,6 +18,8 @@ import path from "node:path";
 import { lockdownTree } from "./acl.js";
 import { LoopbackHttpServer, validateLoopbackToken } from "./http.js";
 import { IdempotencyStore } from "./idempotency.js";
+import { L402Gateway, DEMO_ECHO_PATH, DEMO_MCP_PATH_PREFIX } from "./l402.js";
+import { L402Store } from "./l402-store.js";
 import { acquireLock, type LockHandle } from "./lock.js";
 import type { ErrorCode } from "./protocol.js";
 import { PROTOCOL_SCHEMA, PROTOCOL_VERSION, SERVICE_VERSION, encodeResponse, errorEnvelope } from "./protocol.js";
@@ -111,6 +113,9 @@ export class SidecarCore {
    * redaction; cleared on completion, on lock, and on teardown).
    */
   #pendingMnemonic: string | null = null;
+  /** WP-6: the MDK-protocol L-402 gateway (design §5; D3/D5) — the ONLY paid boundary. */
+  #l402Gateway: L402Gateway | null = null;
+  #l402Store: L402Store | null = null;
 
   constructor(config: SidecarConfig) {
     this.#config = config;
@@ -182,6 +187,11 @@ export class SidecarCore {
     this.#vault = new Vault({ vaultRoot: "vault", idleTimeoutMs: 900_000 }, dataRoot);
     this.#vaultState = (await this.#vault.existsOnDisk()) ? "locked" : "none";
 
+    // WP-6: the L-402 gateway state store (SQLite; survives restarts by
+    // construction — design §5.5). The gateway itself is constructed after
+    // waved so its mint path can reach the wallet engine.
+    this.#l402Store = L402Store.open(path.join(dataRoot, "l402"));
+
     // HTTP surface: fail-closed on a missing/malformed token (SEC-2026-053).
     this.#httpReason = validateLoopbackToken(this.#config.loopbackToken) ?? undefined;
     if (!this.#httpReason && this.#config.loopbackToken) {
@@ -189,6 +199,20 @@ export class SidecarCore {
         token: this.#config.loopbackToken,
         onStatus: () => this.statusProjection(),
         onBalance: () => this.balance(),
+        // WP-6: the L-402 gateway routes (the ONLY paid boundary). The
+        // gateway is constructed after waved below; the handler is bound
+        // lazily through `this.#l402Gateway`.
+        onL402: (method, pathname, headers, body) => {
+          const gateway = this.#l402Gateway;
+          if (!gateway) {
+            return Promise.resolve({
+              status: 503,
+              headers: { "cache-control": "no-store" },
+              body: { error: { code: "gateway_unavailable", message: "the L-402 gateway is not initialized" } },
+            });
+          }
+          return gateway.handleRequest(method, pathname, headers, body);
+        },
       });
     }
 
@@ -218,6 +242,31 @@ export class SidecarCore {
     } else {
       this.#wavedUnavailableReason = "OMEGA_SOVEREIGN_WALLET_WAVED_BIN is not set";
     }
+
+    // WP-6: construct the L-402 gateway (design §5). The gateway mints via
+    // the Wavelength engine (Recv) and refuses mainnet everywhere; the
+    // wallet-ready gate is the sidecar's own `#requireWalletReady`
+    // (SEC-2026-054 locked-wallet fail-closed mint).
+    if (this.#l402Store) {
+      this.#l402Gateway = new L402Gateway({
+        network,
+        store: this.#l402Store,
+        vault: this.#vault,
+        walletReady: () => this.#requireWalletReady(),
+        mintInvoice: async (amtSat, memo) => {
+          const received = await this.#waved!.client.recvInvoice(amtSat, memo);
+          assertInvoiceNetwork(network, received.invoice);
+          return {
+            invoice: received.invoice,
+            entryPaymentHash:
+              received.entry.request?.lightning_invoice?.payment_hash ??
+              received.entry.progress?.payment_hash ??
+              null,
+          };
+        },
+        nowMs: () => Date.now(),
+      });
+    }
   }
 
   /** Ordered teardown: waved first, then HTTP, then idempotency, then lock. */
@@ -239,6 +288,16 @@ export class SidecarCore {
     }
     // Drop any pending identity ceremony mnemonic.
     this.#pendingMnemonic = null;
+    // WP-6: zeroize the L-402 gateway's in-memory HMAC key and close the
+    // gateway state store (SEC-2026-044 "zeroized on shutdown").
+    if (this.#l402Gateway) {
+      this.#l402Gateway.shutdown();
+      this.#l402Gateway = null;
+    }
+    if (this.#l402Store) {
+      this.#l402Store.close();
+      this.#l402Store = null;
+    }
     if (this.#waved) {
       await terminateWaved(this.#waved.child).catch(() => {});
       this.#waved = null;
@@ -305,8 +364,8 @@ export class SidecarCore {
       walletState: this.#walletState,
       // WP-4: the satnam-derived vault state — none (absent), locked, or unlocked.
       vaultState: this.#vaultState,
-      // WP-6 wires the MDK L-402 gateway; absent in WP-3.
-      l402GatewayState: "absent",
+      // WP-6: the MDK L-402 gateway state (real — ready/locked/unavailable/absent).
+      l402GatewayState: this.#l402Gateway?.state().state ?? "absent",
       httpSurface: this.httpSurface,
       dataRoot: this.#config.dataRoot,
     };
@@ -332,6 +391,8 @@ capabilities: [
         "vault-init",
         "vault-unlock",
         "export-nostr-secret",
+        "mcp-identity-map-get",
+        "mcp-identity-map-set",
         "shutdown",
       ],
       dataRoot: this.#config.dataRoot,
@@ -717,6 +778,39 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
   }
 
   /**
+   * WP-6: the MCP-server -> Nostr-identity mapping (design §6.4 / §5.4). Read
+   * projection of the L-402 gateway's attribution map — server id -> principal
+   * pubkey (64-hex, public). Never key material.
+   */
+  async mcpIdentityMapGet(): Promise<Record<string, unknown>> {
+    if (!this.#l402Store) {
+      throw envelopeError("INTERNAL", "the L-402 gateway store is not initialized");
+    }
+    return { entries: this.#l402Store.mcpIdentityMapGet() };
+  }
+
+  /**
+   * WP-6: set (or unset) the MCP-server -> Nostr-identity mapping. The
+   * principal is a public 64-hex Nostr pubkey (the pubkey-keyed L-402
+   * entitlement attribution). Operator/stdio surface only; the HTTP surface
+   * registers read projections only.
+   */
+  async mcpIdentityMapSet(serverId: string, principalPubkey: string | null): Promise<Record<string, unknown>> {
+    if (!this.#l402Store) {
+      throw envelopeError("INTERNAL", "the L-402 gateway store is not initialized");
+    }
+    const id = serverId.trim();
+    if (id.length === 0 || /[\s"']/.test(id) || /[\u0000-\u001f]/.test(id)) {
+      throw envelopeError("INVALID_ARGS", "serverId must be a non-empty id without whitespace, quotes, or control characters");
+    }
+    if (principalPubkey !== null && !/^[0-9a-fA-F]{64}$/.test(principalPubkey)) {
+      throw envelopeError("INVALID_ARGS", "principalPubkey must be 64-hex (a public Nostr pubkey) or null");
+    }
+    this.#l402Store.mcpIdentityMapSet(id, principalPubkey?.toLowerCase() ?? null);
+    return { serverId: id, principalPubkey: principalPubkey?.toLowerCase() ?? null, updated: true };
+  }
+
+  /**
    * Engine-owned syncing→ready advance (design §1.4 / wallet-lifecycle docs:
    * "automatically advances syncing to ready" by polling until ready).
    * Lazy refresh on demand plus a 2s background watcher while syncing.
@@ -829,6 +923,16 @@ case "identity-status":
         // surface registers read projections only, so this method is
         // unreachable from the agent channel by construction (tested).
         return this.exportNostrSecret();
+      case "mcp-identity-map-get":
+        // Read projection of the L-402 attribution map (public pubkeys only).
+        return this.mcpIdentityMapGet();
+      case "mcp-identity-map-set":
+        // Operator/stdio surface: set or unset a server -> Nostr-identity
+        // mapping (design §6.4). Never the agent HTTP channel.
+        return this.mcpIdentityMapSet(
+          requireString(params, "serverId"),
+          stringOrNull(params, "principalPubkey"),
+        );
       case "shutdown": {
         void this.stop().then(() => process.exit(0));
         return { stopping: true };
@@ -1069,6 +1173,13 @@ function requireNumber(params: Record<string, unknown>, key: string): number {
 function stringOr(params: Record<string, unknown>, key: string, fallback: string | undefined): string | undefined {
   const value = params[key];
   return typeof value === "string" ? value : fallback;
+}
+
+/** A string param that may be null (e.g. an unset principal mapping). */
+function stringOrNull(params: Record<string, unknown>, key: string): string | null {
+  const value = params[key];
+  if (value === null || value === undefined) return null;
+  return typeof value === "string" ? value : null;
 }
 
 function numberOr(params: Record<string, unknown>, key: string, fallback: number): number {

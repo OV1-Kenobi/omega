@@ -14,6 +14,7 @@
 //! kicks off the async start so the sidecar spawns in the running app.
 
 mod client;
+mod l402;
 mod mandate;
 mod protocol;
 mod supervisor;
@@ -21,6 +22,7 @@ mod supervisor;
 mod tests;
 
 pub use client::SovereignWalletError;
+pub use l402::{L402PayError, L402Proof, call_paid_route, pay_l402_challenge, parse_l402_challenge_body};
 pub use mandate::{
     SOVEREIGN_WALLET_STRATEGY, authorize_sovereign_spend, sovereign_wallet_instruction,
     sovereign_wallet_mandate_candidate,
