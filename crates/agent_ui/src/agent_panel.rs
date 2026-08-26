@@ -22240,6 +22240,40 @@ impl AgentPanel {
             .or(missing_forensics_content)
             .unwrap_or_else(|| content.into_any_element());
 
+        // Sovereign Agents dashboard (founder direction, 2026-08-25): a
+        // toggleable column beside the main content, inside the card shell —
+        // the primary surface does not draw the Zed dock system, so a dock
+        // panel would never be visible here.
+        let main_content = if self.omega_sovereign_dashboard_open {
+            let panel_background = cx.theme().colors().panel_background;
+            let border_color = cx.theme().colors().border;
+            let dashboard_column = self
+                .omega_sovereign_dashboard
+                .as_ref()
+                .map(|panel| {
+                    div()
+                        .w(px(360.))
+                        .h_full()
+                        .flex_none()
+                        .overflow_hidden()
+                        .bg(panel_background)
+                        .border_r_1()
+                        .border_color(border_color)
+                        .child(panel.clone())
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| div().into_any_element());
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(dashboard_column)
+                .child(main_content)
+                .into_any_element()
+        } else {
+            main_content
+        };
+
         let sidebar_open = self.sidebar.open;
         let sidebar_target = if sidebar_open {
             OMEGA_SIDEBAR_WIDTH
