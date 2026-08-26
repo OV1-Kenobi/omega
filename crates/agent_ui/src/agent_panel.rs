@@ -4603,6 +4603,11 @@ pub struct AgentPanel {
     /// refusal reached the user as nothing at all.
     omega_unavailable_surface: Option<OmegaUnavailableSurface>,
     omega_settings: Option<Entity<settings_ui::SettingsWindow>>,
+    /// Sovereign Agents dashboard (founder direction, 2026-08-25). Rendered
+    /// as a column inside the card shell — the primary surface does not draw
+    /// the Zed dock system, so a dock panel would never be visible here.
+    omega_sovereign_dashboard: Option<Entity<sovereign_dashboard::SovereignDashboardPanel>>,
+    omega_sovereign_dashboard_open: bool,
     #[cfg(debug_assertions)]
     omega_component_library: Option<Entity<component_library::ComponentLibrary>>,
     #[cfg(debug_assertions)]
@@ -5392,6 +5397,8 @@ impl AgentPanel {
             omega_unavailable_route: None,
             omega_unavailable_surface: None,
             omega_settings: None,
+            omega_sovereign_dashboard: None,
+            omega_sovereign_dashboard_open: false,
             #[cfg(debug_assertions)]
             omega_component_library: None,
             #[cfg(debug_assertions)]
@@ -18774,12 +18781,9 @@ impl AgentPanel {
                 .style(ButtonStyle::Subtle)
                 .aria_label("Open Sovereign Agents dashboard")
                 .tooltip(Tooltip::text("Sovereign Agents"))
-                .on_click(|_, window, cx| {
-                    window.dispatch_action(
-                        sovereign_dashboard::ToggleFocus.boxed_clone(),
-                        cx,
-                    );
-                });
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_sovereign_dashboard(cx);
+                }));
 
         v_flex()
             .id("omega.workbench.activity-rail")
@@ -19412,6 +19416,15 @@ impl AgentPanel {
         self.omega_component_library = None;
         self.omega_component_library_subscription = None;
         window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn toggle_sovereign_dashboard(&mut self, cx: &mut Context<Self>) {
+        self.omega_sovereign_dashboard_open = !self.omega_sovereign_dashboard_open;
+        if self.omega_sovereign_dashboard_open && self.omega_sovereign_dashboard.is_none() {
+            self.omega_sovereign_dashboard =
+                Some(cx.new(sovereign_dashboard::SovereignDashboardPanel::new));
+        }
         cx.notify();
     }
 
@@ -23469,12 +23482,9 @@ impl AgentPanel {
                             .aria_label("Open Sovereign Agents dashboard")
                             .tooltip(ui::Tooltip::text("Sovereign Agents"))
                             .hover(move |style| style.bg(hover_background))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    sovereign_dashboard::ToggleFocus.boxed_clone(),
-                                    cx,
-                                );
-                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_sovereign_dashboard(cx);
+                            }))
                             .child(
                                 Icon::new(IconName::BoltOutlined)
                                     .size(IconSize::Small)
@@ -24129,7 +24139,37 @@ impl Render for AgentPanel {
                 .child(self.render_activity_rail(layout.sidebar, window, cx))
                 .children(self.render_sidebar(layout.sidebar, window, cx))
                 .children(self.render_work_surface_dock(layout, window, cx))
-                .child(v_flex().flex_1().min_w_0().h_full().child(content))
+                .child(
+                    // The Sovereign Agents dashboard renders as a column
+                    // inside the card shell beside the active content: the
+                    // primary surface does not draw the Zed dock system, so
+                    // a dock panel would never be visible here.
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .children(
+                            self.omega_sovereign_dashboard_open.then(|| {
+                                self.omega_sovereign_dashboard
+                                    .as_ref()
+                                    .map(|panel| {
+                                        div()
+                                            .w(px(360.))
+                                            .h_full()
+                                            .flex_none()
+                                            .overflow_hidden()
+                                            .border_r_1()
+                                            .border_color(
+                                                cx.theme().colors().border,
+                                            )
+                                            .child(panel.clone())
+                                            .into_any_element()
+                                    })
+                                    .unwrap_or_else(|| div().into_any_element())
+                            }),
+                        )
+                        .child(v_flex().flex_1().min_w_0().h_full().child(content)),
+                )
                 .into_any_element()
         } else {
             content.into_any_element()

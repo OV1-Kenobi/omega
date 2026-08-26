@@ -60,7 +60,7 @@ impl SovereignDashboardPanel {
         })
     }
 
-    fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             stub_notice: None,
