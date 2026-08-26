@@ -23394,52 +23394,92 @@ impl AgentPanel {
             // )
             .child(
                 h_flex()
-                    .id("omega-effective-principal")
-                    .debug_selector(|| "omega.omega.effective-principal".into())
-                    .h(px(60.))
-                    .px(px(8.))
-                    .gap(px(8.))
-                    .rounded(px(8.))
-                    .cursor_pointer()
-                    .role(gpui::Role::Button)
-                    .aria_label(principal_accessibility_label)
-                    .hover(move |style| style.bg(hover_background))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_omega_settings(true, window, cx);
-                    }))
+                    .w_full()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        h_flex()
+                            .id("omega-effective-principal")
+                            .debug_selector(|| "omega.omega.effective-principal".into())
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(60.))
+                            .px(px(8.))
+                            .gap(px(8.))
+                            .rounded(px(8.))
+                            .cursor_pointer()
+                            .role(gpui::Role::Button)
+                            .aria_label(principal_accessibility_label)
+                            .hover(move |style| style.bg(hover_background))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_omega_settings(true, window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .size(px(24.))
+                                    .rounded_full()
+                                    .bg(text_accent)
+                                    .text_color(card_background)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(principal_initial),
+                            )
+                            .child(
+                                v_flex().min_w_0().flex_1().child(
+                                    h_flex()
+                                        .gap(px(5.))
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .truncate()
+                                                .child(effective_principal.display_name),
+                                        )
+                                        .child(
+                                            Icon::new(principal_icon)
+                                                .size(IconSize::XSmall)
+                                                .color(principal_color),
+                                        ),
+                                ),
+                            )
+                            .child(
+                                Icon::new(IconName::Settings)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    // Sovereign Agents dashboard (founder direction,
+                    // 2026-08-25): the entry point lives beside the account
+                    // row in the card shell, where the operator actually
+                    // looks — the Zed-style activity rail is not the primary
+                    // surface on every screen.
                     .child(
                         div()
-                            .size(px(24.))
-                            .rounded_full()
-                            .bg(text_accent)
-                            .text_color(card_background)
+                            .id("open-sovereign-dashboard")
+                            .debug_selector(|| "omega.omega.open-sovereign-dashboard".into())
+                            .size(px(28.))
+                            .flex_none()
+                            .rounded(px(8.))
+                            .cursor_pointer()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(principal_initial),
-                    )
-                    .child(
-                        v_flex().min_w_0().flex_1().child(
-                            h_flex()
-                                .gap(px(5.))
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .child(effective_principal.display_name),
-                                )
-                                .child(
-                                    Icon::new(principal_icon)
-                                        .size(IconSize::XSmall)
-                                        .color(principal_color),
-                                ),
-                        ),
-                    )
-                    .child(
-                        Icon::new(IconName::Settings)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
+                            .role(gpui::Role::Button)
+                            .aria_label("Open Sovereign Agents dashboard")
+                            .tooltip(ui::Tooltip::text("Sovereign Agents"))
+                            .hover(move |style| style.bg(hover_background))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    sovereign_dashboard::ToggleFocus.boxed_clone(),
+                                    cx,
+                                );
+                            })
+                            .child(
+                                Icon::new(IconName::BoltOutlined)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            ),
                     ),
             );
 
