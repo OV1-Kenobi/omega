@@ -774,6 +774,15 @@ impl WindowsWindowInner {
             if self.state.is_maximized() {
                 let dpi = GetDpiForWindow(handle);
                 (*params).rgrc[0].top += get_frame_thicknessx(dpi);
+                // A maximized client-side-decorated window extends past the
+                // monitor work area by the frame thickness on every side, and
+                // the DefWindowProc client computation does not remove that
+                // overhang at the bottom. Without this inset the bottom of
+                // the client area renders below the visible screen when
+                // maximized: bottom-anchored chrome (dock panels, status
+                // bars, rail buttons) disappears until the window is
+                // restored. Windowed geometry is unaffected.
+                (*params).rgrc[0].bottom -= get_frame_thicknessy(dpi);
             }
             Some(result.0 as isize)
         }
