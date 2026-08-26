@@ -10972,3 +10972,35 @@ dark-only Aiur decision itself stands unchanged - Aiur still declares exactly
 one dark theme and no suffixed Aiur variant exists.
 
 - **Enforced by:** `sarah_is_the_default_dark_theme` in `omega_deltas`.
+
+### OMEGA-DELTA-0284 - The sovereign identity derives from a BIP-39/NIP-06 shared root
+
+Upstream Zed has no sovereign identity; Omega-before-this generated one random
+Nostr keypair per account and derived nothing (documented at
+`crates/agent_ui/src/effective_principal.rs`).
+
+Omega now derives the sovereign identity from a BIP-39 shared root (12-word
+English mnemonic, empty passphrase, BIP-32 master seed) at the NIP-06 path
+`m/44'/1237'/0'/0/0`, per founder decision D2 (2026-08-26) and the
+satnam/sovereign-identity lineage. The frozen public vector ("abandon … about"
+→ `npub1az708q3kd9zy6z6f44zav5ygvdwelkzspf6mtusttx47lft2z38sghk0w7`) is the
+derivation test.
+
+Reading of D2 (accepted question Q1): the shared BIP-39 root is the identity
+root and the vault root. The Wavelength wallet keeps its own 24-word aezeed
+seed — aezeed is not BIP-39 and is never derived from the root; it is captured
+once at create and stored encrypted inside the vault, so one operator-held
+recovery chain still restores the whole sovereign surface. Spark is dropped and
+is not part of this root (founder decision).
+
+The random-keypair path remains as the import/legacy entry (`importFromNsec`),
+exactly as satnam keeps it; the activation ceremony and NIP-49 recovery in the
+Rust `omega_identity` crates are preserved unchanged. Authority split: the
+sidecar is the identity/vault root; Rust `omega_identity` keeps Nostr event
+signing and agent grants via the existing import path.
+
+Why: the same BIP-39 root must derive the sovereign identity (and protect the
+vault) so one operator-held recovery artifact restores the whole sovereign
+surface.
+
+- **Enforced by:** `sovereign_identity_derives_from_bip39_nip06_root` in `omega_deltas`.

@@ -22,6 +22,8 @@ import { acquireLock, type LockHandle } from "./lock.js";
 import type { ErrorCode } from "./protocol.js";
 import { PROTOCOL_SCHEMA, PROTOCOL_VERSION, SERVICE_VERSION, encodeResponse, errorEnvelope } from "./protocol.js";
 import { clearRegisteredSecrets, redact, registerSecret } from "./redact.js";
+import { MIN_PASSPHRASE_LEN, Vault } from "./vault/vault.js";
+import { listPrimaryNpub } from "./identity/index.js";
 import {
   WavelengthClient,
   assertInvoiceNetwork,
@@ -95,6 +97,9 @@ export class SidecarCore {
   #walletState: WalletState = "none";
   #generation: number;
   #syncWatcher: ReturnType<typeof setInterval> | null = null;
+  /** WP-4: satnam-derived identity/vault root. Absent-vs-locked-vs-unlocked. */
+  #vault: Vault | null = null;
+  #vaultState: "none" | "locked" | "unlocked" = "none";
 
   constructor(config: SidecarConfig) {
     this.#config = config;
@@ -160,6 +165,12 @@ export class SidecarCore {
     this.#walletCreated = marker?.created ?? false;
     this.#walletState = this.#walletCreated ? "locked" : "none";
 
+    // WP-4 vault: satnam-derived identity/vault root at <data_root>/vault.
+    // The vault is the sidecar's authority for the BIP-39 identity/vault root
+    // and the Wavelength wallet secrets (Q1: aezeed vaulted, not derived).
+    this.#vault = new Vault({ vaultRoot: "vault", idleTimeoutMs: 900_000 }, dataRoot);
+    this.#vaultState = (await this.#vault.existsOnDisk()) ? "locked" : "none";
+
     // HTTP surface: fail-closed on a missing/malformed token (SEC-2026-053).
     this.#httpReason = validateLoopbackToken(this.#config.loopbackToken) ?? undefined;
     if (!this.#httpReason && this.#config.loopbackToken) {
@@ -207,6 +218,13 @@ export class SidecarCore {
     if (this.#syncWatcher) {
       clearInterval(this.#syncWatcher);
       this.#syncWatcher = null;
+    }
+    // WP-4: lock the vault (zeroize the master key) on any teardown, so a
+    // crash/restart never leaves key material in a lingering process's heap.
+    if (this.#vault) {
+      this.#vault.lock();
+      this.#vaultState = "locked";
+      this.#vault = null;
     }
     if (this.#waved) {
       await terminateWaved(this.#waved.child).catch(() => {});
@@ -272,8 +290,8 @@ export class SidecarCore {
       wavedConnected: this.wavedConnected,
       wavedUnavailableReason: this.#wavedUnavailableReason,
       walletState: this.#walletState,
-      // WP-4 wires the satnam-derived vault; absent by construction in WP-3.
-      vaultState: "absent",
+      // WP-4: the satnam-derived vault state — none (absent), locked, or unlocked.
+      vaultState: this.#vaultState,
       // WP-6 wires the MDK L-402 gateway; absent in WP-3.
       l402GatewayState: "absent",
       httpSurface: this.httpSurface,
@@ -373,16 +391,20 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
     }
   }
 
-  /** Operator-only: lock the wallet surface (vault idle-lock seam, WP-4). */
+  /** Operator-only: lock the wallet surface and the vault (design §2.2). */
   async lock(): Promise<Record<string, unknown>> {
     // WP-3 seam: waved has no documented remote lock RPC, so the sidecar
     // enforces the lock boundary in memory (wallet RPCs refuse until unlock).
-    // WP-4 wires the vault idle-lock here (zeroize master key + wallet lock).
-this.#walletPassword = null;
+    // WP-4: the vault locks here too (zeroizes the master key).
+    this.#walletPassword = null;
     this.#operatorLocked = true;
     this.#walletState = "locked";
+    if (this.#vault) {
+      this.#vault.lock();
+      this.#vaultState = "locked";
+    }
     this.#stopSyncWatcher();
-    return { walletState: this.#walletState };
+    return { walletState: this.#walletState, vaultState: this.#vaultState };
   }
 
   /** Mint a signet BOLT11 invoice (design §2.2; prefix guard §3.4). */
@@ -454,13 +476,37 @@ this.#walletPassword = null;
     };
   }
 
-  /** WP-4 stub: identity/vault projection, never key material. */
-  identityStatus(): Record<string, unknown> {
+  /**
+   * Identity/vault projection (design §2.2 `identity-status`). Read-only,
+   * public projection only — never key material. Reports real vault/identity
+   * state: created (none/locked/unlocked) and the derived npub.
+   */
+  async identityStatus(): Promise<Record<string, unknown>> {
+    if (!this.#vault) {
+      return {
+        vaultState: "none",
+        derivedNpub: null,
+        recoveryArtifactState: "absent",
+        note: "vault not initialized",
+      };
+    }
+    // The vault state is derived from both the on-disk marker and the in-memory
+    // master key (a locked-on-disk vault is "locked" until unlocked).
+    const onDisk = await this.#vault.existsOnDisk();
+    const state: "none" | "locked" | "unlocked" = !onDisk
+      ? "none"
+      : this.#vault.isUnlocked()
+        ? "unlocked"
+        : "locked";
+    let derivedNpub: string | null = null;
+    if (this.#vault.isUnlocked()) {
+      derivedNpub = await listPrimaryNpub(this.#vault).catch(() => null);
+    }
     return {
-      vaultState: "absent",
-      derivedNpub: null,
-      recoveryArtifactState: "absent",
-      note: "WP-4 wires the satnam-derived identity/vault; this is the typed stub surface",
+      vaultState: state,
+      derivedNpub,
+      recoveryArtifactState: onDisk ? "absent" : "absent", // operator-exported; not auto-persisted
+      note: "WP-4: satnam-derived identity/vault (BIP-39/NIP-06 root, OMEGA-DELTA-0284)",
     };
   }
 

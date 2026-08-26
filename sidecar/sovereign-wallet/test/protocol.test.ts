@@ -191,7 +191,10 @@ describe("protocol round-trip against fake waved", () => {
 
       const status = expectOk(await sidecar.request("status"));
       assert.equal(status.network, "signet");
-      assert.equal(status.vaultState, "absent");
+      // WP-4 (OMEGA-DELTA-0284): the vault is now a real surface. In a fresh
+      // data root it is "none" (no vault initialized), not the WP-3 "absent"
+      // stub marker.
+      assert.equal(status.vaultState, "none");
 
       // Wallet not created: balance refuses with WALLET_LOCKED-class error.
       const lockedBalance = expectError(await sidecar.request("balance"));
@@ -232,7 +235,10 @@ describe("protocol round-trip against fake waved", () => {
       assert.equal(Array.isArray(activity.entries), true);
 
       const identity = expectOk(await sidecar.request("identity-status"));
-      assert.equal(identity.vaultState, "absent"); // WP-4 stub
+      // WP-4 (OMEGA-DELTA-0284): the identity-status stub is now wired to real
+      // vault/identity state. A fresh data root reports vaultState "none"
+      // (vault not yet initialized), replacing the WP-3 "absent" stub marker.
+      assert.equal(identity.vaultState, "none");
 
       const shutdown = expectOk(await sidecar.request("shutdown"));
       assert.equal(shutdown.stopping, true);
