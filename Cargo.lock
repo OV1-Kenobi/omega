@@ -647,6 +647,7 @@ dependencies = [
  "sha2 0.10.9",
  "shlex",
  "smol",
+ "sovereign_dashboard",
  "streaming_diff",
  "task",
  "telemetry",
@@ -11525,6 +11526,8 @@ dependencies = [
  "shellexpand",
  "smol",
  "snippet_provider",
+ "sovereign_dashboard",
+ "sovereign_wallet",
  "sysinfo 0.37.2",
  "system_specs",
  "task",
@@ -16443,6 +16446,37 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sovereign_dashboard"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "ui",
+ "workspace",
+]
+
+[[package]]
+name = "sovereign_wallet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.32",
+ "gpui",
+ "libc",
+ "log",
+ "node_runtime",
+ "paths",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "smol",
+ "tempfile",
+ "thiserror 2.0.17",
+ "util",
+ "zeroize",
 ]
 
 [[package]]
