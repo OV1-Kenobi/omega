@@ -253,6 +253,7 @@ pub const ENFORCED_DELTAS: &[&str] = &[
     "OMEGA-DELTA-0280",
     "OMEGA-DELTA-0281",
     "OMEGA-DELTA-0282",
+    "OMEGA-DELTA-0283",
 ];
 
 /// OMEGA-DELTA-0281. `eval_cli` is a headless production tool. These direct
@@ -4428,8 +4429,9 @@ mod tests {
              name the same theme."
         );
         assert_eq!(
-            dark_defaults[0].1, "Aiur",
-            "OMEGA-DELTA-0016: the dark default must be Aiur"
+            dark_defaults[0].1, "Sarah",
+            "OMEGA-DELTA-0283: the dark default must be Sarah (amends the \
+             OMEGA-DELTA-0016 value of Aiur)"
         );
     }
 
@@ -4501,6 +4503,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// OMEGA-DELTA-0283. Sarah is the default dark theme, everywhere the
+    /// decision lives.
+    ///
+    /// Three mechanisms carry one decision: the shipped settings files name
+    /// `"Sarah"`, the two `DEFAULT_DARK_THEME` constants agree with them, and
+    /// the theme actually ships under `assets/themes/sarah/sarah.json` (dark
+    /// appearance, named exactly `Sarah`). The compiled-in fallback is checked
+    /// too, because a fallback that silently dropped the Sarah theme would
+    /// leave a fresh install resolving to whatever shipped theme sorts first.
+    #[test]
+    fn sarah_is_the_default_dark_theme() {
+        // 1. Both shipped settings files select Sarah for the dark appearance.
+        for settings_file in SHIPPED_THEME_SETTINGS_FILES {
+            let settings_path = repository_path(settings_file);
+            let raw = std::fs::read_to_string(&settings_path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", settings_path.display()));
+            let settings: serde_json::Value = serde_json::from_str(&strip_jsonc(&raw))
+                .unwrap_or_else(|error| {
+                    panic!("cannot parse {}: {error}", settings_path.display())
+                });
+            let dark = default_setting(&settings, "theme.dark")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("OMEGA-DELTA-0283: {settings_file} no longer names theme.dark")
+                });
+            assert_eq!(
+                dark, "Sarah",
+                "OMEGA-DELTA-0283: {settings_file} no longer resolves the dark \
+                 appearance to Sarah"
+            );
+        }
+
+        // 2. Both DEFAULT_DARK_THEME constants say Sarah.
+        for relative_path in [
+            "crates/theme/src/theme.rs",
+            "crates/settings_content/src/theme.rs",
+        ] {
+            let path = repository_path(relative_path);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+            let declared = string_constant(&source, "DEFAULT_DARK_THEME").unwrap_or_else(|| {
+                panic!("DEFAULT_DARK_THEME is not declared as a string literal in {relative_path}")
+            });
+            assert_eq!(
+                declared, "Sarah",
+                "OMEGA-DELTA-0283: DEFAULT_DARK_THEME in {relative_path} is \
+                 {declared:?}; the default dark theme must stay Sarah"
+            );
+        }
+
+        // 3. The shipped JSON theme declares Sarah as a dark theme.
+        let shipped = shipped_theme_names().expect("shipped themes parse");
+        assert!(
+            shipped.contains("Sarah"),
+            "OMEGA-DELTA-0283: no theme under assets/themes/ declares Sarah; \
+             the default dark theme would resolve to nothing"
+        );
+        let sarah_path = repository_path("assets/themes/sarah/sarah.json");
+        let raw = std::fs::read_to_string(&sarah_path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", sarah_path.display()));
+        let family: serde_json::Value = serde_json::from_str(&strip_jsonc(&raw))
+            .unwrap_or_else(|error| panic!("cannot parse {}: {error}", sarah_path.display()));
+        assert_eq!(
+            family.get("name").and_then(serde_json::Value::as_str),
+            Some("Sarah"),
+            "OMEGA-DELTA-0283: the Sarah family must be named Sarah"
+        );
+        let themes = family
+            .get("themes")
+            .and_then(serde_json::Value::as_array)
+            .expect("sarah.json declares a themes array");
+        assert_eq!(themes.len(), 1, "OMEGA-DELTA-0283: Sarah ships exactly one theme");
+        assert_eq!(
+            themes[0].get("appearance").and_then(serde_json::Value::as_str),
+            Some("dark"),
+            "OMEGA-DELTA-0283: Sarah ships as a dark theme"
+        );
+
+        // 4. The compiled-in fallback still carries the Sarah theme.
+        let fallback_path = repository_path("crates/theme/src/fallback_themes.rs");
+        let fallback = std::fs::read_to_string(&fallback_path).unwrap_or_else(|error| {
+            panic!("cannot read {}: {error}", fallback_path.display())
+        });
+        assert!(
+            fallback.contains("id: \"sarah\".to_string()"),
+            "OMEGA-DELTA-0283: the compiled-in Sarah fallback theme has been \
+             removed from crates/theme/src/fallback_themes.rs"
+        );
+        assert!(
+            fallback.contains("sarah_dark()"),
+            "OMEGA-DELTA-0283: sarah_dark() is no longer registered in the \
+             default theme family"
+        );
+
+        // 5. The onboarding picker lists Sarah as the first family.
+        let basics_path = repository_path("crates/onboarding/src/basics_page.rs");
+        let basics = std::fs::read_to_string(&basics_path).unwrap_or_else(|error| {
+            panic!("cannot read {}: {error}", basics_path.display())
+        });
+        assert!(
+            basics.contains("const DARK_THEMES: [&str; 4] = [\"Sarah\", \"Aiur\","),
+            "OMEGA-DELTA-0283: Sarah is no longer the first dark family card \
+             in the onboarding theme picker"
+        );
     }
 
     /// OMEGA-DELTA-0026. The shipped defaults still point away from Zed's

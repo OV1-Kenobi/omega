@@ -14,7 +14,7 @@
   "theme": {
     "mode": "system",
     "light": "Ayu Light",
-    "dark": "Aiur",
+    "dark": "Sarah",
   },
   // Upstream Zed names this "Zed (Default)". It has to match
   // DEFAULT_ICON_THEME_NAME in crates/theme/src/icon_theme.rs, which registers

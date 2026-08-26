@@ -10944,3 +10944,31 @@ WP10 scale guard is the re-evaluation trigger, not a schema change).
 
 - **Enforced by:** `library_store_carries_saved_analyses_and_capabilities` in
   `omega_deltas` plus the `prompt_store` migration and round-trip tests.
+
+### OMEGA-DELTA-0283 - Sarah is the default dark theme
+
+Upstream Zed and Omega-before-this resolved the dark appearance to the Aiur
+theme (Protoss-blue system, `assets/themes/aiur/aiur.json`).
+
+Omega now ships `assets/themes/sarah/sarah.json` - the Sarah brand theme
+(warm near-black navy surfaces `#0b0f1a`/`#0d111c`/`#1a2035`, soft off-white
+text `#e8ebf0`, one warm gold accent `#d4a843`) - and resolves the dark
+appearance to it: `assets/settings/default.json` and
+`assets/settings/initial_user_settings.json` set `"theme.dark": "Sarah"`, and
+`DEFAULT_DARK_THEME` in `crates/theme/src/theme.rs` and
+`crates/settings_content/src/theme.rs` is `"Sarah"`. A compiled-in fallback
+(`sarah_dark()` in `crates/theme/src/fallback_themes.rs`, following the
+O1-P3 Khala pattern) guarantees the theme resolves even when the shipped
+JSON assets are absent. The onboarding theme picker lists Sarah as the first
+family card (dark-only, like Aiur: selecting Sarah in either appearance
+resolves to Sarah). Aiur remains shipped and selectable; light appearance
+continues to resolve to Ayu Light.
+
+Why: owner direction, 2026-08-25. Sarah is the OpenAgents voice-interface
+brand and the owner asked for Sarah styling deployed as the default surface
+("Sarah should be the default dark theme"). This amends the default named in
+OMEGA-DELTA-0016 (which locked `DEFAULT_DARK_THEME = "Aiur"`); that delta's
+dark-only Aiur decision itself stands unchanged - Aiur still declares exactly
+one dark theme and no suffixed Aiur variant exists.
+
+- **Enforced by:** `sarah_is_the_default_dark_theme` in `omega_deltas`.

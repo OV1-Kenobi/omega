@@ -17,7 +17,7 @@ pub fn zed_default_themes() -> ThemeFamily {
         id: "zed-default".to_string(),
         name: "Zed Default".into(),
         author: "".into(),
-        themes: vec![zed_default_dark(), khala_dark()],
+        themes: vec![zed_default_dark(), khala_dark(), sarah_dark()],
         scales: default_color_scales(),
     }
 }
@@ -454,6 +454,323 @@ pub(crate) fn khala_dark() -> Theme {
                 ghost_element_background: SystemColors::default().transparent,
                 ghost_element_hover: blue_200.opacity(20. / 255.),
                 ghost_element_active: blue_200.opacity(33. / 255.),
+                ghost_element_selected: accent.opacity(41. / 255.),
+                ghost_element_disabled: surface,
+                text,
+                text_muted,
+                text_placeholder: text_faint,
+                text_disabled,
+                text_accent: accent,
+                icon: text,
+                icon_muted: text_muted,
+                icon_disabled: text_disabled,
+                icon_placeholder: text_faint,
+                icon_accent: accent,
+                debugger_accent: error_red,
+                status_bar_background: surface,
+                title_bar_background: surface,
+                title_bar_inactive_background: void,
+                toolbar_background: void,
+                tab_bar_background: surface,
+                tab_inactive_background: surface,
+                tab_active_background: void,
+                search_match_background: accent.opacity(102. / 255.),
+                search_active_match_background: amber.opacity(102. / 255.),
+                panel_background: surface,
+                panel_focused_border: focus,
+                panel_indent_guide: border_variant,
+                panel_indent_guide_hover: border_strong,
+                panel_indent_guide_active: border_strong,
+                panel_overlay_background: surface_overlay,
+                panel_overlay_hover: border,
+                pane_focused_border: focus,
+                pane_group_border: border,
+                scrollbar_thumb_background: muted.opacity(76. / 255.),
+                scrollbar_thumb_hover_background: border_strong,
+                scrollbar_thumb_active_background: border_strong,
+                scrollbar_thumb_border: border,
+                scrollbar_track_background: SystemColors::default().transparent,
+                scrollbar_track_border: border_variant,
+                editor_foreground: text_body,
+                editor_background: void,
+                editor_gutter_background: void,
+                editor_subheader_background: surface,
+                editor_active_line_background: surface_raised.opacity(191. / 255.),
+                editor_highlighted_line_background: surface_raised,
+                editor_line_number: border_strong,
+                editor_active_line_number: text_faint,
+                editor_hover_line_number: text_body,
+                editor_invisible: border_strong,
+                editor_wrap_guide: muted.opacity(13. / 255.),
+                editor_active_wrap_guide: muted.opacity(26. / 255.),
+                editor_document_highlight_read_background: accent.opacity(26. / 255.),
+                editor_document_highlight_write_background: border_strong.opacity(102. / 255.),
+                terminal_background: void,
+                terminal_foreground: text,
+                terminal_bright_foreground: text,
+                terminal_dim_foreground: text_disabled,
+                terminal_ansi_background: void,
+                terminal_ansi_black: border_strong,
+                terminal_ansi_bright_black: text_disabled,
+                terminal_ansi_dim_black: border,
+                terminal_ansi_red: red,
+                terminal_ansi_bright_red: hsla(349.89 / 360., 1.0, 81.37 / 100., 1.0),
+                terminal_ansi_dim_red: hsla(347.55 / 360., 47.32 / 100., 56.08 / 100., 1.0),
+                terminal_ansi_green: green,
+                terminal_ansi_bright_green: hsla(87.91 / 360., 58.11 / 100., 70.98 / 100., 1.0),
+                terminal_ansi_dim_green: hsla(87.69 / 360., 32.77 / 100., 46.67 / 100., 1.0),
+                terminal_ansi_yellow: amber,
+                terminal_ansi_bright_yellow: hsla(40.0 / 360., 80.0 / 100., 70.59 / 100., 1.0),
+                terminal_ansi_dim_yellow: hsla(35.0 / 360., 37.8 / 100., 50.2 / 100., 1.0),
+                terminal_ansi_blue: accent,
+                terminal_ansi_bright_blue: accent_hover,
+                terminal_ansi_dim_blue: accent_active,
+                terminal_ansi_magenta: magenta,
+                terminal_ansi_bright_magenta: hsla(264.3 / 360., 1.0, 84.51 / 100., 1.0),
+                terminal_ansi_dim_magenta: hsla(264.0 / 360., 38.83 / 100., 59.61 / 100., 1.0),
+                terminal_ansi_cyan: cyan,
+                terminal_ansi_bright_cyan: hsla(199.18 / 360., 1.0, 80.98 / 100., 1.0),
+                terminal_ansi_dim_cyan: hsla(197.14 / 360., 47.06 / 100., 53.33 / 100., 1.0),
+                terminal_ansi_white: text,
+                terminal_ansi_bright_white: hsla(0.0 / 360., 0.0 / 100., 100.0 / 100., 1.0),
+                terminal_ansi_dim_white: muted,
+                link_text_hover: accent_hover,
+                version_control_added: success_green,
+                version_control_deleted: error_red,
+                version_control_modified: accent,
+                version_control_renamed: accent,
+                version_control_conflict: warning_amber,
+                version_control_ignored: text_disabled,
+                version_control_word_added: success_green.opacity(89. / 255.),
+                version_control_word_deleted: error_red.opacity(204. / 255.),
+                version_control_conflict_marker_ours: success_green.opacity(26. / 255.),
+                version_control_conflict_marker_theirs: accent.opacity(26. / 255.),
+                ..ThemeColors::dark()
+            },
+            status: StatusColors {
+                conflict: warning_amber,
+                conflict_background: warning_amber.opacity(26. / 255.),
+                conflict_border: warning_amber.opacity(64. / 255.),
+                created: success_green,
+                created_background: success_green.opacity(26. / 255.),
+                created_border: success_green.opacity(64. / 255.),
+                deleted: error_red,
+                deleted_background: error_red.opacity(26. / 255.),
+                deleted_border: error_red.opacity(64. / 255.),
+                error: error_red,
+                error_background: error_red.opacity(26. / 255.),
+                error_border: error_red.opacity(64. / 255.),
+                hidden: text_disabled,
+                hidden_background: text_disabled.opacity(26. / 255.),
+                hidden_border: border_strong,
+                hint: text_faint,
+                hint_background: focus.opacity(26. / 255.),
+                hint_border: border_strong,
+                ignored: text_disabled,
+                ignored_background: text_disabled.opacity(26. / 255.),
+                ignored_border: border,
+                info: info_cyan,
+                info_background: info_cyan.opacity(26. / 255.),
+                info_border: border_strong,
+                modified: warning_amber,
+                modified_background: warning_amber.opacity(26. / 255.),
+                modified_border: warning_amber.opacity(64. / 255.),
+                predictive: text_faint,
+                predictive_background: text_faint.opacity(26. / 255.),
+                predictive_border: border_strong,
+                renamed: accent,
+                renamed_background: accent.opacity(26. / 255.),
+                renamed_border: border_strong,
+                success: success_green,
+                success_background: success_green.opacity(26. / 255.),
+                success_border: success_green.opacity(64. / 255.),
+                unreachable: muted,
+                unreachable_background: muted.opacity(26. / 255.),
+                unreachable_border: border,
+                warning: warning_amber,
+                warning_background: warning_amber.opacity(26. / 255.),
+                warning_border: warning_amber.opacity(64. / 255.),
+            },
+            player: PlayerColors(vec![
+                PlayerColor {
+                    cursor: accent,
+                    background: accent,
+                    selection: accent.opacity(77. / 255.),
+                },
+                PlayerColor {
+                    cursor: red,
+                    background: red,
+                    selection: red.opacity(61. / 255.),
+                },
+                PlayerColor {
+                    cursor: orange,
+                    background: orange,
+                    selection: orange.opacity(61. / 255.),
+                },
+                PlayerColor {
+                    cursor: magenta,
+                    background: magenta,
+                    selection: magenta.opacity(61. / 255.),
+                },
+                PlayerColor {
+                    cursor: cyan,
+                    background: cyan,
+                    selection: cyan.opacity(61. / 255.),
+                },
+                PlayerColor {
+                    cursor: error_red,
+                    background: error_red,
+                    selection: error_red.opacity(61. / 255.),
+                },
+                PlayerColor {
+                    cursor: amber,
+                    background: amber,
+                    selection: amber.opacity(61. / 255.),
+                },
+                PlayerColor {
+                    cursor: green,
+                    background: green,
+                    selection: green.opacity(61. / 255.),
+                },
+            ]),
+            syntax: Arc::new(SyntaxTheme::new(vec![
+                ("attribute".into(), accent.into()),
+                ("boolean".into(), orange.into()),
+                ("comment".into(), text_faint.into()),
+                ("comment.doc".into(), muted.into()),
+                ("constant".into(), amber.into()),
+                ("constructor".into(), accent.into()),
+                ("embedded".into(), text.into()),
+                ("emphasis".into(), accent.into()),
+                (
+                    "emphasis.strong".into(),
+                    HighlightStyle {
+                        color: Some(orange),
+                        font_weight: Some(FontWeight::BOLD),
+                        ..HighlightStyle::default()
+                    },
+                ),
+                ("enum".into(), cyan.into()),
+                ("function".into(), accent.into()),
+                ("hint".into(), text_faint.into()),
+                ("keyword".into(), magenta.into()),
+                ("label".into(), accent.into()),
+                (
+                    "link_text".into(),
+                    HighlightStyle {
+                        color: Some(accent),
+                        font_style: Some(FontStyle::Italic),
+                        ..HighlightStyle::default()
+                    },
+                ),
+                ("link_uri".into(), cyan.into()),
+                ("namespace".into(), text.into()),
+                ("number".into(), orange.into()),
+                ("operator".into(), cyan.into()),
+                (
+                    "predictive".into(),
+                    HighlightStyle {
+                        color: Some(text_faint),
+                        font_style: Some(FontStyle::Italic),
+                        ..HighlightStyle::default()
+                    },
+                ),
+                ("preproc".into(), magenta.into()),
+                ("primary".into(), muted.into()),
+                ("property".into(), red.into()),
+                ("punctuation".into(), muted.into()),
+                ("punctuation.bracket".into(), muted.into()),
+                ("punctuation.delimiter".into(), muted.into()),
+                ("punctuation.list_marker".into(), red.into()),
+                ("punctuation.markup".into(), red.into()),
+                ("punctuation.special".into(), orange.into()),
+                ("selector".into(), amber.into()),
+                ("selector.pseudo".into(), accent.into()),
+                ("string".into(), green.into()),
+                ("string.escape".into(), muted.into()),
+                ("string.regex".into(), orange.into()),
+                ("string.special".into(), orange.into()),
+                ("string.special.symbol".into(), orange.into()),
+                ("tag".into(), accent.into()),
+                ("text.literal".into(), green.into()),
+                ("title".into(), red.into()),
+                ("type".into(), cyan.into()),
+                ("variable".into(), muted.into()),
+                ("variable.parameter".into(), red.into()),
+                ("variable.special".into(), orange.into()),
+                ("variant".into(), accent.into()),
+                ("diff.plus".into(), green.into()),
+                ("diff.minus".into(), red.into()),
+            ])),
+        },
+    }
+}
+
+pub(crate) fn sarah_dark() -> Theme {
+    // Sarah — the OpenAgents voice-interface brand dark theme (O1-P4).
+    // Compiled-in companion to Khala following the O1-P3 pattern: a warm
+    // near-black navy system with a single warm gold/amber accent, ported
+    // from the Sarah design tokens (planning/omega-ui-upgrade design-plan.md).
+    // Sarah is the voice-interface persona: the interface keeps one visual
+    // "pop" — the gold accent — against an otherwise monochrome dark palette.
+    let accent = hsla(41.18 / 360., 62.0 / 100., 55.0 / 100., 1.0); // #d4a843
+    let accent_hover = hsla(41.18 / 360., 66.0 / 100., 63.0 / 100., 1.0); // #e2bf62
+    let accent_active = hsla(41.18 / 360., 56.0 / 100., 46.0 / 100., 1.0); // #b88f35
+    let focus = hsla(41.18 / 360., 66.0 / 100., 63.0 / 100., 1.0); // gold focus ring
+    let gold_300 = hsla(41.18 / 360., 78.0 / 100., 75.0 / 100., 1.0); // #f0d58a
+    let void = hsla(224.0 / 360., 30.0 / 100., 6.0 / 100., 1.0); // #0b0f1a
+    let surface = hsla(224.0 / 360., 34.0 / 100., 8.0 / 100., 1.0); // #0d111c
+    let surface_raised = hsla(224.0 / 360., 33.0 / 100., 15.0 / 100., 1.0); // #1a2035
+    let surface_overlay = hsla(222.0 / 360., 31.0 / 100., 19.0 / 100., 1.0); // #242b3a
+    let border = hsla(222.0 / 360., 31.0 / 100., 18.0 / 100., 1.0); // #1e2436
+    let border_variant = hsla(223.0 / 360., 33.0 / 100., 15.0 / 100., 1.0); // #1a2035
+    let border_strong = hsla(220.0 / 360., 30.0 / 100., 24.0 / 100., 1.0); // #2a3348
+    let text = hsla(220.0 / 360., 15.0 / 100., 92.0 / 100., 1.0); // #e8ebf0
+    let text_body = hsla(220.0 / 360., 14.0 / 100., 80.0 / 100., 1.0); // #c2c9d4
+    let text_muted = hsla(220.0 / 360., 12.0 / 100., 67.0 / 100., 1.0); // #a0a8b8
+    let text_faint = hsla(220.0 / 360., 10.0 / 100., 56.0 / 100., 1.0); // #8a93a3
+    let text_disabled = hsla(220.0 / 360., 10.0 / 100., 34.0 / 100., 1.0); // #4a5160
+    let muted = hsla(220.0 / 360., 12.0 / 100., 73.0 / 100., 1.0); // #b9c0cc
+    let info_cyan = hsla(198.44 / 360., 93.2 / 100., 59.61 / 100., 1.0); // #38bdf8
+    let success_green = hsla(142.09 / 360., 70.56 / 100., 45.29 / 100., 1.0); // #22c55e
+    let warning_amber = hsla(37.69 / 360., 92.13 / 100., 50.2 / 100., 1.0); // #f59e0b
+    let error_red = hsla(0.0 / 360., 90.6 / 100., 70.78 / 100., 1.0); // #f87171
+    let amber = hsla(41.18 / 360., 66.0 / 100., 63.0 / 100., 1.0); // #e2bf62
+    let red = hsla(348.84 / 360., 88.97 / 100., 71.57 / 100., 1.0);
+    let orange = hsla(22.45 / 360., 1.0, 69.61 / 100., 1.0);
+    let green = hsla(88.8 / 360., 50.51 / 100., 61.18 / 100., 1.0);
+    let magenta = hsla(261.29 / 360., 85.32 / 100., 78.63 / 100., 1.0);
+    let cyan = hsla(202.15 / 360., 1.0, 74.51 / 100., 1.0);
+
+    Theme {
+        id: "sarah".to_string(),
+        name: "Sarah".into(),
+        appearance: Appearance::Dark,
+        styles: ThemeStyles {
+            window_background_appearance: WindowBackgroundAppearance::Opaque,
+            system: SystemColors::default(),
+            accents: AccentColors::dark(),
+            colors: ThemeColors {
+                border,
+                border_variant,
+                border_focused: focus,
+                border_selected: border_strong,
+                border_transparent: SystemColors::default().transparent,
+                border_disabled: border_strong,
+                elevated_surface_background: surface_raised,
+                surface_background: surface,
+                background: surface,
+                element_background: surface_raised,
+                element_hover: gold_300.opacity(20. / 255.),
+                element_active: gold_300.opacity(33. / 255.),
+                element_selected: accent.opacity(41. / 255.),
+                element_disabled: surface,
+                element_selection_background: accent.opacity(41. / 255.),
+                drop_target_background: accent.opacity(128. / 255.),
+                drop_target_border: focus,
+                ghost_element_background: SystemColors::default().transparent,
+                ghost_element_hover: gold_300.opacity(20. / 255.),
+                ghost_element_active: gold_300.opacity(33. / 255.),
                 ghost_element_selected: accent.opacity(41. / 255.),
                 ghost_element_disabled: surface,
                 text,

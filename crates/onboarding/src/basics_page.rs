@@ -25,12 +25,13 @@ use crate::{
     theme_preview::{ThemePreviewStyle, ThemePreviewTile},
 };
 
-// Aiur is dark-only (omega#70). Selecting the Aiur family gives Aiur in
-// either appearance rather than substituting a light theme the owner did
-// not choose.
-const LIGHT_THEMES: [&str; 3] = ["Aiur", "Ayu Light", "Gruvbox Light"];
-const DARK_THEMES: [&str; 3] = ["Aiur", "Ayu Dark", "Gruvbox Dark"];
-const FAMILY_NAMES: [SharedString; 3] = [
+// Sarah is the default dark theme (OMEGA-DELTA-0283) and dark-only, like
+// Aiur (omega#70): selecting either family gives the same theme in either
+// appearance rather than substituting a light theme the owner did not choose.
+const LIGHT_THEMES: [&str; 4] = ["Sarah", "Aiur", "Ayu Light", "Gruvbox Light"];
+const DARK_THEMES: [&str; 4] = ["Sarah", "Aiur", "Ayu Dark", "Gruvbox Dark"];
+const FAMILY_NAMES: [SharedString; 4] = [
+    SharedString::new_static("Sarah"),
     SharedString::new_static("Aiur"),
     SharedString::new_static("Ayu"),
     SharedString::new_static("Gruvbox"),
@@ -779,11 +780,14 @@ mod tests {
 
     #[test]
     fn omega_onboarding_preserves_theme_families() {
-        assert_eq!(LIGHT_THEMES, ["Aiur", "Ayu Light", "Gruvbox Light"]);
-        assert_eq!(DARK_THEMES, ["Aiur", "Ayu Dark", "Gruvbox Dark"]);
+        assert_eq!(
+            LIGHT_THEMES,
+            ["Sarah", "Aiur", "Ayu Light", "Gruvbox Light"]
+        );
+        assert_eq!(DARK_THEMES, ["Sarah", "Aiur", "Ayu Dark", "Gruvbox Dark"]);
         assert_eq!(
             FAMILY_NAMES.map(|name| name.to_string()),
-            ["Aiur", "Ayu", "Gruvbox"]
+            ["Sarah", "Aiur", "Ayu", "Gruvbox"]
         );
         assert_eq!(
             get_theme_family_themes("Ayu Dark"),
@@ -791,6 +795,11 @@ mod tests {
         );
         // Aiur is dark-only, so both appearances resolve to the same theme.
         assert_eq!(get_theme_family_themes("Aiur"), Some(("Aiur", "Aiur")));
+        // Sarah is the default dark theme (OMEGA-DELTA-0283) and dark-only,
+        // so both appearances resolve to Sarah.
+        assert_eq!(get_theme_family_themes("Sarah"), Some(("Sarah", "Sarah")));
+        // The default dark theme must be the first family card.
+        assert_eq!(DARK_THEMES[0], "Sarah");
     }
 
     #[test]
