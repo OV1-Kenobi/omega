@@ -771,6 +771,24 @@ pub(crate) fn initialize_panels(
             .context("failed to load Sarah voice owner")
             .log_err();
 
+        // Sovereign Agents dashboard (founder direction, 2026-08-25): the
+        // stubbed plugins/MCP/wallet/mandates panel, unconditional in every
+        // build — the rail button must exist on every screen.
+        if let Some(dashboard_panel) = sovereign_dashboard::SovereignDashboardPanel::load(
+            workspace_handle.clone(),
+            cx.clone(),
+        )
+        .await
+        .context("failed to load the Sovereign Agents dashboard")
+        .log_err()
+        {
+            workspace_handle
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.add_panel(dashboard_panel, window, cx);
+                })
+                .log_err();
+        }
+
         // Development-gated NIP-MKT Markets panel (omega#244); absent from
         // normal builds until the negotiated session flow is implemented.
         if market_ui::market_panel_enabled() {
@@ -6280,6 +6298,7 @@ mod tests {
             agent_computer_ui::init(cx);
             workroom_ui::init(cx);
             market_ui::init(cx);
+            sovereign_dashboard::init(cx);
             initialize_workspace(app_state.clone(), cx);
             search::init(cx);
             lsp_locations::init(cx);

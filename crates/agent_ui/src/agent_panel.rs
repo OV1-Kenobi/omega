@@ -18761,6 +18761,25 @@ impl AgentPanel {
             .on_click(|_, window, cx| {
                 window.dispatch_action(omega_actions::OpenSettings.boxed_clone(), cx);
             });
+        // Sovereign Agents dashboard (founder direction, 2026-08-25): one
+        // rail button, present on every screen the activity rail renders,
+        // pulling up the plugins / MCP / wallet / mandates dashboard.
+        let sovereign_dashboard_button =
+            IconButton::new("open-sovereign-dashboard", IconName::BoltOutlined)
+                .debug_selector(|| "open-sovereign-dashboard".into())
+                .shape(ui::IconButtonShape::Wide)
+                .width(px(28.))
+                .size(ButtonSize::Medium)
+                .icon_size(IconSize::Small)
+                .style(ButtonStyle::Subtle)
+                .aria_label("Open Sovereign Agents dashboard")
+                .tooltip(Tooltip::text("Sovereign Agents"))
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(
+                        sovereign_dashboard::ToggleFocus.boxed_clone(),
+                        cx,
+                    );
+                });
 
         v_flex()
             .id("omega.workbench.activity-rail")
@@ -18802,6 +18821,15 @@ impl AgentPanel {
                             .color(Color::Warning),
                     )
             }))
+            .child(
+                div()
+                    .size_8()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .mb_2()
+                    .child(sovereign_dashboard_button),
+            )
             .child(
                 div()
                     .size_8()
@@ -22607,7 +22635,9 @@ impl AgentPanel {
                         .aria_label("Open threads")
                         .absolute()
                         .left(px(tabs_left))
-                        .right(px(16.))
+                        // Reserve the right edge for the Windows window
+                        // controls (min/max/close) rendered below.
+                        .right(px(148.))
                         .top_0()
                         .h_full()
                         .flex()
@@ -22625,7 +22655,7 @@ impl AgentPanel {
                     div()
                         .absolute()
                         .left(px(tabs_left))
-                        .right(px(16.))
+                        .right(px(148.))
                         .top_0()
                         .h_full()
                         .flex()
@@ -22636,7 +22666,31 @@ impl AgentPanel {
                         .text_color(text_muted)
                         .child("Settings"),
                 )
-            });
+            })
+            // Windows window controls (minimize / maximize / close). GPUI's
+            // client-side decorations suppress the native caption buttons, so
+            // the platform strip's controls must be rendered here — the same
+            // pattern threads_archive_view uses. Without this, a window on
+            // Windows has no visible way to minimize, maximize, or close.
+            .when(
+                !cfg!(target_os = "macos") && !window.is_fullscreen(),
+                |bar| {
+                    bar.child(
+                        div()
+                            .absolute()
+                            .right(px(0.))
+                            .top_0()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .children(platform_title_bar::render_right_window_controls(
+                                cx.button_layout(),
+                                Box::new(workspace::CloseWindow),
+                                window,
+                            )),
+                    )
+                },
+            );
 
         let sidebar_thread_rows = self.omega_sidebar_thread_rows(cx);
         let active_sidebar_row_is_persisted = active_thread_id.is_some_and(|active_thread_id| {

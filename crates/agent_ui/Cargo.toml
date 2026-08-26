@@ -131,6 +131,7 @@ paths.workspace = true
 picker.workspace = true
 plugin_api.workspace = true
 platform_title_bar.workspace = true
+sovereign_dashboard.workspace = true
 postage.workspace = true
 project.workspace = true
 project_panel.workspace = true
