@@ -3,7 +3,10 @@
 use anyhow::{anyhow, Result};
 use serde_json::{Value, json};
 
-use crate::protocol::{BalanceResult, ErrorCode, InvoiceResult, PayResult, StatusResult};
+use crate::protocol::{
+    BalanceResult, CreateWalletResult, ErrorCode, ExportNostrSecretResult, IdentityStatusResult,
+    InvoiceResult, PayResult, StatusResult,
+};
 use crate::supervisor::SovereignWalletSupervisor;
 
 #[derive(Debug, thiserror::Error)]
@@ -52,15 +55,17 @@ impl SovereignWalletSupervisor {
         &mut self,
         idempotency_key: &str,
         password: &str,
-    ) -> Result<Value, SovereignWalletError> {
+    ) -> Result<CreateWalletResult, SovereignWalletError> {
         // Operator-only method; the response carries the show-once aezeed and
         // is never logged by the supervisor (SEC-2026-046).
-        self.request(
-            "create-wallet",
-            Some(json!({ "idempotencyKey": idempotency_key, "password": password })),
-            self.generation(),
-        )
-        .await
+        let result = self
+            .request(
+                "create-wallet",
+                Some(json!({ "idempotencyKey": idempotency_key, "password": password })),
+                self.generation(),
+            )
+            .await?;
+        decode(result, "create-wallet result")
     }
 
     pub async fn unlock(&mut self, idempotency_key: &str, password: &str) -> Result<Value, SovereignWalletError> {
@@ -112,8 +117,55 @@ impl SovereignWalletSupervisor {
         .await
     }
 
-    pub async fn identity_status(&mut self) -> Result<Value, SovereignWalletError> {
-        self.request("identity-status", None, self.generation()).await
+    pub async fn identity_status(&mut self) -> Result<IdentityStatusResult, SovereignWalletError> {
+        let result = self
+            .request("identity-status", None, self.generation())
+            .await?;
+        decode(result, "identity-status result")
+    }
+
+    /// Operator-only one-time Nostr-secret export (design §2.2; WP-5 seam).
+    /// The sidecar refuses a second export with `ExportAlreadyConsumed`.
+    pub async fn export_nostr_secret(&mut self) -> Result<ExportNostrSecretResult, SovereignWalletError> {
+        let result = self
+            .request("export-nostr-secret", None, self.generation())
+            .await?;
+        decode(result, "export-nostr-secret result")
+    }
+
+    /// Operator-only identity ceremony step 1 (design §4.3): generate + show
+    /// the mnemonic once and hold it pending the word-challenge commit.
+    /// Returns `{ mnemonic, challengeLabels, note }`.
+    pub async fn vault_init_prepare(&mut self) -> Result<Value, SovereignWalletError> {
+        self.request("vault-init-prepare", None, self.generation()).await
+    }
+
+    /// Operator-only identity ceremony step 2 (design §4.3): commit the
+    /// pending ceremony with the passphrase and the word-challenge answers
+    /// (`{ "2": word, "7": word, "11": word }`). Returns
+    /// `{ vaultState, npub, pubkeyHex }`.
+    pub async fn vault_init(
+        &mut self,
+        passphrase: &str,
+        answers: &Value,
+    ) -> Result<Value, SovereignWalletError> {
+        self.request(
+            "vault-init",
+            Some(json!({ "passphrase": passphrase, "answers": answers })),
+            self.generation(),
+        )
+        .await
+    }
+
+    /// Operator-only vault unlock (design §4.2). Returns
+    /// `{ vaultState, derivedNpub, derivedPubkeyHex }`.
+    pub async fn vault_unlock(&mut self, passphrase: &str) -> Result<Value, SovereignWalletError> {
+        self.request(
+            "vault-unlock",
+            Some(json!({ "passphrase": passphrase })),
+            self.generation(),
+        )
+        .await
     }
 
     pub async fn shutdown(&mut self) -> Result<Value, SovereignWalletError> {

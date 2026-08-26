@@ -710,7 +710,7 @@ impl GovernanceRuntime {
             orders_last_hour: self.orders_last_hour(now)?,
             liquidation_buffer_bps: 10_000,
         };
-        match self.mandate.authorize(&instruction, now)? {
+        match self.mandate.authorize(&instruction, None, now)? {
             MandateDecision::Authorized { revision } => Ok(revision),
             MandateDecision::Refused { reason, .. } => {
                 bail!("trading mandate refused action: {reason:?}")
@@ -3614,6 +3614,8 @@ mod tests {
         let mandate = TradingMandate {
             venue: VENUE.into(),
             network: TradingNetwork::Testnet,
+            // WP-5: Nautilus mandates stay venue-wide (no principal scope).
+            principal_pubkey: None,
             collateral_asset: AssetId::usdc(),
             objective: "Explicitly confirmed Hyperliquid testnet governance proof".into(),
             max_venue_balance: risk.venue_balance_micros.saturating_add(1_000_000_000),
@@ -4354,6 +4356,8 @@ mod tests {
         let mandate = TradingMandate {
             venue: VENUE.into(),
             network: TradingNetwork::Testnet,
+            // WP-5: Nautilus mandates stay venue-wide (no principal scope).
+            principal_pubkey: None,
             collateral_asset: AssetId::usdc(),
             objective: "Bounded in-engine BTC testnet quote and fill proof".into(),
             max_venue_balance: risk.venue_balance_micros.saturating_add(1_000_000_000),

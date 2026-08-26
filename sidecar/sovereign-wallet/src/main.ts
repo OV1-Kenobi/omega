@@ -23,7 +23,9 @@ import type { ErrorCode } from "./protocol.js";
 import { PROTOCOL_SCHEMA, PROTOCOL_VERSION, SERVICE_VERSION, encodeResponse, errorEnvelope } from "./protocol.js";
 import { clearRegisteredSecrets, redact, registerSecret } from "./redact.js";
 import { MIN_PASSPHRASE_LEN, Vault } from "./vault/vault.js";
-import { listPrimaryNpub } from "./identity/index.js";
+import { listPrimaryIdentity } from "./identity/index.js";
+import { deriveFromMnemonic, encodeNsec, generateMnemonic12 } from "./identity/keygen.js";
+import { challengeLabels, verifyChallenge } from "./identity/ceremony.js";
 import {
   WavelengthClient,
   assertInvoiceNetwork,
@@ -59,7 +61,10 @@ export interface SidecarConfig {
 }
 
 export interface WalletMarker {
-  created: boolean;
+  /** Wallet-created marker (non-secret). */
+  created?: boolean;
+  /** One-time export marker: the npub whose nsec was exported (non-secret). */
+  exported?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +105,12 @@ export class SidecarCore {
   /** WP-4: satnam-derived identity/vault root. Absent-vs-locked-vs-unlocked. */
   #vault: Vault | null = null;
   #vaultState: "none" | "locked" | "unlocked" = "none";
+  /**
+   * WP-5 ceremony: the show-once mnemonic held in memory between
+   * `vault-init-prepare` and `vault-init` (never persisted; registered for
+   * redaction; cleared on completion, on lock, and on teardown).
+   */
+  #pendingMnemonic: string | null = null;
 
   constructor(config: SidecarConfig) {
     this.#config = config;
@@ -226,6 +237,8 @@ export class SidecarCore {
       this.#vaultState = "locked";
       this.#vault = null;
     }
+    // Drop any pending identity ceremony mnemonic.
+    this.#pendingMnemonic = null;
     if (this.#waved) {
       await terminateWaved(this.#waved.child).catch(() => {});
       this.#waved = null;
@@ -305,7 +318,7 @@ export class SidecarCore {
       protocolVersion: PROTOCOL_VERSION,
       serviceVersion: SERVICE_VERSION,
       generation: this.#generation,
-      capabilities: [
+capabilities: [
         "status",
         "balance",
         "create-wallet",
@@ -315,6 +328,10 @@ export class SidecarCore {
         "pay-invoice",
         "activity",
         "identity-status",
+        "vault-init-prepare",
+        "vault-init",
+        "vault-unlock",
+        "export-nostr-secret",
         "shutdown",
       ],
       dataRoot: this.#config.dataRoot,
@@ -339,7 +356,7 @@ export class SidecarCore {
     };
   }
 
-  /** Operator-only: create the Wavelength wallet (never the agent channel). */
+/** Operator-only: create the Wavelength wallet (never the agent channel). */
   async createWallet(idempotencyKey: string, password: string): Promise<Record<string, unknown>> {
     this.#requireWaved();
     const stored = this.#idempotency?.fetch("create-wallet", idempotencyKey);
@@ -351,15 +368,44 @@ export class SidecarCore {
       // redaction so it can never reach a log.
       const mnemonic = created.mnemonic.join(" ");
       registerSecret(mnemonic);
-await writeMarker(path.join(this.#runDir, "wallet-state.json"), { created: true });
+      await writeMarker(path.join(this.#runDir, "wallet-state.json"), { created: true });
       this.#walletCreated = true;
       this.#walletState = "syncing";
       this.#startSyncWatcher();
+
+      // WP-5 seam (design §4.2 `wallet/` entry, §4.3): capture the wallet DB
+      // password + aezeed into the vault immediately at create. The vault must
+      // be unlocked; otherwise the capture is honestly reported as not
+      // vaulted (the operator holds the password + paper aezeed).
+      let walletDbPasswordVaulted = false;
+      let vaultWalletId: string | null = null;
+      let note = "";
+      const walletId = created.identity_pubkey ?? "default";
+      if (this.#vault && this.#vault.isUnlocked()) {
+        try {
+          await this.#vault.storeWalletEntry({
+            walletId,
+            walletDbPassword: password,
+            aezeed: mnemonic,
+            createdAt: new Date().toISOString(),
+          });
+          walletDbPasswordVaulted = true;
+          vaultWalletId = walletId;
+        } catch (error) {
+          // The vault write failed (e.g. locked mid-flight): never fail the
+          // wallet creation on a capture problem; report the honest state.
+          note = `vault capture failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      } else {
+        note =
+          "the vault is not unlocked; the wallet DB password and aezeed were NOT vaulted (operator-held only)";
+      }
       const result = {
         mnemonic: created.mnemonic,
         identityPubkey: created.identity_pubkey,
-        // WP-4 seam: this password must move into the vault immediately.
-        walletDbPasswordVaulted: false,
+        walletDbPasswordVaulted,
+        vaultWalletId,
+        note,
       };
       this.#idempotency?.store("create-wallet", idempotencyKey, result);
       return result;
@@ -403,6 +449,9 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
       this.#vault.lock();
       this.#vaultState = "locked";
     }
+    // Drop any pending identity ceremony (the show-once mnemonic never
+    // survives a lock; the operator restarts the ceremony).
+    this.#pendingMnemonic = null;
     this.#stopSyncWatcher();
     return { walletState: this.#walletState, vaultState: this.#vaultState };
   }
@@ -479,13 +528,15 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
   /**
    * Identity/vault projection (design §2.2 `identity-status`). Read-only,
    * public projection only — never key material. Reports real vault/identity
-   * state: created (none/locked/unlocked) and the derived npub.
+   * state: created (none/locked/unlocked), the derived npub, and the derived
+   * pubkey hex (WP-5: the principal for pubkey-keyed spending authorizations).
    */
   async identityStatus(): Promise<Record<string, unknown>> {
     if (!this.#vault) {
       return {
         vaultState: "none",
         derivedNpub: null,
+        derivedPubkeyHex: null,
         recoveryArtifactState: "absent",
         note: "vault not initialized",
       };
@@ -499,15 +550,170 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
         ? "unlocked"
         : "locked";
     let derivedNpub: string | null = null;
+    let derivedPubkeyHex: string | null = null;
     if (this.#vault.isUnlocked()) {
-      derivedNpub = await listPrimaryNpub(this.#vault).catch(() => null);
+      const identity = await listPrimaryIdentity(this.#vault).catch(() => null);
+      derivedNpub = identity?.npub ?? null;
+      derivedPubkeyHex = identity?.pubkeyHex ?? null;
     }
     return {
       vaultState: state,
       derivedNpub,
+      derivedPubkeyHex,
       recoveryArtifactState: onDisk ? "absent" : "absent", // operator-exported; not auto-persisted
       note: "WP-4: satnam-derived identity/vault (BIP-39/NIP-06 root, OMEGA-DELTA-0284)",
     };
+  }
+
+  /**
+   * Operator-only identity ceremony step 1 (design §4.3; WP-5 renders the
+   * ceremony): generate a fresh 12-word BIP-39 mnemonic, show it ONCE, and
+   * hold it in memory pending the word-challenge commit. Never persisted;
+   * registered for redaction; cleared on commit/lock/teardown.
+   */
+  async vaultInitPrepare(): Promise<Record<string, unknown>> {
+    if (!this.#vault) {
+      throw envelopeError("INTERNAL", "the vault is not initialized");
+    }
+    if (await this.#vault.existsOnDisk()) {
+      throw envelopeError("INVALID_ARGS", "a vault already exists; the identity ceremony runs once");
+    }
+    const mnemonic = generateMnemonic12();
+    registerSecret(mnemonic);
+    this.#pendingMnemonic = mnemonic;
+    return {
+      mnemonic,
+      challengeLabels: challengeLabels(),
+      note: "show-once: record these 12 words; they are never shown again (lost words = lost identity unless a NIP-49 recovery artifact was exported)",
+    };
+  }
+
+  /**
+   * Operator-only identity ceremony step 2 (design §4.3): commit the pending
+   * ceremony — verify the operator recorded the mnemonic (word challenge at
+   * positions 2/7/11), initialize the vault under the passphrase, and store
+   * the derived identity. The mnemonic is then dropped. A lost passphrase
+   * makes the vault unrecoverable without a recovery artifact (SEC-2026-052
+   * consequence, stated in the dashboard ceremony copy).
+   */
+  async vaultInit(
+    passphrase: string,
+    answers: Record<number, string>,
+  ): Promise<Record<string, unknown>> {
+    if (!this.#vault) {
+      throw envelopeError("INTERNAL", "the vault is not initialized");
+    }
+    if (await this.#vault.existsOnDisk()) {
+      throw envelopeError("INVALID_ARGS", "a vault already exists; the identity ceremony runs once");
+    }
+    if (!this.#pendingMnemonic) {
+      throw envelopeError("INVALID_ARGS", "no pending identity ceremony; run vault-init-prepare first");
+    }
+    if (passphrase.length < MIN_PASSPHRASE_LEN) {
+      throw envelopeError(
+        "INVALID_ARGS",
+        `the vault passphrase must be at least ${MIN_PASSPHRASE_LEN} characters (SEC-2026-052)`,
+      );
+    }
+    if (!verifyChallenge(this.#pendingMnemonic, answers)) {
+      throw envelopeError("INVALID_ARGS", "the word challenge failed; the ceremony is canceled", {
+        remediation: "run vault-init-prepare again and record the words exactly",
+      });
+    }
+    registerSecret(passphrase);
+    const mnemonic = this.#pendingMnemonic;
+    this.#pendingMnemonic = null;
+    try {
+      await this.#vault.initialize(passphrase);
+      const derived = deriveFromMnemonic(mnemonic);
+      try {
+        await this.#vault.storeNsec(derived.publicPart.npub, derived.secret);
+      } finally {
+        derived.secret.fill(0);
+      }
+      this.#vaultState = "unlocked";
+      return {
+        vaultState: "unlocked",
+        npub: derived.publicPart.npub,
+        pubkeyHex: derived.publicPart.pubkeyHex,
+        note: "identity ceremony complete; the mnemonic is dropped",
+      };
+    } catch (error) {
+      this.#vault?.lock();
+      this.#vaultState = "locked";
+      throw error;
+    }
+  }
+
+  /**
+   * Operator-only vault unlock (design §4.2; the ceremony's passphrase step).
+   * Wrong passphrase is refused; a lost passphrase is unrecoverable without a
+   * recovery artifact (SEC-2026-052 consequence).
+   */
+  async vaultUnlock(passphrase: string): Promise<Record<string, unknown>> {
+    if (!this.#vault) {
+      throw envelopeError("INTERNAL", "the vault is not initialized");
+    }
+    if (!(await this.#vault.existsOnDisk())) {
+      throw envelopeError("INVALID_ARGS", "no vault exists; run the identity ceremony first");
+    }
+    registerSecret(passphrase);
+    try {
+      await this.#vault.unlock(passphrase);
+    } catch (error) {
+      if (error instanceof Error && "vaultError" in error && error.vaultError === "DecryptionFailed") {
+        throw envelopeError("INVALID_ARGS", "wrong vault passphrase", {
+          remediation: "a lost passphrase is unrecoverable without a recovery artifact",
+        });
+      }
+      throw error;
+    }
+    this.#vaultState = "unlocked";
+    const identity = await listPrimaryIdentity(this.#vault).catch(() => null);
+    return {
+      vaultState: "unlocked",
+      derivedNpub: identity?.npub ?? null,
+      derivedPubkeyHex: identity?.pubkeyHex ?? null,
+    };
+  }
+
+  /**
+   * Operator-only one-time Nostr-secret export (design §2.2
+   * `export-nostr-secret`; WP-5 seam — the bridge into the Rust
+   * `omega_identity` import path, §4.6). Refused unless the vault is
+   * unlocked and an identity exists; refused permanently after the first
+   * export (`EXPORT_ALREADY_CONSUMED`). The nsec is registered for redaction
+   * and never logged (SEC-2026-046).
+   */
+  async exportNostrSecret(): Promise<Record<string, unknown>> {
+    if (!this.#vault || !this.#vault.isUnlocked()) {
+      throw envelopeError("WALLET_LOCKED", "the vault is locked; export-nostr-secret requires an unlocked vault", {
+        remediation: "unlock the vault first (operator-only)",
+      });
+    }
+    const identity = await listPrimaryIdentity(this.#vault).catch(() => null);
+    if (!identity) {
+      throw envelopeError("NOT_FOUND", "no identity exists in the vault; initialize the identity first");
+    }
+    // One-time bridge: a durable marker under run/ (non-secret; the nsec is
+    // never persisted). Re-export is refused permanently.
+    const markerPath = path.join(this.#runDir, "export-nostr-secret.done");
+    try {
+      await fs.access(markerPath);
+      throw envelopeError(
+        "EXPORT_ALREADY_CONSUMED",
+        "export-nostr-secret has already been consumed; the bridge is one-time (design §2.2)",
+      );
+    } catch (error) {
+      if (error instanceof Error && "envelope" in error) throw error;
+      // marker absent → first export
+    }
+    const secret = await this.#vault.getNsec(identity.npub);
+    const nsec = encodeNsec(secret);
+    secret.fill(0);
+    registerSecret(nsec);
+    await writeMarker(markerPath, { exported: identity.npub });
+    return { nsec, npub: identity.npub, exported: true };
   }
 
   /**
@@ -606,8 +812,23 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
         return this.payInvoice(requireString(params, "invoice"), requireString(params, "idempotencyKey"));
       case "activity":
         return this.activity(numberOr(params, "limit", 100), stringOr(params, "cursor", undefined));
-      case "identity-status":
+case "identity-status":
         return this.identityStatus();
+      case "vault-init-prepare":
+        // Operator-only ceremony step 1 (never the agent channel).
+        return this.vaultInitPrepare();
+      case "vault-init":
+        return this.vaultInit(
+          requireString(params, "passphrase"),
+          requireAnswers(params, "answers"),
+        );
+      case "vault-unlock":
+        return this.vaultUnlock(requireString(params, "passphrase"));
+      case "export-nostr-secret":
+        // Operator-only: reachable only on the stdio control plane. The HTTP
+        // surface registers read projections only, so this method is
+        // unreachable from the agent channel by construction (tested).
+        return this.exportNostrSecret();
       case "shutdown": {
         void this.stop().then(() => process.exit(0));
         return { stopping: true };
@@ -853,6 +1074,26 @@ function stringOr(params: Record<string, unknown>, key: string, fallback: string
 function numberOr(params: Record<string, unknown>, key: string, fallback: number): number {
   const value = params[key];
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+/** The identity ceremony's word-challenge answers: {"2": word, "7": word, "11": word}. */
+function requireAnswers(
+  params: Record<string, unknown>,
+  key: string,
+): Record<number, string> {
+  const value = params[key];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw envelopeError("INVALID_ARGS", `${key} must be an object of word answers`);
+  }
+  const answers: Record<number, string> = {};
+  for (const [label, word] of Object.entries(value as Record<string, unknown>)) {
+    const index = Number.parseInt(label, 10);
+    if (!Number.isInteger(index) || typeof word !== "string" || word.length === 0) {
+      throw envelopeError("INVALID_ARGS", `${key} entries must map 1-based positions to words`);
+    }
+    answers[index - 1] = word; // 1-based labels → 0-indexed challenge indexes
+  }
+  return answers;
 }
 
 async function readMarker(path: string): Promise<WalletMarker | null> {

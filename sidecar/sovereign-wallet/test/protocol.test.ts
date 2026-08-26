@@ -200,13 +200,17 @@ describe("protocol round-trip against fake waved", () => {
       const lockedBalance = expectError(await sidecar.request("balance"));
       assert.equal(lockedBalance.code, "WALLET_LOCKED");
 
-      // Operator-only create -> unlock -> balance.
+// Operator-only create -> unlock -> balance.
       const created = expectOk(await sidecar.request("create-wallet", {
         idempotencyKey: "11111111-1111-4111-8111-111111111111",
         password: "correct horse battery staple",
       }));
       assert.equal(Array.isArray(created.mnemonic), true);
       assert.equal((created.mnemonic as string[]).length, 24);
+      // WP-5 seam: with the vault locked/absent the capture is reported
+      // HONESTLY as not vaulted (operator-held password + paper aezeed).
+      assert.equal(created.walletDbPasswordVaulted, false);
+      assert.equal(typeof created.note, "string");
 
       const unlocked = expectOk(await sidecar.request("unlock", {
         idempotencyKey: "22222222-2222-4222-8222-222222222222",
@@ -564,11 +568,99 @@ try {
       });
       const initialize = JSON.parse(stdout.trim().split("\n")[0] ?? "{}") as Record<string, unknown>;
       const httpSurface = ((initialize.result ?? {}) as { httpSurface?: { bound: boolean; reason?: string } }).httpSurface;
-      assert.equal(httpSurface?.bound, false);
+assert.equal(httpSurface?.bound, false);
       assert.match(httpSurface?.reason ?? "", /LOOPBACK_TOKEN is not set/);
     } finally {
       killTree(child.pid);
       await cleanupDir(dataRoot);
+    }
+  });
+
+  it("WP-5: identity ceremony, create-wallet vault capture, and the one-time export bridge", async () => {
+    const sidecar = spawnSidecar({});
+    try {
+      await sidecar.request("initialize");
+
+      // Ceremony step 1: show-once mnemonic + challenge labels.
+      const prepared = expectOk(await sidecar.request("vault-init-prepare"));
+      const mnemonic = prepared.mnemonic as string;
+      const labels = prepared.challengeLabels as number[];
+      assert.deepEqual(labels, [2, 7, 11]);
+      assert.equal(mnemonic.split(" ").length, 12);
+
+      // A wrong challenge refuses and cancels the pending ceremony.
+      const wrongAnswers = { 2: "zebra", 7: "zebra", 11: "zebra" };
+      const wrongChallenge = expectError(await sidecar.request("vault-init", { passphrase: "correct horse battery staple", answers: wrongAnswers }));
+      assert.equal(wrongChallenge.code, "INVALID_ARGS");
+
+      // Prepare again, then commit with the correct words at 2/7/11.
+      const preparedAgain = expectOk(await sidecar.request("vault-init-prepare"));
+      const words = (preparedAgain.mnemonic as string).split(" ");
+      const answers = { 2: words[1], 7: words[6], 11: words[10] };
+      const initialized = expectOk(await sidecar.request("vault-init", {
+        passphrase: "correct horse battery staple",
+        answers,
+      }));
+      assert.equal(initialized.vaultState, "unlocked");
+      assert.match(initialized.npub as string, /^npub1/);
+      assert.match(initialized.pubkeyHex as string, /^[0-9a-f]{64}$/);
+
+      // identity-status now reports the REAL derived identity.
+      const identity = expectOk(await sidecar.request("identity-status"));
+      assert.equal(identity.vaultState, "unlocked");
+      assert.equal(identity.derivedNpub, initialized.npub);
+      assert.equal(identity.derivedPubkeyHex, initialized.pubkeyHex);
+
+      // WP-5 seam: create-wallet now CAPTURES the wallet DB password + aezeed
+      // into the unlocked vault.
+      const created = expectOk(await sidecar.request("create-wallet", {
+        idempotencyKey: "51111111-1111-4111-8111-111111111111",
+        password: "correct horse battery staple",
+      }));
+      assert.equal(created.walletDbPasswordVaulted, true);
+      assert.equal(typeof created.vaultWalletId, "string");
+
+      // WP-5 seam: the one-time export bridge hands the derived nsec to the
+      // operator exactly once (bridge to the Rust omega_identity import path).
+      const exported = expectOk(await sidecar.request("export-nostr-secret"));
+      assert.match(exported.nsec as string, /^nsec1/);
+      assert.equal(exported.npub, initialized.npub);
+      assert.equal(exported.exported, true);
+
+      // Re-export is refused permanently (EXPORT_ALREADY_CONSUMED).
+      const second = expectError(await sidecar.request("export-nostr-secret"));
+      assert.equal(second.code, "EXPORT_ALREADY_CONSUMED");
+
+      // SEC-2026-046: the exported nsec never reaches stderr (redaction).
+      assert.ok(
+        !sidecar.stderrText().includes(exported.nsec as string),
+        "the exported nsec must never appear in stderr",
+      );
+    } finally {
+      await sidecar.close();
+    }
+  });
+
+  it("WP-5: vault unlock refuses a wrong passphrase and honors the right one", async () => {
+    const sidecar = spawnSidecar({});
+    try {
+      await sidecar.request("initialize");
+      const prepared = expectOk(await sidecar.request("vault-init-prepare"));
+      const words = (prepared.mnemonic as string).split(" ");
+      await sidecar.request("vault-init", {
+        passphrase: "correct horse battery staple",
+        answers: { 2: words[1], 7: words[6], 11: words[10] },
+      });
+      await sidecar.request("lock");
+
+      const wrong = expectError(await sidecar.request("vault-unlock", { passphrase: "wrong passphrase value" }));
+      assert.equal(wrong.code, "INVALID_ARGS");
+
+      const unlocked = expectOk(await sidecar.request("vault-unlock", { passphrase: "correct horse battery staple" }));
+      assert.equal(unlocked.vaultState, "unlocked");
+      assert.match(unlocked.derivedNpub as string, /^npub1/);
+    } finally {
+      await sidecar.close();
     }
   });
 });

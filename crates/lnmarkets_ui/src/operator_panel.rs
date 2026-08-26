@@ -970,6 +970,8 @@ mod tests {
                     mandates: vec![TradingMandate {
                         venue: "lnmarkets".into(),
                         network: TradingNetwork::Signet,
+                        // WP-5: venue-wide mandate (no principal scope).
+                        principal_pubkey: None,
                         collateral_asset: AssetId::sats(),
                         objective: "Bounded profit".into(),
                         max_venue_balance: 100_000,

@@ -24,6 +24,7 @@ serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true
 thiserror.workspace = true
+trading_mandate.workspace = true
 util.workspace = true
 zeroize.workspace = true
 
@@ -31,4 +32,5 @@ zeroize.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

@@ -16453,8 +16453,17 @@ name = "sovereign_dashboard"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "command_center_ui",
+ "editor",
  "gpui",
+ "log",
+ "project",
+ "serde_json",
+ "settings",
+ "sovereign_wallet",
+ "trading_mandate",
  "ui",
+ "util",
  "workspace",
 ]
 
@@ -16475,6 +16484,7 @@ dependencies = [
  "smol",
  "tempfile",
  "thiserror 2.0.17",
+ "trading_mandate",
  "util",
  "zeroize",
 ]

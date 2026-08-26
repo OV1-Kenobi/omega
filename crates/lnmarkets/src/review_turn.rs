@@ -317,6 +317,8 @@ mod tests {
             mandates: vec![TradingMandate {
                 venue: LEGACY_VENUE.into(),
                 network: TradingNetwork::Signet,
+                // WP-5: venue-wide mandate (no principal scope).
+                principal_pubkey: None,
                 collateral_asset: trading_mandate::AssetId::sats(),
                 objective: "maximize ledger profit in sats".into(),
                 max_venue_balance: 100_000,

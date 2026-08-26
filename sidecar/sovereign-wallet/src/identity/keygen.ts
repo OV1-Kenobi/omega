@@ -177,6 +177,22 @@ export function derivePublicFromMnemonic(mnemonic: string): DerivedIdentityPubli
 }
 
 /**
+ * Public projection from raw 32-byte secret bytes (public output only).
+ * WP-5: used by the identity-status projection to report the pubkey hex of
+ * the vault identity without persisting or logging the secret; the caller
+ * zeroizes the secret buffer after use.
+ */
+export function publicProjectionFromSecretBytes(secret: Uint8Array): DerivedIdentityPublic {
+  const pubkeyXonly = schnorr.getPublicKey(secret);
+  return {
+    pubkeyHex: bytesToHex(pubkeyXonly),
+    npub: encodeNpub(Uint8Array.from(pubkeyXonly)),
+    derivationPath: NOSTR_DERIVATION_PATH,
+    profileId: DERIVATION_PROFILE_ID,
+  };
+}
+
+/**
  * Import an existing identity from nsec material (bech32 or 64-hex).
  * Verifies the derived npub against the provided secret so a typo'd input
  * cannot silently create a mismatched identity record.

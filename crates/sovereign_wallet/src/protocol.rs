@@ -31,6 +31,9 @@ pub enum ErrorCode {
     CredentialConsumed,
     StaleGeneration,
     AlreadyRunning,
+    /// The one-time Nostr-secret export bridge has already been consumed and
+    /// refuses to re-export (design §2.2 `export-nostr-secret`).
+    ExportAlreadyConsumed,
     WavedBinaryMissing,
     WavedWalletApiUnavailable,
     IncompatibleVersion,
@@ -192,6 +195,57 @@ pub struct PayResult {
     /// persists it (SEC-2026-046/047).
     #[serde(default)]
     pub preimage: Option<String>,
+}
+
+/// Identity/vault projection (design §2.2 `identity-status`). Read-only,
+/// public projection only — never key material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityStatusResult {
+    pub vault_state: String,
+    pub derived_npub: Option<String>,
+    /// Public-key hex (64-hex) of the derived identity — public projection
+    /// (same key material as the npub, different encoding). WP-5: used as the
+    /// principal for pubkey-keyed spending authorizations.
+    #[serde(default)]
+    pub derived_pubkey_hex: Option<String>,
+    #[serde(default)]
+    pub recovery_artifact_state: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// One-time Nostr-secret export (design §2.2 `export-nostr-secret`; operator
+/// only — the bridge into the Rust `omega_identity` import path). The nsec is
+/// returned exactly once; the sidecar refuses re-export with
+/// `ExportAlreadyConsumed` and never logs the material (SEC-2026-046).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportNostrSecretResult {
+    /// bech32 `nsec1…` material, shown once to the operator.
+    pub nsec: String,
+    pub npub: String,
+    pub exported: bool,
+}
+
+/// Create-wallet result (operator-only). The aezeed is shown once; the wallet
+/// DB password and aezeed are captured into the vault when it is unlocked
+/// (WP-5 seam: create-wallet → vault capture).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWalletResult {
+    /// Show-once 24-word Wavelength aezeed backup phrase.
+    pub mnemonic: Vec<String>,
+    #[serde(default)]
+    pub identity_pubkey: Option<String>,
+    /// True when the wallet DB password + aezeed were captured into the vault
+    /// at create (vault unlocked). False (with `note`) when the vault is
+    /// locked/absent — the password is then operator-held only.
+    pub wallet_db_password_vaulted: bool,
+    #[serde(default)]
+    pub vault_wallet_id: Option<String>,
+    #[serde(default)]
+    pub note: String,
 }
 
 pub fn request_frame(id: impl Into<String>, generation: u64, method: &str, params: Option<Value>) -> RequestFrame {

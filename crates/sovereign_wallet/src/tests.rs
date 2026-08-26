@@ -12,7 +12,8 @@ use tempfile::tempdir;
 use crate::client::SovereignWalletError;
 use crate::{
     SovereignWalletCommand, SovereignWalletSupervisor, SovereignWalletSupervisorOptions,
-    default_options, fixture_command, fixture_command_with_network, sovereign_wallet_enabled,
+    default_options, fixture_command, fixture_command_with_network, fixture_node,
+    sovereign_wallet_enabled,
 };
 
 fn fixture_path() -> PathBuf {
@@ -157,4 +158,84 @@ fn protocol_error_mapping_is_typed() {
         }
         supervisor.stop().await.ok();
     });
+}
+
+// ---------------------------------------------------------------------------
+// WP-5 construction site (design §7.1 + §6.1): the flag-ON path constructs
+// the shared supervisor in the running app and spawns the sidecar; the
+// flag-OFF path is byte-identical to today (no global, no spawn).
+// ---------------------------------------------------------------------------
+
+fn unset_construction_env() {
+    unsafe {
+        std::env::remove_var(crate::SOVEREIGN_WALLET_ENVIRONMENT_VARIABLE);
+        std::env::remove_var(crate::NODE_BIN_ENVIRONMENT_VARIABLE);
+        std::env::remove_var(crate::DATA_ROOT_ENVIRONMENT_VARIABLE);
+        std::env::remove_var(crate::NETWORK_ENVIRONMENT_VARIABLE);
+        std::env::remove_var("OMEGA_SOVEREIGN_WALLET_FIXTURE");
+    }
+}
+
+#[gpui::test]
+fn construction_is_inert_when_flag_off(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        unset_construction_env();
+        crate::init(cx);
+        assert!(
+            !crate::supervisor_available(cx),
+            "the flag-OFF path must not construct the supervisor"
+        );
+        assert!(
+            crate::shared_supervisor(cx).is_err(),
+            "the flag-OFF path must not register a runtime"
+        );
+    });
+}
+
+#[gpui::test]
+async fn construction_spawns_the_sidecar_when_flag_on(cx: &mut gpui::TestAppContext) {
+    let data_root = tempdir().expect("data root");
+    cx.update(|cx| {
+        unset_construction_env();
+        unsafe {
+            std::env::set_var(crate::SOVEREIGN_WALLET_ENVIRONMENT_VARIABLE, "1");
+            std::env::set_var(crate::NODE_BIN_ENVIRONMENT_VARIABLE, fixture_node());
+            std::env::set_var(crate::DATA_ROOT_ENVIRONMENT_VARIABLE, data_root.path());
+            std::env::set_var("OMEGA_SOVEREIGN_WALLET_FIXTURE", "1");
+        }
+        crate::init(cx);
+        assert!(
+            crate::supervisor_available(cx),
+            "the flag-ON path must construct the shared supervisor"
+        );
+        assert!(
+            crate::shared_supervisor(cx).is_ok(),
+            "the flag-ON path must register a runtime"
+        );
+    });
+    // The construction site is real: the shared supervisor drives the typed
+    // client against the spawned sidecar (initialize → health → balance).
+    // The async drive happens on the smol runtime (parking allowed), NOT on
+    // the gpui test scheduler (which forbids parking); the init's own
+    // foreground spawn is left to teardown, where ensure_started is a no-op
+    // once the child is already running.
+    let supervisor = cx.update(|cx| crate::shared_supervisor(cx).expect("shared supervisor"));
+    let balance = {
+        let supervisor = supervisor.clone();
+        smol::block_on(async move {
+            let mut guard = supervisor.lock().await;
+            guard.ensure_started().await.context("start via the construction site").unwrap();
+            let health = guard.health().await.context("health").unwrap();
+            assert!(health.ok, "the spawned sidecar must report healthy");
+            guard.balance().await.context("balance").unwrap()
+        })
+    };
+    assert_eq!(balance.confirmed_sat, "12345");
+    // The shared supervisor is process-wide: a second access returns the SAME
+    // instance (one Omega instance never spawns two sidecars).
+    let again = cx.update(|cx| crate::shared_supervisor(cx).expect("shared supervisor again"));
+    assert!(std::rc::Rc::ptr_eq(&supervisor, &again));
+    drop(supervisor);
+    drop(data_root);
+    unset_construction_env();
 }

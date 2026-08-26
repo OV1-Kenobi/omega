@@ -299,7 +299,9 @@ pub trait MandateAuthority: Send + Sync + 'static {
 
 impl MandateAuthority for MandateStore {
     fn authorize(&self, instruction: &TradingInstruction, now_ms: i64) -> Result<MandateDecision> {
-        MandateStore::authorize(self, instruction, now_ms)
+        // WP-5: the principal-aware authorize keeps the trait's 2-arg shape;
+        // the strategy engine is a non-principal flow (None = venue-wide).
+        MandateStore::authorize(self, instruction, None, now_ms)
     }
 }
 
