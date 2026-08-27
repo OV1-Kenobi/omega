@@ -755,6 +755,10 @@ fn main() {
         market_ui::init(cx);
         // OMEGA-DELTA-0268: the optional testnet-only execution engine is app-owned.
         nautilus_sidecar::init(cx);
+        // OA-P2-WALLET-2026-08-26 WP-3: the sovereign wallet lane is gated
+        // OFF by default (OMEGA_SOVEREIGN_WALLET=1); construction of the
+        // supervisor is wired by WP-5.
+        sovereign_wallet::init(cx);
         // OMEGA-DELTA-0275: live trading docks exist only with the typed
         // Nautilus testnet stream capability.
         trading_workspace_ui::init(cx);

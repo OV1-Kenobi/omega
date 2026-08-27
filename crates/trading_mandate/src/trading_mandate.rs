@@ -18,10 +18,27 @@ const MIN_REVIEW_INTERVAL_SECONDS: u64 = 60;
 /// The venue every mandate recorded before venue scoping implicitly governed.
 pub const LEGACY_VENUE: &str = "lnmarkets";
 
+/// The sovereign wallet venue (design §6.3.5). SEC-2026-043 (resolved by the
+/// founder: principal-only for the sovereign-wallet venue) makes this venue
+/// principal-only: every mandate for it MUST carry `principal_pubkey`, and
+/// `authorize` never falls back to a venue-wide mandate on this venue.
+pub const SOVEREIGN_WALLET_VENUE: &str = "sovereign-wallet";
+
 /// Mandate schema version stored in SQLite `user_version`. Version 1 stores
 /// held one implicit-venue revision chain; version 2 rows carry an explicit
-/// (venue, network) scope.
+/// (venue, network) scope. The principal-keyed scope dimension (WP-5) is an
+/// additive nullable column on version 2 — the version constant is NOT bumped
+/// because OMEGA-DELTA-0258 pins `MANDATE_SCHEMA_VERSION: i64 = 2` and
+/// crates/omega_deltas is out of bounds for WP-5 (labeled choice; open
+/// question OQ-WP5-1: bump both together in a delta-owning WP).
 pub const MANDATE_SCHEMA_VERSION: i64 = 2;
+
+/// SEC-2026-043: the sovereign-wallet venue is principal-only. The venue-wide
+/// fallback never applies to it, so a principal-keyed spend requires an exact
+/// principal mandate even when a venue-wide mandate exists.
+pub fn is_principal_only_venue(venue: &str) -> bool {
+    venue == SOVEREIGN_WALLET_VENUE
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,6 +93,11 @@ impl ReviewCadence {
 pub struct TradingMandate {
     pub venue: String,
     pub network: TradingNetwork,
+    /// Nostr public key hex (validated 64-hex) this mandate authorizes.
+    /// `None` = venue-wide mandate (legacy semantics, unchanged). The
+    /// sovereign-wallet venue is principal-only (SEC-2026-043): a mandate for
+    /// that venue without a principal is refused by the widening door.
+    pub principal_pubkey: Option<String>,
     pub collateral_asset: AssetId,
     pub objective: String,
     pub max_venue_balance: u64,
@@ -91,11 +113,16 @@ pub struct TradingMandate {
 
 impl TradingMandate {
     fn is_legacy_shape(&self) -> bool {
-        self.venue == LEGACY_VENUE && self.collateral_asset.is_sats()
+        self.venue == LEGACY_VENUE && self.collateral_asset.is_sats() && self.principal_pubkey.is_none()
     }
 
     pub fn validate(&self) -> Result<()> {
         validate_identifier("venue", &self.venue)?;
+        if let Some(principal) = &self.principal_pubkey
+            && !is_valid_pubkey_hex(principal)
+        {
+            bail!("mandate principal pubkey must be 64 hex characters");
+        }
         let objective = self.objective.trim();
         if objective.is_empty() {
             bail!("mandate objective must not be empty");
@@ -156,9 +183,13 @@ impl Serialize for TradingMandate {
             state.serialize_field("expires_at_ms", &self.expires_at_ms)?;
             state.end()
         } else {
-            let mut state = serializer.serialize_struct("TradingMandate", 13)?;
+            let mut state = serializer.serialize_struct("TradingMandate", 14)?;
             state.serialize_field("venue", &self.venue)?;
             state.serialize_field("network", &self.network)?;
+            // The principal scope dimension (WP-5) is included in the
+            // non-legacy serialization only, so pre-scoping byte-identical
+            // approval digests stay verifiable (design §6.3.6).
+            state.serialize_field("principal_pubkey", &self.principal_pubkey)?;
             state.serialize_field("collateral_asset", &self.collateral_asset)?;
             state.serialize_field("objective", &self.objective)?;
             state.serialize_field("max_venue_balance", &self.max_venue_balance)?;
@@ -184,6 +215,9 @@ struct TradingMandateRepr {
     #[serde(default = "legacy_venue")]
     venue: String,
     network: TradingNetwork,
+    // Pre-principal-keying rows carry no principal scope (None = venue-wide).
+    #[serde(default)]
+    principal_pubkey: Option<String>,
     #[serde(default = "AssetId::sats")]
     collateral_asset: AssetId,
     objective: String,
@@ -209,6 +243,7 @@ impl From<TradingMandateRepr> for TradingMandate {
         Self {
             venue: repr.venue,
             network: repr.network,
+            principal_pubkey: repr.principal_pubkey,
             collateral_asset: repr.collateral_asset,
             objective: repr.objective,
             max_venue_balance: repr.max_venue_balance,
@@ -294,11 +329,15 @@ pub struct MandateRevision {
     pub mandate: Option<TradingMandate>,
     pub approval_digest: Option<String>,
     // Pre-scoping rows carry no explicit scope; revocations recorded since
-    // venue scoping name the (venue, network) pair they revoke.
+    // venue scoping name the (venue, network) pair they revoke. The
+    // principal-keyed scope dimension (WP-5) is carried on the same row:
+    // NULL = the venue-wide (None) scope.
     #[serde(default)]
     pub venue: Option<String>,
     #[serde(default)]
     pub network: Option<TradingNetwork>,
+    #[serde(default)]
+    pub principal_pubkey: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -308,10 +347,26 @@ pub struct MandateSnapshot {
 }
 
 impl MandateSnapshot {
+    /// The venue-wide mandate for the (venue, network) pair (pre-principal-keying
+    /// semantics, unchanged). Principal-keyed mandates are selected with
+    /// [`MandateSnapshot::mandate_for_principal`].
     pub fn mandate_for(&self, venue: &str, network: TradingNetwork) -> Option<&TradingMandate> {
-        self.mandates
-            .iter()
-            .find(|mandate| mandate.venue == venue && mandate.network == network)
+        self.mandate_for_principal(venue, network, None)
+    }
+
+    /// Exact-scope lookup on the (venue, network, principal) triple (WP-5).
+    /// `None` principal selects the venue-wide mandate for the pair.
+    pub fn mandate_for_principal(
+        &self,
+        venue: &str,
+        network: TradingNetwork,
+        principal: Option<&str>,
+    ) -> Option<&TradingMandate> {
+        self.mandates.iter().find(|mandate| {
+            mandate.venue == venue
+                && mandate.network == network
+                && mandate.principal_pubkey.as_deref() == principal
+        })
     }
 }
 
@@ -365,6 +420,12 @@ pub enum RequiredRiskPosture {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MandateRefusal {
     Missing,
+    /// A principal was supplied but no mandate authorizes that principal for
+    /// the (venue, network) pair — and the venue-wide fallback either does not
+    /// exist or the venue is principal-only (SEC-2026-043).
+    PrincipalNotAuthorized {
+        principal: String,
+    },
     Expired {
         expires_at_ms: i64,
     },
@@ -465,7 +526,8 @@ impl MandateStore {
                  mandate_json TEXT,
                  approval_digest TEXT,
                  venue TEXT,
-                 network TEXT
+                 network TEXT,
+                 principal_pubkey TEXT
              ) STRICT;
              CREATE TRIGGER IF NOT EXISTS trading_mandate_no_update
              BEFORE UPDATE ON trading_mandate_revisions BEGIN
@@ -599,7 +661,11 @@ impl MandateStore {
         let transaction = connection.transaction()?;
         let revisions = load_revisions(&transaction)?;
         let replay = verify_revisions(&revisions)?;
-        let scope = (venue.to_owned(), network);
+        // Revocation keeps the pre-principal-keying signature and semantics:
+        // it removes the VENUE-WIDE (None) mandate for the pair. Revoking a
+        // principal-keyed mandate needs a principal-aware scope and is not
+        // wired in this WP (open question OQ-WP5-3).
+        let scope = (venue.to_owned(), network, None);
         if !replay.active.contains_key(&scope) {
             transaction.commit()?;
             return Ok(replay.snapshot());
@@ -618,17 +684,42 @@ impl MandateStore {
         Ok(verify_revisions(&revisions)?.snapshot())
     }
 
+    /// Authorize an instruction. `principal` is the spending agent's Nostr
+    /// pubkey hex (64-hex) when the flow is principal-keyed, `None` for
+    /// non-principal flows (e.g. nautilus). Resolution order (design §6.3.3,
+    /// SEC-2026-043): an exact `(venue, network, Some(principal))` mandate
+    /// first; then the venue-wide `(venue, network, None)` mandate — except on
+    /// principal-only venues (sovereign-wallet) where the venue-wide fallback
+    /// never applies. `PrincipalNotAuthorized` fires when a principal was
+    /// supplied and no mandate authorizes it.
     pub fn authorize(
         &self,
         instruction: &TradingInstruction,
+        principal: Option<&str>,
         now_ms: i64,
     ) -> Result<MandateDecision> {
         validate_timestamp(now_ms)?;
         validate_identifier("venue", &instruction.venue)?;
         validate_identifier("strategy ID", &instruction.strategy_id)?;
+        if let Some(principal) = principal
+            && !is_valid_pubkey_hex(principal)
+        {
+            // A malformed principal can never match a stored mandate (mandate
+            // `principal_pubkey` values are validated 64-hex), so the honest
+            // refusal is PrincipalNotAuthorized for the supplied value.
+            return Ok(refused(MandateRefusal::PrincipalNotAuthorized {
+                principal: principal.to_string(),
+            }));
+        }
         let snapshot = self.snapshot()?;
-        let Some(mandate) = snapshot.mandate_for(&instruction.venue, instruction.network) else {
-            return Ok(refused(MandateRefusal::Missing));
+        let Some(mandate) = resolve_mandate(&snapshot, &instruction.venue, instruction.network, principal)
+        else {
+            return Ok(match principal {
+                Some(principal) => refused(MandateRefusal::PrincipalNotAuthorized {
+                    principal: principal.to_string(),
+                }),
+                None => refused(MandateRefusal::Missing),
+            });
         };
         if now_ms >= mandate.expires_at_ms {
             return Ok(refused(MandateRefusal::Expired {
@@ -703,10 +794,71 @@ fn refused(reason: MandateRefusal) -> MandateDecision {
     }
 }
 
-type MandateScope = (String, TradingNetwork);
+/// Test-support seam (WP-5): lets another crate's mandate-gate tests set up an
+/// approved mandate without adding a production widening caller. This is the
+/// same store call the settings-UI approval path performs; it exists so the
+/// spend-gate tests in `sovereign_wallet` can create approved state without
+/// duplicating the widening door. Production callers must keep using the
+/// settings-UI approval path (OMEGA-DELTA-0245).
+#[doc(hidden)]
+pub fn apply_ui_approved_for_test(
+    store: &MandateStore,
+    proposal: MandateProposal,
+    approved_at_ms: i64,
+) -> Result<MandateSnapshot> {
+    store.apply_ui_approved(proposal, approved_at_ms)
+}
+
+/// The mandate scope key: (venue, network, principal). `None` principal is
+/// the venue-wide scope (legacy semantics, unchanged).
+type MandateScope = (String, TradingNetwork, Option<String>);
 
 fn scope_of(mandate: &TradingMandate) -> MandateScope {
-    (mandate.venue.clone(), mandate.network)
+    (
+        mandate.venue.clone(),
+        mandate.network,
+        mandate.principal_pubkey.clone(),
+    )
+}
+
+/// SEC-2026-043 (resolved by the founder: principal-only for the
+/// sovereign-wallet venue): a mandate for that venue without a
+/// `principal_pubkey` is refused by the widening door (`propose` →
+/// `apply_ui_approved`), so no venue-wide sovereign-wallet mandate can ever
+/// exist to fall back on.
+fn venue_policy_check(candidate: &TradingMandate) -> Result<()> {
+    if is_principal_only_venue(&candidate.venue) && candidate.principal_pubkey.is_none() {
+        bail!(
+            "the {SOVEREIGN_WALLET_VENUE} venue is principal-only; a mandate for it must carry principal_pubkey (SEC-2026-043)"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the governing mandate for a (venue, network, principal) request
+/// (design §6.3.3 + SEC-2026-043): exact principal scope first; venue-wide
+/// fallback for non-principal-only venues; NO venue-wide fallback on
+/// principal-only venues.
+fn resolve_mandate<'a>(
+    snapshot: &'a MandateSnapshot,
+    venue: &str,
+    network: TradingNetwork,
+    principal: Option<&str>,
+) -> Option<&'a TradingMandate> {
+    if let Some(principal) = principal {
+        if let Some(exact) = snapshot.mandate_for_principal(venue, network, Some(principal)) {
+            return Some(exact);
+        }
+        if is_principal_only_venue(venue) {
+            return None; // SEC-2026-043: the venue-wide fallback never applies here.
+        }
+    }
+    snapshot.mandate_for_principal(venue, network, None)
+}
+
+/// Nostr public keys in this store are 64 hex characters (design §6.3.1).
+fn is_valid_pubkey_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 struct MandateReplay {
@@ -725,7 +877,8 @@ impl MandateReplay {
 
 // Version 1 stores predate scoped rows; the added columns stay NULL for
 // existing rows, whose scope is recovered from the mandate itself during
-// replay.
+// replay. WP-5 adds the principal-keyed scope dimension as an additive
+// nullable column on the same table (legacy rows NULL → None = venue-wide).
 fn migrate_legacy_single_scope_store(connection: &Connection) -> Result<()> {
     let table_exists = connection
         .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'trading_mandate_revisions'")?
@@ -742,6 +895,16 @@ fn migrate_legacy_single_scope_store(connection: &Connection) -> Result<()> {
         connection.execute_batch(
             "ALTER TABLE trading_mandate_revisions ADD COLUMN venue TEXT;
              ALTER TABLE trading_mandate_revisions ADD COLUMN network TEXT;",
+        )?;
+    }
+    let has_principal_column = connection
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('trading_mandate_revisions') WHERE name = 'principal_pubkey'",
+        )?
+        .exists([])?;
+    if !has_principal_column {
+        connection.execute_batch(
+            "ALTER TABLE trading_mandate_revisions ADD COLUMN principal_pubkey TEXT;",
         )?;
     }
     Ok(())
@@ -771,6 +934,7 @@ fn make_proposal(
     candidate: TradingMandate,
 ) -> Result<MandateProposal> {
     candidate.validate()?;
+    venue_policy_check(&candidate)?;
     let change_class = classify_change(current, &candidate);
     let digest = proposal_digest(base_revision, &candidate)?;
     Ok(MandateProposal {
@@ -863,14 +1027,16 @@ fn append_revision(
     let revision_i64 = i64::try_from(revision).context("mandate revision exceeded SQLite range")?;
     let kind_json = serde_json::to_string(&kind)?;
     let mandate_json = mandate.as_ref().map(serde_json::to_string).transpose()?;
-    let (venue, network) = match &scope {
-        Some((venue, network)) => (Some(venue.clone()), Some(*network)),
-        None => (None, None),
+    let (venue, network, principal_pubkey) = match &scope {
+        Some((venue, network, principal_pubkey)) => {
+            (Some(venue.clone()), Some(*network), principal_pubkey.clone())
+        }
+        None => (None, None, None),
     };
     transaction.execute(
         "INSERT INTO trading_mandate_revisions (
-             revision, changed_at_ms, kind, mandate_json, approval_digest, venue, network
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             revision, changed_at_ms, kind, mandate_json, approval_digest, venue, network, principal_pubkey
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             revision_i64,
             changed_at_ms,
@@ -879,6 +1045,7 @@ fn append_revision(
             approval_digest,
             venue,
             network.map(TradingNetwork::label),
+            principal_pubkey,
         ],
     )?;
     Ok(MandateRevision {
@@ -889,12 +1056,13 @@ fn append_revision(
         approval_digest,
         venue,
         network,
+        principal_pubkey,
     })
 }
 
 fn load_revisions(connection: &Connection) -> Result<Vec<MandateRevision>> {
     let mut statement = connection.prepare(
-        "SELECT revision, changed_at_ms, kind, mandate_json, approval_digest, venue, network
+        "SELECT revision, changed_at_ms, kind, mandate_json, approval_digest, venue, network, principal_pubkey
          FROM trading_mandate_revisions ORDER BY revision",
     )?;
     let rows = statement.query_map([], |row| {
@@ -906,12 +1074,21 @@ fn load_revisions(connection: &Connection) -> Result<Vec<MandateRevision>> {
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
             row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     })?;
     let mut revisions = Vec::new();
     for row in rows {
-        let (revision, changed_at_ms, kind_json, mandate_json, approval_digest, venue, network) =
-            row?;
+        let (
+            revision,
+            changed_at_ms,
+            kind_json,
+            mandate_json,
+            approval_digest,
+            venue,
+            network,
+            principal_pubkey,
+        ) = row?;
         revisions.push(MandateRevision {
             revision: u64::try_from(revision).context("mandate revision was negative")?,
             changed_at_ms,
@@ -928,6 +1105,7 @@ fn load_revisions(connection: &Connection) -> Result<Vec<MandateRevision>> {
                 .map(TradingNetwork::parse)
                 .transpose()
                 .context("mandate revision names an unknown network")?,
+            principal_pubkey,
         });
     }
     Ok(revisions)
@@ -950,8 +1128,10 @@ fn verify_revisions(revisions: &[MandateRevision]) -> Result<MandateReplay> {
                 if revision.approval_digest.is_some() {
                     bail!("mandate revocation must not carry a widening approval");
                 }
-                let scope = match (&revision.venue, revision.network) {
-                    (Some(venue), Some(network)) => (venue.clone(), network),
+                let scope = match (&revision.venue, revision.network, &revision.principal_pubkey) {
+                    (Some(venue), Some(network), principal) => {
+                        (venue.clone(), network, principal.clone())
+                    }
                     // Pre-scoping revocations named no scope; they were only
                     // valid while exactly one mandate was active.
                     _ => {
@@ -975,7 +1155,9 @@ fn verify_revisions(revisions: &[MandateRevision]) -> Result<MandateReplay> {
                 mandate.validate()?;
                 let scope = scope_of(mandate);
                 if let (Some(venue), Some(network)) = (&revision.venue, revision.network)
-                    && (venue != &scope.0 || network != scope.1)
+                    && (venue != &scope.0
+                        || network != scope.1
+                        || revision.principal_pubkey != scope.2)
                 {
                     bail!("mandate revision scope does not match its mandate");
                 }
@@ -1046,6 +1228,7 @@ mod tests {
         TradingMandate {
             venue: LEGACY_VENUE.into(),
             network: TradingNetwork::Signet,
+            principal_pubkey: None,
             collateral_asset: AssetId::sats(),
             objective: "Maximize ledger profit in sats".into(),
             max_venue_balance: 100_000,
@@ -1064,6 +1247,7 @@ mod tests {
         TradingMandate {
             venue: "hyperliquid".into(),
             network: TradingNetwork::Mainnet,
+            principal_pubkey: None,
             collateral_asset: AssetId::usdc(),
             objective: "Carry funding in USDC".into(),
             max_venue_balance: 250_000_000,
@@ -1261,9 +1445,12 @@ mod tests {
                 .is_none()
         );
 
-        // Authorization routes by the instruction's (venue, network) scope.
+        // Authorization routes by the instruction's (venue, network) scope;
+        // non-principal flows pass None (venue-wide resolution, unchanged).
         assert_eq!(
-            store.authorize(&instruction(), 3).expect("sats decision"),
+            store
+                .authorize(&instruction(), None, 3)
+                .expect("sats decision"),
             MandateDecision::Authorized { revision: 2 }
         );
         let usdc_instruction = TradingInstruction {
@@ -1280,7 +1467,7 @@ mod tests {
         };
         assert_eq!(
             store
-                .authorize(&usdc_instruction, 3)
+                .authorize(&usdc_instruction, None, 3)
                 .expect("usdc decision"),
             MandateDecision::Authorized { revision: 2 }
         );
@@ -1291,6 +1478,7 @@ mod tests {
                         network: TradingNetwork::Signet,
                         ..usdc_instruction.clone()
                     },
+                    None,
                     3
                 )
                 .expect("missing scope"),
@@ -1303,6 +1491,7 @@ mod tests {
                         collateral_asset: AssetId::sats(),
                         ..usdc_instruction
                     },
+                    None,
                     3
                 )
                 .expect("collateral mismatch"),
@@ -1372,12 +1561,12 @@ mod tests {
     fn instruction_enforcement_fails_closed_for_every_limit() {
         let store = MandateStore::in_memory().expect("store");
         assert_eq!(
-            store.authorize(&instruction(), 1).expect("decision"),
+            store.authorize(&instruction(), None, 1).expect("decision"),
             refused(MandateRefusal::Missing)
         );
         approve(&store, mandate(), 1);
         assert_eq!(
-            store.authorize(&instruction(), 2).expect("decision"),
+            store.authorize(&instruction(), None, 2).expect("decision"),
             MandateDecision::Authorized { revision: 1 }
         );
 
@@ -1480,12 +1669,12 @@ mod tests {
         ];
         for (request, reason) in cases {
             assert_eq!(
-                store.authorize(&request, 2).expect("decision"),
+                store.authorize(&request, None, 2).expect("decision"),
                 refused(reason)
             );
         }
         assert_eq!(
-            store.authorize(&instruction(), 10_000).expect("expiry"),
+            store.authorize(&instruction(), None, 10_000).expect("expiry"),
             refused(MandateRefusal::Expired {
                 expires_at_ms: 10_000
             })
@@ -1638,5 +1827,360 @@ mod tests {
         let reopened = MandateStore::open(&path).expect("reopen");
         assert_eq!(reopened.snapshot().expect("snapshot").revision, 1);
         assert_eq!(reopened.history().expect("history").len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // WP-5: principal-pubkey-keyed spending authorizations (design §6.3,
+    // SEC-2026-043). The scope key is now (venue, network, principal_pubkey);
+    // existing venue-wide mandates keep their exact semantics.
+    // -----------------------------------------------------------------------
+
+    const AGENT_PUBKEY: &str =
+        "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0";
+    const OTHER_PUBKEY: &str =
+        "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+    fn principal_mandate(venue: &str, network: TradingNetwork, principal: &str) -> TradingMandate {
+        TradingMandate {
+            venue: venue.into(),
+            network,
+            principal_pubkey: Some(principal.into()),
+            collateral_asset: AssetId::sats(),
+            objective: "Pubkey-keyed spending authorization".into(),
+            max_venue_balance: 50_000,
+            max_position_usd: 1,
+            max_leverage: 1,
+            daily_loss_stop: 50_000,
+            max_orders_per_hour: 60,
+            min_liquidation_buffer_bps: 0,
+            allowed_strategies: strategies(&["wallet_payment"]),
+            review_cadence: ReviewCadence::Interval { seconds: 3_600 },
+            expires_at_ms: 100_000,
+        }
+    }
+
+    fn wallet_instruction(amount_sat: u64) -> TradingInstruction {
+        TradingInstruction {
+            venue: "sovereign-wallet".into(),
+            network: TradingNetwork::Signet,
+            strategy_id: "wallet_payment".into(),
+            collateral_asset: AssetId::sats(),
+            venue_balance_after: amount_sat,
+            position_notional_usd: 0,
+            leverage: 1,
+            daily_realized_loss: 0,
+            orders_last_hour: 0,
+            liquidation_buffer_bps: 10_000,
+        }
+    }
+
+    #[test]
+    fn pubkey_keyed_mandates_are_a_distinct_scope_through_the_approval_door() {
+        let store = MandateStore::in_memory().expect("store");
+        // A principal-keyed mandate is a new scope: Creation through the same
+        // widening door (apply_ui_approved), never save_restriction.
+        let candidate = principal_mandate("hyperliquid", TradingNetwork::Testnet, AGENT_PUBKEY);
+        let proposal = store.propose(candidate.clone()).expect("principal proposal");
+        assert_eq!(proposal.change_class(), MandateChangeClass::Creation);
+        assert!(store.save_restriction(proposal, 1).is_err());
+        let proposal = store.propose(candidate.clone()).expect("principal proposal");
+        store
+            .apply_ui_approved(proposal, 1)
+            .expect("approved principal mandate");
+
+        let snapshot = store.snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.mandate_for_principal("hyperliquid", TradingNetwork::Testnet, Some(AGENT_PUBKEY)),
+            Some(&candidate)
+        );
+        // The venue-wide slot for the same pair is untouched by the
+        // principal-keyed mandate (None and Some are distinct scopes).
+        assert!(
+            snapshot
+                .mandate_for_principal("hyperliquid", TradingNetwork::Testnet, None)
+                .is_none()
+        );
+
+        let mut instruction = instruction();
+        instruction.venue = "hyperliquid".into();
+        instruction.network = TradingNetwork::Testnet;
+        instruction.strategy_id = "wallet_payment".into();
+        instruction.collateral_asset = AssetId::sats();
+        instruction.venue_balance_after = 10_000;
+        instruction.position_notional_usd = 0;
+        instruction.leverage = 1;
+        // Exact principal matches the principal-keyed mandate.
+        assert_eq!(
+            store
+                .authorize(&instruction, Some(AGENT_PUBKEY), 2)
+                .expect("agent decision"),
+            MandateDecision::Authorized { revision: 1 }
+        );
+        // A different principal on a non-principal-only venue falls back to
+        // the venue-wide slot — which does not exist here, so the refusal is
+        // PrincipalNotAuthorized, not Missing.
+        assert_eq!(
+            store
+                .authorize(&instruction, Some(OTHER_PUBKEY), 2)
+                .expect("other principal decision"),
+            refused(MandateRefusal::PrincipalNotAuthorized {
+                principal: OTHER_PUBKEY.into(),
+            })
+        );
+        // A None-principal flow resolves to the venue-wide slot (absent) →
+        // Missing, preserving pre-principal semantics.
+        assert_eq!(
+            store.authorize(&instruction, None, 2).expect("venue-wide"),
+            refused(MandateRefusal::Missing)
+        );
+    }
+
+    #[test]
+    fn venue_wide_fallback_still_authorizes_non_principal_flows() {
+        let store = MandateStore::in_memory().expect("store");
+        approve(&store, mandate(), 1);
+        // A principal-keyed request on a non-principal-only venue with no
+        // principal-scoped mandate resolves to the venue-wide mandate exactly
+        // as a None-principal flow would (design §6.3.3 conservative default).
+        assert_eq!(
+            store
+                .authorize(&instruction(), Some(AGENT_PUBKEY), 2)
+                .expect("venue-wide fallback"),
+            MandateDecision::Authorized { revision: 1 }
+        );
+        assert_eq!(
+            store.authorize(&instruction(), None, 2).expect("venue-wide"),
+            MandateDecision::Authorized { revision: 1 }
+        );
+    }
+
+    #[test]
+    fn sovereign_wallet_venue_is_principal_only_and_refuses_without_a_principal() {
+        let store = MandateStore::in_memory().expect("store");
+        // SEC-2026-043 (founder-resolved): a mandate for the sovereign-wallet
+        // venue without principal_pubkey is refused by the widening door.
+        let mut venue_wide = principal_mandate(
+            SOVEREIGN_WALLET_VENUE,
+            TradingNetwork::Signet,
+            AGENT_PUBKEY,
+        );
+        venue_wide.principal_pubkey = None;
+        let error = store
+            .propose(venue_wide)
+            .expect_err("a venue-wide sovereign-wallet mandate must be refused");
+        assert!(
+            error.to_string().contains("principal-only"),
+            "expected the SEC-2026-043 principal-only refusal, got: {error}"
+        );
+
+        // The principal-keyed sovereign-wallet mandate is the only creatable
+        // shape, through the same widening door.
+        let candidate =
+            principal_mandate(SOVEREIGN_WALLET_VENUE, TradingNetwork::Signet, AGENT_PUBKEY);
+        let proposal = store.propose(candidate.clone()).expect("principal proposal");
+        store
+            .apply_ui_approved(proposal, 1)
+            .expect("approved principal mandate");
+
+        // The exact principal spend is authorized.
+        let instruction = wallet_instruction(10_000);
+        assert_eq!(
+            store
+                .authorize(&instruction, Some(AGENT_PUBKEY), 2)
+                .expect("agent decision"),
+            MandateDecision::Authorized { revision: 1 }
+        );
+
+        // A different principal is refused with PrincipalNotAuthorized even
+        // though the pair has a principal-keyed mandate for another principal.
+        assert_eq!(
+            store
+                .authorize(&instruction, Some(OTHER_PUBKEY), 2)
+                .expect("other principal decision"),
+            refused(MandateRefusal::PrincipalNotAuthorized {
+                principal: OTHER_PUBKEY.into(),
+            })
+        );
+
+        // SEC-2026-043 negative test: a principal-keyed spend with only a
+        // venue-wide mandate on the pair must be refused. The widening door
+        // makes that state unrepresentable through the API, so this proves the
+        // enforcement at the replay layer instead: a hand-inserted venue-wide
+        // sovereign-wallet row fails store verification (the invariant holds
+        // even against a store bypass).
+        {
+            let connection = store.connection.lock();
+            let digest = proposal_digest(0, &{
+                let mut row = principal_mandate(
+                    SOVEREIGN_WALLET_VENUE,
+                    TradingNetwork::Signet,
+                    AGENT_PUBKEY,
+                );
+                row.principal_pubkey = None;
+                row
+            })
+            .expect("digest for the injected row");
+            connection
+                .execute(
+                    "INSERT INTO trading_mandate_revisions (
+                         revision, changed_at_ms, kind, mandate_json, approval_digest,
+                         venue, network, principal_pubkey
+                     ) VALUES (2, 2, ?1, ?2, ?3, ?4, ?5, NULL)",
+                    params![
+                        serde_json::to_string(&MandateRevisionKind::Creation).expect("kind"),
+                        serde_json::to_string(&{
+                            let mut row = principal_mandate(
+                                SOVEREIGN_WALLET_VENUE,
+                                TradingNetwork::Signet,
+                                AGENT_PUBKEY,
+                            );
+                            row.principal_pubkey = None;
+                            row
+                        })
+                        .expect("row mandate"),
+                        digest,
+                        SOVEREIGN_WALLET_VENUE,
+                        "signet",
+                    ],
+                )
+                .expect("inject a venue-wide sovereign-wallet row");
+        } // connection guard dropped before verify() (non-reentrant lock)
+        assert!(
+            store.verify().is_err(),
+            "a venue-wide sovereign-wallet mandate must fail store verification"
+        );
+    }
+
+    #[test]
+    fn principal_pubkey_is_validated_and_scope_change_is_creation() {
+        let store = MandateStore::in_memory().expect("store");
+        let mut bad = principal_mandate("hyperliquid", TradingNetwork::Testnet, AGENT_PUBKEY);
+        bad.principal_pubkey = Some("not-hex".into());
+        assert!(store.propose(bad).is_err(), "malformed principal must fail");
+
+        let mut short = principal_mandate("hyperliquid", TradingNetwork::Testnet, AGENT_PUBKEY);
+        short.principal_pubkey = Some("abc".into());
+        assert!(store.propose(short).is_err(), "short principal must fail");
+
+        // Moving a venue from venue-wide to principal-keyed is a NEW scope →
+        // Creation (UI approval), not a widening of the venue-wide mandate.
+        approve(&store, mandate(), 1);
+        let candidate =
+            principal_mandate(LEGACY_VENUE, TradingNetwork::Signet, AGENT_PUBKEY);
+        let proposal = store.propose(candidate).expect("principal proposal");
+        assert_eq!(proposal.change_class(), MandateChangeClass::Creation);
+
+        // Widening a principal-keyed mandate's limits is still a Widening
+        // behind the same approval door.
+        let candidate = principal_mandate(LEGACY_VENUE, TradingNetwork::Signet, AGENT_PUBKEY);
+        let proposal = store.propose(candidate.clone()).expect("creation");
+        store
+            .apply_ui_approved(proposal, 2)
+            .expect("approved principal mandate");
+        let mut wider = candidate;
+        wider.max_venue_balance += 1;
+        let proposal = store.propose(wider).expect("widening");
+        assert_eq!(proposal.change_class(), MandateChangeClass::Widening);
+        assert!(store.save_restriction(proposal, 3).is_err());
+    }
+
+    #[test]
+    fn principal_keyed_restriction_keeps_the_no_approval_semantics() {
+        let store = MandateStore::in_memory().expect("store");
+        let candidate =
+            principal_mandate("hyperliquid", TradingNetwork::Testnet, AGENT_PUBKEY);
+        let proposal = store.propose(candidate.clone()).expect("creation");
+        store
+            .apply_ui_approved(proposal, 1)
+            .expect("approved principal mandate");
+
+        let mut narrowed = candidate;
+        narrowed.max_venue_balance -= 1;
+        let proposal = store.propose(narrowed.clone()).expect("restriction");
+        assert_eq!(proposal.change_class(), MandateChangeClass::Restriction);
+        let snapshot = store.save_restriction(proposal, 2).expect("save");
+        assert_eq!(
+            snapshot.mandate_for_principal("hyperliquid", TradingNetwork::Testnet, Some(AGENT_PUBKEY)),
+            Some(&narrowed)
+        );
+    }
+
+    #[test]
+    fn revoke_removes_the_venue_wide_scope_only() {
+        // OQ-WP5-3: revocation keeps its pre-principal signature and removes
+        // the venue-wide (None) scope; principal-keyed revocation is not
+        // wired this WP. A principal-keyed mandate survives a pair revoke.
+        let store = MandateStore::in_memory().expect("store");
+        approve(&store, mandate(), 1);
+        let candidate = principal_mandate(LEGACY_VENUE, TradingNetwork::Signet, AGENT_PUBKEY);
+        let proposal = store.propose(candidate.clone()).expect("creation");
+        store
+            .apply_ui_approved(proposal, 2)
+            .expect("approved principal mandate");
+
+        let snapshot = store
+            .revoke(LEGACY_VENUE, TradingNetwork::Signet, 3)
+            .expect("revoke venue-wide");
+        assert!(
+            snapshot
+                .mandate_for_principal(LEGACY_VENUE, TradingNetwork::Signet, None)
+                .is_none(),
+            "the venue-wide mandate must be revoked"
+        );
+        assert_eq!(
+            snapshot.mandate_for_principal(LEGACY_VENUE, TradingNetwork::Signet, Some(AGENT_PUBKEY)),
+            Some(&candidate),
+            "the principal-keyed mandate must survive a venue-wide revoke"
+        );
+    }
+
+    #[test]
+    fn version_two_stores_gain_the_principal_column_and_still_verify() {
+        // A v2-schema store (venue/network columns, no principal_pubkey)
+        // migrates additively: the new column is added, old rows read as
+        // None (venue-wide), and their digests still verify.
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("trading-mandate.db");
+        {
+            let connection = Connection::open(&path).expect("raw connection");
+            connection
+                .execute_batch(
+                    "CREATE TABLE trading_mandate_revisions (
+                         revision INTEGER PRIMARY KEY CHECK (revision > 0),
+                         changed_at_ms INTEGER NOT NULL CHECK (changed_at_ms >= 0),
+                         kind TEXT NOT NULL,
+                         mandate_json TEXT,
+                         approval_digest TEXT,
+                         venue TEXT,
+                         network TEXT
+                     ) STRICT;",
+                )
+                .expect("v2 schema");
+            let legacy = mandate();
+            let digest = proposal_digest(0, &legacy).expect("digest");
+            connection
+                .execute(
+                    "INSERT INTO trading_mandate_revisions (
+                         revision, changed_at_ms, kind, mandate_json, approval_digest, venue, network
+                     ) VALUES (1, 1, ?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        serde_json::to_string(&MandateRevisionKind::Creation).expect("kind"),
+                        serde_json::to_string(&legacy).expect("mandate"),
+                        digest,
+                        LEGACY_VENUE,
+                        "signet",
+                    ],
+                )
+                .expect("v2 creation row");
+        }
+        let store = MandateStore::open(&path).expect("migrated store");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(
+            snapshot.mandate_for(LEGACY_VENUE, TradingNetwork::Signet),
+            Some(&mandate())
+        );
+        let revisions = store.history().expect("history");
+        assert_eq!(revisions[0].principal_pubkey, None);
     }
 }

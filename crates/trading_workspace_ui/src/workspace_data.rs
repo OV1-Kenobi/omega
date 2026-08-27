@@ -73,6 +73,8 @@ impl PortfolioPanelData {
         let mandate = TradingMandate {
             venue: "hyperliquid".to_owned(),
             network: TradingNetwork::Testnet,
+            // WP-5: venue-wide demo mandate (no principal scope).
+            principal_pubkey: None,
             collateral_asset: AssetId::usdc(),
             objective: "Bounded testnet execution".to_owned(),
             max_venue_balance: 2_500_000,

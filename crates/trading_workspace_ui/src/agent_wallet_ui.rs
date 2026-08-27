@@ -982,6 +982,8 @@ mod tests {
         let mut mandate = TradingMandate {
             venue: "hyperliquid".to_owned(),
             network: TradingNetwork::Testnet,
+            // WP-5: venue-wide mandate (no principal scope).
+            principal_pubkey: None,
             collateral_asset: AssetId::usdc(),
             objective: "testnet proof".to_owned(),
             max_venue_balance: 2_000_000_000,
@@ -1017,6 +1019,8 @@ mod tests {
         let mut mandate = TradingMandate {
             venue: "hyperliquid".to_owned(),
             network: TradingNetwork::Testnet,
+            // WP-5: venue-wide mandate (no principal scope).
+            principal_pubkey: None,
             collateral_asset: AssetId::usdc(),
             objective: "old objective".to_owned(),
             max_venue_balance: 2_000_000_000,

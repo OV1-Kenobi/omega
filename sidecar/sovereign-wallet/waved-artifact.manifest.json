@@ -1,0 +1,56 @@
+{
+  "schema": "openagents.omega.sovereign-wallet.artifact-manifest.v1",
+  "component": "waved/wavecli (Wavelength wallet daemon, wavewalletrpc+swapruntime build)",
+  "decision": "Q2 (accepted, founder 2026-08-26): official release downloads, pinned version + hash verification, vendored OUTSIDE git (this manifest is the pinning record; binary blobs are never committed). Runtime wallet-API probe mandatory (a wavewalletrpc-only build silently stubs WalletService — probe Status and fail closed on Unimplemented).",
+  "source": "https://github.com/lightninglabs/wavelength/releases (official Lightning Labs releases)",
+  "pinned_release": "v0.1.2-rc3",
+  "published_at": "2026-08-21T17:28:25Z",
+  "release_notes": "https://github.com/lightninglabs/wavelength/releases/tag/v0.1.2-rc3",
+  "verification": {
+    "manifest_url": "https://github.com/lightninglabs/wavelength/releases/download/v0.1.2-rc3/manifest-v0.1.2-rc3.txt",
+    "manifest_sha256": "81f3540fed5932c40db1aca6c44c5e09ee499514156f48f35069f683d88e366d",
+    "signature_asset": "manifest-sputn1ck-v0.1.2-rc3.sig (detached; OpenPGP — key fingerprint to be recorded at install time)",
+    "reproducible_build": "make release tag=v0.1.2-rc3 (Go 1.26.0); verify with ./scripts/verify-install.sh v0.1.2-rc3 <path> (docs/release.md at the tag)",
+    "provenance_status": "REQUIRES VERIFICATION — whether the release archives are built with the wavewalletrpc+swapruntime tags is not provable from the manifest alone; the runtime wallet-API probe (WalletService.Status) at install time is the definitive check (Q2/SEC-2026-050)."
+  },
+  "platforms": {
+    "windows-amd64": {
+      "archive": "wavelength-windows-amd64-v0.1.2-rc3.zip",
+      "archive_sha256": "2df8394efc170ed2e25e17ca5176acef8bb0fcc87d055feff414026c94235aac",
+      "archive_size_bytes": 38079694,
+      "waved_exe_sha256": "18d4bd19261bba1ac49774c6113c0055628a9ffdeb6278db5bc79b202fcbae64",
+      "wavecli_exe_sha256": "cfd8fb6772becee8c060524ed864ee7a793442438638a11cf5a98755d07d57ae"
+    },
+    "darwin-arm64": {
+      "archive": "wavelength-darwin-arm64-v0.1.2-rc3.tar.gz",
+      "archive_sha256": "f7ac15d7dd6249a4e84e244ff18535439f7d9d09677fae780b77c66f1170ef0b",
+      "waved_sha256": "d1e0bbbe60f4ff39f0acb108eb8b21f519ba86889931106ea40f97c2a71853e8"
+    },
+    "darwin-amd64": {
+      "archive": "wavelength-darwin-amd64-v0.1.2-rc3.tar.gz",
+      "archive_sha256": "1ba32322d39caf64e3ca2652e4aa0b3d6aecdad54efaf1848f1ac9e039df7c8d",
+      "waved_sha256": "e4ee5e6e42d624b265d5cfadc97e2363d5be73806047f5ea56f6d2765e50d2dd"
+    },
+    "linux-amd64": {
+      "archive": "wavelength-linux-amd64-v0.1.2-rc3.tar.gz",
+      "archive_sha256": "751b498d6b94c47d10a372a98248e75238df05b8da0d48170ba1766d40315789",
+      "waved_sha256": "d063df656627a73ea7a91c49f8db538fc13c9d02c9189f458dcfef79671bd529"
+    }
+  },
+  "install_procedure": {
+    "vendor_location": "OUTSIDE git (never committed). Suggested: C:\\Users\\<you>\\Documents\\OpenCode-Local-Media\\wavelength\\v0.1.2-rc3\\",
+    "steps": [
+      "1. Download the platform archive from the official release URL.",
+      "2. Verify sha256 of the archive AND of the extracted waved binary against this manifest.",
+      "3. Run the runtime wallet-API probe: start waved with the signet config (sidecar does this), call POST /v1/wallet/status; an Unimplemented/unknown-service answer means the build lacks wavewalletrpc+swapruntime — replace the artifact.",
+      "4. Point the supervisor at the binary via OMEGA_SOVEREIGN_WALLET_WAVED_BIN."
+    ]
+  },
+  "re_review_triggers": [
+    "waved/wavecli version change",
+    "new official release publish",
+    "OS/arch change",
+    "Node/ABI shift affecting the sidecar",
+    "any mainnet-adjacent phase (per SEC-2026-052 posture)"
+  ]
+}

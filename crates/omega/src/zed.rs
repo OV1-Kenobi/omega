@@ -6299,6 +6299,7 @@ mod tests {
             workroom_ui::init(cx);
             market_ui::init(cx);
             sovereign_dashboard::init(cx);
+            sovereign_wallet::init(cx);
             initialize_workspace(app_state.clone(), cx);
             search::init(cx);
             lsp_locations::init(cx);

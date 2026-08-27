@@ -33,4 +33,15 @@ pub trait Transport: Send + Sync {
     fn auth_challenge(&self) -> Option<WwwAuthenticate> {
         None
     }
+
+    /// The L-402 challenge from the last `402 Payment Required` response this
+    /// transport gave up on (no payer configured, or payment refused), if any
+    /// (currently only set by the HTTP transport; WP-6).
+    ///
+    /// Mirrors [`Transport::auth_challenge`]: recorded right before the failed
+    /// send tears down the client's output loop, so a caller can observe the
+    /// invoice even when the 402 arrived on a notification.
+    fn l402_challenge(&self) -> Option<L402Challenge> {
+        None
+    }
 }

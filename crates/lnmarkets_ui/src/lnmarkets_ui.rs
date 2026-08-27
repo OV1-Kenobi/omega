@@ -309,6 +309,8 @@ impl LnMarketsSettingsPage {
         let mandate = TradingMandate {
             venue: LEGACY_VENUE.to_owned(),
             network: self.mandate_network,
+            // WP-5: LN Markets mandates stay venue-wide (no principal scope).
+            principal_pubkey: None,
             collateral_asset: AssetId::sats(),
             objective,
             max_venue_balance: parse_editor(

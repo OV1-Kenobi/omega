@@ -252,6 +252,8 @@ pub(crate) fn demo_mandate() -> TradingMandate {
     TradingMandate {
         venue: "lnmarkets".into(),
         network: TradingNetwork::Signet,
+        // WP-5: the demo mandate is venue-wide (no principal scope).
+        principal_pubkey: None,
         collateral_asset: AssetId::sats(),
         objective: "Bound automated carry and rebalance risk".into(),
         max_venue_balance: 250_000,

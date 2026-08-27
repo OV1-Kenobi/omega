@@ -544,6 +544,8 @@ mod tests {
                 mandates: vec![TradingMandate {
                     venue: trading_mandate::LEGACY_VENUE.into(),
                     network: TradingNetwork::Signet,
+                    // WP-5: venue-wide mandate (no principal scope).
+                    principal_pubkey: None,
                     collateral_asset: trading_mandate::AssetId::sats(),
                     objective: "Keep signet strategy risk bounded".into(),
                     max_venue_balance: 100_000,
@@ -724,6 +726,8 @@ mod tests {
         let mandate = TradingMandate {
             venue: trading_mandate::LEGACY_VENUE.into(),
             network: TradingNetwork::Signet,
+            // WP-5: venue-wide mandate (no principal scope).
+            principal_pubkey: None,
             collateral_asset: trading_mandate::AssetId::sats(),
             objective: "Prove bounded zero-nudge Signet operation".into(),
             max_venue_balance: opening_balance_unsigned.saturating_add(100_000),
@@ -822,6 +826,8 @@ mod tests {
                     orders_last_hour: 0,
                     liquidation_buffer_bps: 10_000,
                 },
+                // WP-5: non-principal flow (no principal scope).
+                None,
                 ended_at_ms.saturating_sub(1),
             )
             .expect("evaluate injected limit")

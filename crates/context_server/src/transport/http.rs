@@ -5,6 +5,7 @@ use futures::{Stream, StreamExt};
 use gpui::BackgroundExecutor;
 use http_client::{AsyncBody, HttpClient, Request, Response, http::Method};
 use parking_lot::Mutex as SyncMutex;
+use serde::Deserialize;
 use std::{pin::Pin, sync::Arc};
 
 use crate::oauth::{self, OAuthTokenProvider, WwwAuthenticate};
@@ -18,6 +19,10 @@ pub enum TransportError {
     /// The server returned 401 and token refresh either wasn't possible or
     /// failed. The caller should initiate the OAuth authorization flow.
     AuthRequired { www_authenticate: WwwAuthenticate },
+    /// The server returned 402 with an L-402 (Lightning paywall) challenge and
+    /// no payer is configured for this transport. The caller can obtain the
+    /// challenge via [`Transport::l402_challenge`] and retry after paying.
+    L402PaymentRequired { challenge: L402Challenge },
 }
 
 impl std::fmt::Display for TransportError {
@@ -26,15 +31,48 @@ impl std::fmt::Display for TransportError {
             TransportError::AuthRequired { .. } => {
                 write!(f, "OAuth authorization required")
             }
+            TransportError::L402PaymentRequired { .. } => {
+                write!(f, "L-402 payment required")
+            }
         }
     }
 }
 
 impl std::error::Error for TransportError {}
 
+/// An L-402 challenge from a `402 Payment Required` response (MDK protocol;
+/// see the OpenAgents L-402 audit — challenge JSON body + the standard
+/// `WWW-Authenticate: L402 macaroon="…", invoice="…"` challenge).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct L402Challenge {
+    #[serde(rename = "challengeId")]
+    pub challenge_id: String,
+    pub macaroon: String,
+    pub invoice: String,
+    #[serde(rename = "paymentHash")]
+    pub payment_hash: String,
+    #[serde(rename = "amountSats")]
+    pub amount_sats: u64,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: i64,
+}
+
+/// Payer for L-402 challenges. The transport calls [`L402Payer::pay`] when a
+/// 402 arrives and a payer is configured, then retries the request with the
+/// `X-OpenAgents-L402: <macaroon>:<preimage>` proof header (the audit's
+/// "Preferred v0" — agent identity keeps `Authorization: Bearer`). The
+/// concrete mandate-gated payer lives in `crates/sovereign_wallet/src/l402.rs`
+/// (the sovereign-wallet lane's pay path is gated by MandateStore — D1).
+#[async_trait]
+pub trait L402Payer: Send + Sync {
+    /// Pay the challenge invoice; returns the preimage (the proof half).
+    async fn pay(&self, challenge: &L402Challenge) -> Result<String>;
+}
+
 // Constants from MCP spec
 const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const HEADER_PROTOCOL_VERSION: &str = "MCP-Protocol-Version";
+const HEADER_L402_PROOF: &str = "X-OpenAgents-L402";
 const EVENT_STREAM_MIME_TYPE: &str = "text/event-stream";
 const JSON_MIME_TYPE: &str = "application/json";
 
@@ -58,10 +96,19 @@ pub struct HttpTransport {
     /// When set, the transport attaches `Authorization: Bearer` headers and
     /// handles 401 responses with token refresh + retry.
     token_provider: Option<Arc<dyn OAuthTokenProvider>>,
+    /// When set, the transport handles 402 `L402` challenges by paying them
+    /// through this payer and retrying with the `X-OpenAgents-L402` proof
+    /// header (the agent L-402 call path; WP-6). The payer is mandate-gated
+    /// Rust-side (`crates/sovereign_wallet/src/l402.rs`).
+    l402_payer: Option<Arc<dyn L402Payer>>,
     /// The challenge from the last 401 this transport gave up on; cleared at
     /// the start of each send so it always describes the most recent attempt.
     /// See [`Transport::auth_challenge`].
     auth_challenge: SyncMutex<Option<WwwAuthenticate>>,
+    /// The challenge from the last 402 this transport gave up on (no payer or
+    /// payment refused); cleared at the start of each send. See
+    /// [`Transport::l402_challenge`].
+    l402_challenge: SyncMutex<Option<L402Challenge>>,
 }
 
 impl HttpTransport {
@@ -81,6 +128,26 @@ impl HttpTransport {
         executor: BackgroundExecutor,
         token_provider: Option<Arc<dyn OAuthTokenProvider>>,
     ) -> Self {
+        Self::new_with_l402_payer(
+            http_client,
+            endpoint,
+            headers,
+            executor,
+            token_provider,
+            None,
+        )
+    }
+
+    /// Construct with an L-402 payer so `402 Payment Required` responses are
+    /// paid and retried with the `X-OpenAgents-L402` proof header (WP-6).
+    pub fn new_with_l402_payer(
+        http_client: Arc<dyn HttpClient>,
+        endpoint: String,
+        headers: HashMap<String, String>,
+        executor: BackgroundExecutor,
+        token_provider: Option<Arc<dyn OAuthTokenProvider>>,
+        l402_payer: Option<Arc<dyn L402Payer>>,
+    ) -> Self {
         let (response_tx, response_rx) = async_channel::unbounded();
         let (error_tx, error_rx) = async_channel::unbounded();
 
@@ -96,14 +163,20 @@ impl HttpTransport {
             error_rx,
             headers,
             token_provider,
+            l402_payer,
             auth_challenge: SyncMutex::new(None),
+            l402_challenge: SyncMutex::new(None),
         }
     }
 
     /// Build a POST request for the given message body, attaching all standard
-    /// headers (content-type, accept, session ID, static headers, and bearer
-    /// token if available).
-    fn build_request(&self, message: &[u8]) -> Result<http_client::Request<AsyncBody>> {
+    /// headers (content-type, accept, session ID, static headers, bearer
+    /// token, and optional extra headers such as the L-402 proof).
+    fn build_request(
+        &self,
+        message: &[u8],
+        extra_headers: &[(&str, String)],
+    ) -> Result<http_client::Request<AsyncBody>> {
         let mut request_builder = Request::builder()
             .method(Method::POST)
             .uri(&self.endpoint)
@@ -115,6 +188,10 @@ impl HttpTransport {
 
         for (key, value) in &self.headers {
             request_builder = request_builder.header(key.as_str(), value.as_str());
+        }
+
+        for (key, value) in extra_headers {
+            request_builder = request_builder.header(*key, value.as_str());
         }
 
         // Attach bearer token when a token provider is present.
@@ -146,12 +223,33 @@ impl HttpTransport {
         TransportError::AuthRequired { www_authenticate }.into()
     }
 
+    /// Record the L-402 challenge and build the typed error for the send.
+    fn l402_payment_required(&self, challenge: L402Challenge) -> anyhow::Error {
+        *self.l402_challenge.lock() = Some(challenge.clone());
+        TransportError::L402PaymentRequired { challenge }.into()
+    }
+
+    /// Parse an L-402 challenge from a 402 response: the JSON body carries
+    /// `challengeId`/`macaroon`/`invoice`/`paymentHash`/`amountSats`/`expiresAt`
+    /// (audit §"Response Contract"); the standard `WWW-Authenticate: L402 …`
+    /// header is also emitted by servers for generic L-402 clients.
+    fn parse_l402_challenge(&self, response: &Response<AsyncBody>, body: &str) -> Option<L402Challenge> {
+        let parsed: L402Challenge = serde_json::from_str(body).ok()?;
+        // Defense: the body must carry the L402 wire markers.
+        if parsed.macaroon.is_empty() || parsed.invoice.is_empty() || parsed.payment_hash.is_empty() {
+            return None;
+        }
+        let _ = response.headers().get("www-authenticate"); // header present on conforming servers
+        Some(parsed)
+    }
+
     /// Send a message and handle the response based on content type.
     async fn send_message(&self, message: String) -> Result<()> {
         // The same server instance can be restarted over this transport; a
         // challenge recorded by a previous client generation must not be
         // observed by the current one.
         *self.auth_challenge.lock() = None;
+        *self.l402_challenge.lock() = None;
 
         let is_notification =
             !message.contains("\"id\":") || message.contains("notifications/initialized");
@@ -165,7 +263,7 @@ impl HttpTransport {
             }
         }
 
-        let request = self.build_request(message.as_bytes())?;
+        let request = self.build_request(message.as_bytes(), &[])?;
         let mut response = self.http_client.send(request).await?;
 
         // On 401, try refreshing the token and retry once.
@@ -187,7 +285,7 @@ impl HttpTransport {
             if let Some(ref provider) = self.token_provider {
                 if provider.try_refresh().await.unwrap_or(false) {
                     // Retry with the refreshed token.
-                    let retry_request = self.build_request(message.as_bytes())?;
+                    let retry_request = self.build_request(message.as_bytes(), &[])?;
                     response = self.http_client.send(retry_request).await?;
 
                     // If still 401 after refresh, give up.
@@ -199,6 +297,38 @@ impl HttpTransport {
                 }
             } else {
                 return Err(self.auth_required(www_authenticate));
+            }
+        }
+
+        // On 402 with an L-402 challenge: pay through the configured payer
+        // (mandate-gated Rust-side, WP-6) and retry once with the
+        // `X-OpenAgents-L402: <macaroon>:<preimage>` proof header (the audit's
+        // "Preferred v0" — bearer identity is preserved on the retry). With no
+        // payer the challenge is recorded and a typed error is returned so the
+        // caller can decide (e.g. surface the invoice to the operator).
+        if response.status().as_u16() == 402 {
+            let mut body = String::new();
+            futures::AsyncReadExt::read_to_string(response.body_mut(), &mut body).await?;
+            if let Some(challenge) = self.parse_l402_challenge(&response, &body) {
+                if let Some(ref payer) = self.l402_payer {
+                    // Record the challenge BEFORE paying so it stays
+                    // observable when payment is refused (e.g. a refused
+                    // mandate) — the failed send then carries both the payer
+                    // error and the challenge.
+                    *self.l402_challenge.lock() = Some(challenge.clone());
+                    let preimage = payer.pay(&challenge).await?;
+                    let proof = format!("{}:{}", challenge.macaroon, preimage);
+                    let retry_request = self.build_request(message.as_bytes(), &[(HEADER_L402_PROOF, proof)])?;
+                    response = self.http_client.send(retry_request).await?;
+                } else {
+                    return Err(self.l402_payment_required(challenge));
+                }
+            } else {
+                self.error_tx
+                    .send(format!("HTTP 402 with no parseable L-402 challenge: {}", body))
+                    .await
+                    .map_err(|_| anyhow!("Failed to send error"))?;
+                return Ok(());
             }
         }
 
@@ -356,6 +486,10 @@ impl Transport for HttpTransport {
 
     fn auth_challenge(&self) -> Option<WwwAuthenticate> {
         self.auth_challenge.lock().clone()
+    }
+
+    fn l402_challenge(&self) -> Option<L402Challenge> {
+        self.l402_challenge.lock().clone()
     }
 }
 
@@ -781,6 +915,9 @@ mod tests {
                     Some(vec!["read".to_string(), "write".to_string()]),
                 );
             }
+            TransportError::L402PaymentRequired { .. } => {
+                panic!("a 401 must not surface an L-402 challenge")
+            }
         }
         assert_eq!(provider.refresh_count(), 1);
     }
@@ -818,6 +955,9 @@ mod tests {
                 assert!(www_authenticate.resource_metadata.is_none());
                 assert!(www_authenticate.scope.is_none());
             }
+            TransportError::L402PaymentRequired { .. } => {
+                panic!("a 401 must not surface an L-402 challenge")
+            }
         }
     }
 
@@ -854,5 +994,197 @@ mod tests {
             .expect("error should be TransportError");
         // Refresh was attempted exactly once.
         assert_eq!(provider.refresh_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // WP-6: L-402 (Lightning paywall) 402 handling
+    // -----------------------------------------------------------------------
+
+    fn l402_challenge_body() -> String {
+        serde_json::json!({
+            "error": { "code": "payment_required", "message": "Payment required" },
+            "challengeId": "l402_challenge_test",
+            "macaroon": "v1.payload.signature",
+            "invoice": "lntbs100u1qftest",
+            "paymentHash": "4ca14526b2751b640d549ce7caf8ac39438592211a0ec370064d57666a682ad6",
+            "amountSats": 1,
+            "expiresAt": 1893456000,
+        })
+        .to_string()
+    }
+
+    /// A fake payer that records the challenge and returns a fixed preimage.
+    struct FakeL402Payer {
+        paid: SyncMutex<Vec<L402Challenge>>,
+        preimage: String,
+        fail: AtomicBool,
+    }
+
+    impl FakeL402Payer {
+        fn new(preimage: &str) -> Arc<Self> {
+            Arc::new(Self {
+                paid: SyncMutex::new(Vec::new()),
+                preimage: preimage.to_string(),
+                fail: AtomicBool::new(false),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl L402Payer for FakeL402Payer {
+        async fn pay(&self, challenge: &L402Challenge) -> Result<String> {
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("payment refused (no mandate)");
+            }
+            self.paid.lock().push(challenge.clone());
+            Ok(self.preimage.clone())
+        }
+    }
+
+    #[gpui::test]
+    async fn test_402_without_payer_records_challenge_and_returns_typed_error(
+        cx: &mut TestAppContext,
+    ) {
+        let body = l402_challenge_body();
+        let client = make_fake_http_client(move |_req| {
+            let body = body.clone();
+            Box::pin(async move {
+                Ok(Response::builder()
+                    .status(402)
+                    .header("WWW-Authenticate", r#"L402 macaroon="v1.payload.signature", invoice="lntbs100u1qftest""#)
+                    .body(AsyncBody::from(body.into_bytes()))
+                    .unwrap())
+            })
+        });
+
+        let transport = HttpTransport::new(
+            client,
+            "http://mcp.example.com/mcp".to_string(),
+            HashMap::default(),
+            cx.background_executor.clone(),
+        );
+
+        let err = transport
+            .send(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#.to_string())
+            .await
+            .unwrap_err();
+        let transport_err = err.downcast_ref::<TransportError>().expect("TransportError");
+        match transport_err {
+            TransportError::L402PaymentRequired { challenge } => {
+                assert_eq!(challenge.challenge_id, "l402_challenge_test");
+                assert_eq!(challenge.amount_sats, 1);
+                assert_eq!(challenge.invoice, "lntbs100u1qftest");
+            }
+            _ => panic!("expected L402PaymentRequired, got {transport_err:?}"),
+        }
+        // The challenge remains observable after the failed send.
+        assert_eq!(
+            transport.l402_challenge().map(|c| c.challenge_id),
+            Some("l402_challenge_test".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_402_with_payer_pays_and_retries_with_the_proof_header(
+        cx: &mut TestAppContext,
+    ) {
+        let body = l402_challenge_body();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let captured_proof = Arc::new(SyncMutex::new(None::<String>));
+        let request_count_clone = request_count.clone();
+        let captured_proof_clone = captured_proof.clone();
+
+        let client = make_fake_http_client(move |req| {
+            let body = body.clone();
+            let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+            let captured = captured_proof_clone.clone();
+            Box::pin(async move {
+                if count == 0 {
+                    // First attempt: 402 challenge.
+                    Ok(Response::builder()
+                        .status(402)
+                        .header("WWW-Authenticate", r#"L402 macaroon="v1.payload.signature", invoice="lntbs100u1qftest""#)
+                        .body(AsyncBody::from(body.into_bytes()))
+                        .unwrap())
+                } else {
+                    // Retry: the proof header must be present.
+                    let proof = req
+                        .headers()
+                        .get("X-OpenAgents-L402")
+                        .and_then(|v| v.to_str().ok())
+                        .map(ToString::to_string);
+                    *captured.lock() = proof;
+                    Ok(Response::builder()
+                        .status(200)
+                        .header("Content-Type", "application/json")
+                        .body(AsyncBody::from(
+                            br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"paid ok"}]}}"#.to_vec(),
+                        ))
+                        .unwrap())
+                }
+            })
+        });
+
+        let payer = FakeL402Payer::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let transport = HttpTransport::new_with_l402_payer(
+            client,
+            "http://mcp.example.com/mcp".to_string(),
+            HashMap::default(),
+            cx.background_executor.clone(),
+            None,
+            Some(payer.clone()),
+        );
+
+        transport
+            .send(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#.to_string())
+            .await
+            .expect("send should succeed after paying the L-402 challenge");
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2, "exactly one retry");
+        assert_eq!(payer.paid.lock().len(), 1, "the payer paid exactly once");
+        assert_eq!(
+            captured_proof.lock().as_deref(),
+            Some("v1.payload.signature:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "the retry must carry X-OpenAgents-L402: <macaroon>:<preimage>",
+        );
+
+        // The response is forwarded to the client.
+        let mut responses = transport.receive();
+        let next = responses.next().await.expect("response");
+        assert!(next.contains("paid ok"), "{next}");
+    }
+
+    #[gpui::test]
+    async fn test_402_with_payer_refusal_surfaces_the_challenge(cx: &mut TestAppContext) {
+        let body = l402_challenge_body();
+        let client = make_fake_http_client(move |_req| {
+            let body = body.clone();
+            Box::pin(async move {
+                Ok(Response::builder()
+                    .status(402)
+                    .body(AsyncBody::from(body.into_bytes()))
+                    .unwrap())
+            })
+        });
+
+        let payer = FakeL402Payer::new("b".repeat(64).as_str());
+        payer.fail.store(true, Ordering::SeqCst);
+        let transport = HttpTransport::new_with_l402_payer(
+            client,
+            "http://mcp.example.com/mcp".to_string(),
+            HashMap::default(),
+            cx.background_executor.clone(),
+            None,
+            Some(payer),
+        );
+
+        let err = transport
+            .send(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#.to_string())
+            .await
+            .unwrap_err();
+        // The payer's refusal (e.g. a refused mandate) propagates as the send
+        // error, and the challenge stays observable for the caller.
+        assert!(err.to_string().contains("no mandate"), "{err:#}");
+        assert!(transport.l402_challenge().is_some());
     }
 }

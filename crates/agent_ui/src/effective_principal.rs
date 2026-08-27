@@ -1008,11 +1008,15 @@ mod tests {
         assert!(accessibility_label.contains(projection.display_name.as_str()));
     }
 
-    /// The published NIP-06 test vectors, used only for the half this build
-    /// performs: bech32 encoding of a public key already held. Omega keeps one
-    /// Nostr keypair per account and derives nothing, so BIP-39/BIP-32 seed
-    /// derivation is not in this path. The `nsec` values published beside these
-    /// vectors are deliberately absent.
+    /// The published NIP-06 test vectors, used for the halves this build
+    /// performs: bech32 encoding of a public key already held, and (per
+    /// OMEGA-DELTA-0284) the BIP-39/NIP-06 shared-root derivation at path
+    /// `m/44'/1237'/0'/0/0`. Omega previously kept one random Nostr keypair per
+    /// account and derived nothing; under OMEGA-DELTA-0284 the sovereign
+    /// identity derives from the BIP-39 shared root at the NIP-06 path, so
+    /// these vectors now cover the derivation half of the build as well as
+    /// bech32 encoding. The `nsec` values published beside these vectors are
+    /// deliberately absent.
     #[test]
     fn the_projected_identity_matches_the_published_npub_for_its_public_key() {
         for (public_key_hex, expected_npub) in [

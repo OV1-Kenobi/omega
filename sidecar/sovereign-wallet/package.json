@@ -1,0 +1,29 @@
+{
+  "name": "sovereign-wallet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Supervised Node 24/Effect sovereign wallet sidecar (Wavelength waved engine, signet-only). WP-3+WP-4 of OA-P2-WALLET-2026-08-26.",
+  "type": "module",
+  "engines": {
+    "node": ">=23.4.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 --test-timeout=60000 \"test/*.test.ts\"",
+    "invariants": "node scripts/check-invariants.mjs"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.3.0",
+    "@noble/curves": "2.3.0",
+    "@noble/hashes": "2.3.0",
+    "@scure/base": "2.3.0",
+    "@scure/bip32": "2.3.0",
+    "@scure/bip39": "2.3.0",
+    "effect": "3.22.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "5.8.3"
+  }
+}

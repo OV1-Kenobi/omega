@@ -180,6 +180,7 @@ session.workspace = true
 settings.workspace = true
 settings_ui.workspace = true
 sovereign_dashboard.workspace = true
+sovereign_wallet.workspace = true
 shellexpand.workspace = true
 smol.workspace = true
 snippet_provider.workspace = true

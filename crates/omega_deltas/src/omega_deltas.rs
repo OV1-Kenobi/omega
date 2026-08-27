@@ -254,7 +254,19 @@ pub const ENFORCED_DELTAS: &[&str] = &[
     "OMEGA-DELTA-0281",
     "OMEGA-DELTA-0282",
     "OMEGA-DELTA-0283",
+    "OMEGA-DELTA-0284",
 ];
+
+/// OMEGA-DELTA-0284. The sidecar identity keygen module — the sidecar's
+/// secret-handling home for the BIP-39/NIP-06 shared-root derivation
+/// (NOSTR_DERIVATION_PATH, the empty-passphrase rule, the frozen vector, and
+/// the surviving importFromNsec legacy entry).
+pub const SOVEREIGN_IDENTITY_KEYGEN_PATH: &str =
+    "sidecar/sovereign-wallet/src/identity/keygen.ts";
+
+/// OMEGA-DELTA-0284. Where the superseded "one random keypair per account and
+/// derives nothing" statement lives; updated-with-citation, never deleted.
+pub const EFFECTIVE_PRINCIPAL_PATH: &str = "crates/agent_ui/src/effective_principal.rs";
 
 /// OMEGA-DELTA-0281. `eval_cli` is a headless production tool. These direct
 /// dependencies pull the desktop editor/UI, terminal presentation, or media
@@ -32206,5 +32218,73 @@ mod tests {
                 "OMEGA-DELTA-0282: library module lost `{required}`"
             );
         }
+    }
+
+    /// OMEGA-DELTA-0284. The sovereign identity derives from a BIP-39/NIP-06
+    /// shared root, not a random keypair.
+    ///
+    /// Omega-before-this generated one random Nostr keypair per account and
+    /// derived nothing (documented at `crates/agent_ui/src/effective_principal.rs`).
+    /// Per founder decision D2 (2026-08-26) and the satnam/sovereign-identity
+    /// lineage, fresh activation derives the sovereign identity from a BIP-39
+    /// shared root (12-word English mnemonic, empty passphrase, BIP-32 master
+    /// seed) at the NIP-06 path `m/44'/1237'/0'/0/0`.
+    ///
+    /// This check inspects REAL repository state:
+    /// 1. the sidecar keygen module carries the frozen derivation constants and
+    ///    the frozen public vector, and cites the delta in its secret-handling
+    ///    doc comment (the sidecar is the identity/vault root);
+    /// 2. the `importFromNsec` legacy entry survived (the random-keypair path is
+    ///    superseded by delta, not deleted);
+    /// 3. the superseded "derives nothing" statement in effective_principal.rs
+    ///    is updated-with-citation (OMEGA-DELTA-0284), never deleted.
+    ///
+    /// The Rust `omega_identity` crates are deliberately NOT modified by this
+    /// delta (their activation ceremony and NIP-49 recovery are preserved
+    /// unchanged); the citation lives where the sidecar's secret handling
+    /// documents the shared-root divergence.
+    #[test]
+    fn sovereign_identity_derives_from_bip39_nip06_root() {
+        // 1. The sidecar keygen module carries the frozen constants, the frozen
+        //    public vector, and the OMEGA-DELTA-0284 citation in secret handling.
+        let keygen = read_repository_file(SOVEREIGN_IDENTITY_KEYGEN_PATH);
+        for required in [
+            "NOSTR_DERIVATION_PATH = \"m/44'/1237'/0'/0/0\"",
+            "EMPTY_BIP39_PASSPHRASE = \"\"",
+            "npub1az708q3kd9zy6z6f44zav5ygvdwelkzspf6mtusttx47lft2z38sghk0w7",
+            "OMEGA-DELTA-0284",
+        ] {
+            assert!(
+                keygen.contains(required),
+                "OMEGA-DELTA-0284: the sidecar keygen module lost `{required}`; the \
+                 BIP-39/NIP-06 shared-root derivation (frozen vector + delta \
+                 citation) must stay present"
+            );
+        }
+
+        // 2. The random-keypair path is superseded, not deleted: importFromNsec
+        //    survives as the import/legacy entry.
+        assert!(
+            keygen.contains("importFromNsec"),
+            "OMEGA-DELTA-0284: importFromNsec (the legacy/import entry) was removed \
+             from the sidecar keygen module; the divergence is superseded by delta, \
+             not deleted"
+        );
+
+        // 3. The superseded "derives nothing" statement in effective_principal.rs
+        //    is updated-with-citation (never deleted silently).
+        let effective_principal = read_repository_file(EFFECTIVE_PRINCIPAL_PATH);
+        assert!(
+            effective_principal.contains("OMEGA-DELTA-0284"),
+            "OMEGA-DELTA-0284: crates/agent_ui/src/effective_principal.rs no longer \
+             cites the delta beside the 'derives nothing' statement; update the \
+             statement with the citation rather than deleting it"
+        );
+        assert!(
+            effective_principal.contains("derives from the BIP-39 shared root"),
+            "OMEGA-DELTA-0284: crates/agent_ui/src/effective_principal.rs no longer \
+             states that the identity derives from the BIP-39 shared root at the \
+             NIP-06 path (the superseding statement is missing)"
+        );
     }
 }
