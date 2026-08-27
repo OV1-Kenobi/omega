@@ -9,9 +9,11 @@ The sidecar speaks **newline-framed JSON over stdio** to its supervising Rust
 process (`crates/sovereign_wallet`). One JSON object per line; frames are
 bounded at **64 KiB** (`MAX_FRAME_BYTES`). stderr is free-form diagnostic
 output, redacted, and never parsed as protocol. The stdio pipe is the
-operator channel; **create/unlock/lock are unreachable from any agent
-surface** by construction (the loopback HTTP surface registers only read
-projections; the WP-6 L-402 gateway registers only its own routes).
+operator channel; **create/unlock/lock and the identity ceremony methods
+(`vault-init-prepare`/`vault-init`/`vault-unlock`) plus the one-time
+`export-nostr-secret` bridge are unreachable from any agent surface** by
+construction (the loopback HTTP surface registers only read projections; the
+WP-6 L-402 gateway registers only its own routes).
 
 ## 2. Frame envelope
 
@@ -51,6 +53,10 @@ pattern).
 | `pay-invoice` | host→sidecar | spend | PrepareSend + Send; returns preimage when settled | yes, but **only after MandateStore authorization (WP-5, Rust side)** |
 | `activity` | host→sidecar | read | merged activity feed (WalletService.List ACTIVITY view) | yes (read-only) |
 | `identity-status` | host→sidecar | read | WP-4: real vault/identity state — vault state, derived npub + pubkey hex, recovery state (never key material) | yes (read-only projection) |
+| `vault-init-prepare` | host→sidecar | operator | WP-5: begins the identity ceremony — generates the show-once 12-word BIP-39 mnemonic and returns it with the word-challenge positions (2nd/7th/11th); nothing is persisted until `vault-init` | **no — operator only** |
+| `vault-init` | host→sidecar | operator | WP-5: commits the ceremony — verifies the challenge answers and initializes the vault with the passphrase (≥12 chars, SEC-2026-052); derives the identity at `m/44'/1237'/0'/0/0` (OMEGA-DELTA-0284) and returns the npub + pubkey hex | **no — operator only** |
+| `vault-unlock` | host→sidecar | operator | WP-5: unlocks the identity vault with the passphrase (recovery of the wrapping key); returns the derived npub + pubkey hex | **no — operator only** |
+| `export-nostr-secret` | host→sidecar | operator | WP-5: the ONE-TIME bridge to the Rust `omega_identity` import ceremony (design §4.6) — returns the derived nsec once; refused thereafter (`EXPORT_ALREADY_CONSUMED`, durable `run/export-nostr-secret.done` marker); requires an unlocked vault and an existing identity | **no — operator only** |
 | `mcp-identity-map-get` | host→sidecar | read | WP-6: the L-402 gateway's MCP-server → Nostr-identity attribution map (`{ entries: { serverId: principalPubkey } }`; public pubkeys only) | yes (read-only projection) |
 | `mcp-identity-map-set` | host→sidecar | operator | WP-6: set/unset a server → Nostr-identity mapping (64-hex principal or null) in the L-402 gateway store | no (stdio only) |
 | `shutdown` | host→sidecar | control | graceful stop (waved first, then exit) | no |

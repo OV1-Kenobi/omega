@@ -160,6 +160,121 @@ fn protocol_error_mapping_is_typed() {
     });
 }
 
+#[test]
+fn crash_respawn_recovers_the_sidecar_and_increments_generation() {
+    // WP-10 (QA condition 2 — the missing crash->respawn test): kill the
+    // sidecar process mid-run BY PID, assert the supervisor respawns it, the
+    // generation increments, and the protocol state is intact afterwards.
+    smol::block_on(async {
+        let mut supervisor = make_supervisor("signet", fixture_command(&fixture_path()))
+            .expect("supervisor");
+        let initialize = supervisor.start().await.context("initialize").unwrap();
+        assert_eq!(initialize.generation, 1);
+        assert_eq!(supervisor.generation(), 1);
+        assert!(supervisor.health().await.context("health before crash").unwrap().ok);
+
+        // The fixture wrote its own PID under the data root (kill-by-PID
+        // discipline — never a blanket taskkill by image name).
+        let pid_path = supervisor
+            .data_root()
+            .join("run/fixture.pid");
+        let first_pid: u32 = std::fs::read_to_string(&pid_path)
+            .context("read fixture pid")
+            .expect("fixture pid")
+            .trim()
+            .parse()
+            .expect("parse fixture pid");
+        assert!(pid_alive(first_pid), "the fixture must be alive before the kill");
+
+        // Kill the child EXTERNALLY (a crash, not a supervised stop).
+        kill_pid(first_pid).expect("kill the sidecar child by pid");
+        // Give the OS a moment to reap the process, then assert it is gone.
+        for _ in 0..50 {
+            if !pid_alive(first_pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!pid_alive(first_pid), "the killed child must actually be dead");
+
+        // The supervisor's restart path: stop the dead child handle, bump the
+        // generation, spawn a fresh child, and re-run the initialize handshake.
+        let restarted = supervisor.restart().await.context("restart after crash").unwrap();
+        assert_eq!(restarted.network, "signet");
+        assert_eq!(supervisor.generation(), 2, "the crash->respawn must increment the generation");
+        assert_eq!(restarted.generation, 2);
+
+        // The respawned child is a NEW process, and the protocol state is
+        // intact: health reports ready and balance still answers.
+        let second_pid: u32 = std::fs::read_to_string(&pid_path)
+            .context("read respawned fixture pid")
+            .expect("respawned fixture pid")
+            .trim()
+            .parse()
+            .expect("parse respawned fixture pid");
+        assert_ne!(
+            first_pid, second_pid,
+            "the respawned sidecar must be a new process (first pid {first_pid}, second {second_pid})"
+        );
+        assert!(pid_alive(second_pid), "the respawned fixture must be alive");
+        let health = supervisor.health().await.context("health after respawn").unwrap();
+        assert!(health.ok, "the respawned sidecar must report healthy");
+        assert_eq!(health.network, "signet");
+        let balance = supervisor.balance().await.context("balance after respawn").unwrap();
+        assert_eq!(balance.confirmed_sat, "12345", "state is intact after respawn");
+
+        supervisor.stop().await.context("stop").unwrap();
+        assert!(!pid_alive(second_pid), "the supervised stop must terminate the respawned child");
+    });
+}
+
+/// True when a process with the given pid is alive (Windows + Unix).
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        // tasklist is always present on Windows; a live process's line
+        // contains the pid, a dead pid yields the "no tasks" notice.
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .expect("run tasklist");
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.contains(&pid.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe {
+            libc::kill(pid as i32, 0) == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+    }
+}
+
+/// Kill a process by pid: taskkill /T /F on Windows (tree kill, by PID only),
+/// SIGKILL on Unix.
+fn kill_pid(pid: u32) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "taskkill failed for pid {pid}: {status:?}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WP-5 construction site (design §7.1 + §6.1): the flag-ON path constructs
 // the shared supervisor in the running app and spawns the sidecar; the

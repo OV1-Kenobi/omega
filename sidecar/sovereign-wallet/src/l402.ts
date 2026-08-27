@@ -212,6 +212,19 @@ export class L402Gateway {
   readonly #deps: L402GatewayDeps;
   /** In-memory HMAC key (SEC-2026-044 custody). See `#ensureKey`. */
   #key: Uint8Array | null = null;
+  /**
+   * SEC-2026-060 fix: the first-load is memoized as a SINGLE in-flight
+   * promise so concurrent first requests (parallel challenges/redemptions on
+   * a fresh data root) share ONE key generation + store. Before this fix, two
+   * concurrent `#ensureKey` calls could both read no stored key, each generate
+   * a DIFFERENT key, and last-write-wins — a challenge issued under the
+   * earlier key then failed HMAC verification (`invalid_credential`). The
+   * `v1` key-version prefix is a constant, so it cannot disambiguate keys.
+   * A `null` result (vault locked at load time) is NOT memoized so a later
+   * unlock retries the load; a rejection is not memoized either (transient
+   * storage errors stay retryable).
+   */
+  #keyPromise: Promise<Uint8Array | null> | null = null;
 
   constructor(deps: L402GatewayDeps) {
     this.#deps = deps;
@@ -284,10 +297,31 @@ export class L402Gateway {
   async #ensureKey(): Promise<Uint8Array | null> {
     if (this.#key) return this.#key;
     if (!this.#deps.vault || !this.#deps.vault.isUnlocked()) return null;
-    let stored = await this.#deps.vault.getL402Key().catch(() => null);
+    // SEC-2026-060: memoize the first-load as ONE in-flight promise so
+    // concurrent first requests cannot each generate and store a different
+    // key (the racing test drives this on a fresh data root).
+    if (!this.#keyPromise) {
+      this.#keyPromise = this.#loadKey().catch((error) => {
+        // A failed load must not poison the memo: the next call retries.
+        this.#keyPromise = null;
+        throw error;
+      });
+    }
+    const key = await this.#keyPromise;
+    if (key === null) {
+      // The vault was locked at load time: do not memoize the null so a
+      // later unlock retries the load.
+      this.#keyPromise = null;
+    }
+    return key;
+  }
+
+  /** Generate-or-load the HMAC key (single-flight via `#ensureKey`). */
+  async #loadKey(): Promise<Uint8Array | null> {
+    let stored = await this.#deps.vault!.getL402Key().catch(() => null);
     if (!stored) {
       stored = randomBytes(32);
-      await this.#deps.vault.storeL402Key(stored);
+      await this.#deps.vault!.storeL402Key(stored);
     }
     this.#key = stored;
     return stored;
@@ -299,6 +333,7 @@ export class L402Gateway {
       this.#key.fill(0);
       this.#key = null;
     }
+    this.#keyPromise = null;
   }
 
   // -------------------------------------------------------------------------

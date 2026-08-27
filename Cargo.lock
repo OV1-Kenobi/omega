@@ -16453,16 +16453,23 @@ name = "sovereign_dashboard"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "app_identity",
  "command_center_ui",
  "editor",
+ "extension_host",
  "gpui",
  "log",
+ "nostr",
+ "omega_identity",
+ "omega_signer_broker",
  "project",
  "serde_json",
  "settings",
  "sovereign_wallet",
+ "tempfile",
  "trading_mandate",
  "ui",
+ "url",
  "util",
  "workspace",
 ]

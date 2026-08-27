@@ -319,6 +319,113 @@ describe("L-402 gateway unit", () => {
     }
   });
 
+  it("SEC-2026-060: racing first-loads on a fresh data root all verify against the SAME key", async () => {
+    // WP-10 (SEC-2026-060 fix): on a data root whose vault has never stored
+    // the gateway key, concurrent first requests must share ONE key
+    // generation + store. Before the fix, each racer generated its own key
+    // and last-write-wins left earlier challenges signed under a key that
+    // failed HMAC verification (`invalid_credential`). This test races eight
+    // first challenge issuances on a FRESH data root and then redeems ALL of
+    // them — every redemption must verify against the same key (200), and
+    // the vault must hold exactly one stored key.
+    const { vault, dir } = await makeVault();
+    const { store } = await makeStore();
+    const N = 8;
+    const preimages = Array.from({ length: N }, (_, i) => Buffer.alloc(32, i).toString("hex"));
+    const hashToPreimage = new Map(
+      preimages.map((preimage) => [
+        createHash("sha256").update(Buffer.from(preimage, "hex")).digest("hex"),
+        preimage,
+      ]),
+    );
+    let mintCount = 0;
+    try {
+      const gateway = await makeGateway({
+        vault,
+        store,
+        // Each minted invoice must carry a DISTINCT payment hash so every
+        // challenge row is unique (payment_hash is UNIQUE in the store).
+        mintInvoiceOverride: async () => {
+          const preimage = preimages[mintCount % N]!;
+          mintCount += 1;
+          const hash = createHash("sha256").update(Buffer.from(preimage, "hex")).digest("hex");
+          return { invoice: buildTestBolt11(hash), entryPaymentHash: hash };
+        },
+      });
+
+      // Fire all first-loads concurrently — the race window is exactly the
+      // first `#ensureKey` before any of them resolves.
+      const results = await Promise.all(
+        Array.from({ length: N }, () => gateway.handleRequest("POST", DEMO_ECHO_PATH, {}, "")),
+      );
+      const challenges = results.map((result, i) => {
+        assert.ok(result, `challenge ${i} must be a gateway route`);
+        assert.equal(result.status, 402, `challenge ${i} must be issued: ${JSON.stringify(result.body)}`);
+        return result.body as Record<string, unknown>;
+      });
+
+      // Redeem every challenge with ITS OWN preimage. Under the pre-fix
+      // race, challenges signed under a key that lost the last-write-wins
+      // race fail here with 401 invalid_credential; under the fix all eight
+      // verify against the single shared key.
+      const redemptions = await Promise.all(
+        challenges.map((challenge, i) => {
+          const paymentHash = challenge.paymentHash as string;
+          const preimage = hashToPreimage.get(paymentHash)!;
+          return redeem(gateway, DEMO_ECHO_PATH, challenge.macaroon as string, preimage).then(
+            (result) => ({ index: i, result }),
+          );
+        }),
+      );
+      for (const { index, result } of redemptions) {
+        assert.equal(
+          result.status,
+          200,
+          `redemption ${index} must verify against the shared key: ${JSON.stringify(result.body)}`,
+        );
+      }
+
+      // The vault must hold exactly ONE stored key (the fix generates once).
+      const stored = await vault.getL402Key();
+      assert.ok(stored.length === 32, "the stored key is 32 bytes");
+      assert.equal(mintCount, N, "every challenge minted exactly one invoice");
+    } finally {
+      vault.lock();
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("SEC-2026-060: a locked-vault null load is not memoized — after unlock the gateway recovers", async () => {
+    // The fix resets the memoized load promise when the load returns null
+    // (vault locked): a later unlock must retry the load instead of serving
+    // the stale null forever. This is the SEC-2026-054-compatible lifecycle.
+    const { vault, dir } = await makeVault();
+    const { store } = await makeStore();
+    try {
+      const gateway = await makeGateway({ vault, store });
+      // Lock the vault BEFORE the first load.
+      vault.lock();
+      const locked = await issueChallenge(gateway);
+      assert.equal(locked.status, 503);
+      assert.equal((locked.body.error as { code: string }).code, "gateway_locked");
+      // Unlock and mint again: the memo must NOT have cached the null.
+      await vault.unlock(PASSPHRASE);
+      const challenge = await issueChallenge(gateway);
+      assert.equal(challenge.status, 402, "after unlock the gateway must mint");
+      const macaroon = challenge.body.macaroon as string;
+      const paymentHash = challenge.body.paymentHash as string;
+      const preimage = PREIMAGE; // the default wallet mints buildTestBolt11(PAYMENT_HASH)
+      assert.equal(paymentHash, PAYMENT_HASH);
+      const redeemed = await redeem(gateway, DEMO_ECHO_PATH, macaroon, preimage);
+      assert.equal(redeemed.status, 200, "the post-unlock key must verify");
+    } finally {
+      vault.lock();
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("mainnet is refused: an lnbc invoice from the wallet never mints a challenge", async () => {
     const { vault, dir } = await makeVault();
     const { store } = await makeStore();

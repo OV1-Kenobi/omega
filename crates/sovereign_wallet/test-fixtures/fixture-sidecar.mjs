@@ -4,12 +4,24 @@
 // arg, so parallel tests never race on env) with FIXTURE_NETWORK as a
 // fallback.
 
+import fs from "node:fs";
+
 const argNetwork = process.argv.find((arg) => arg.startsWith("--network="));
 const FIXTURE_NETWORK = argNetwork ? argNetwork.slice("--network=".length) : (process.env.FIXTURE_NETWORK ?? "signet");
 
 const schema = "openagents.omega.sovereign-wallet.v1";
 let generation = 1;
 let initializedGeneration = null;
+
+// WP-10 (QA condition 2): the fixture writes its own PID under the data root
+// so the crash->respawn test can kill the sidecar process BY PID and assert
+// the supervisor respawns it (kill-by-PID discipline — never taskkill /IM).
+const dataRoot = process.env.OMEGA_SOVEREIGN_WALLET_DATA_ROOT ?? "";
+if (dataRoot) {
+  const runDir = `${dataRoot}/run`;
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(`${runDir}/fixture.pid`, String(process.pid));
+}
 
 // WP-6: deterministic L-402 proof pair (sha256(preimage) == paymentHash).
 const FIXTURE_PREIMAGE = "b".repeat(64);

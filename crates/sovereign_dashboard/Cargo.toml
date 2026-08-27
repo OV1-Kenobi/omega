@@ -13,10 +13,14 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+app_identity.workspace = true
 command_center_ui.workspace = true
 editor.workspace = true
+extension_host.workspace = true
 gpui.workspace = true
 log.workspace = true
+omega_identity.workspace = true
+omega_signer_broker.workspace = true
 project.workspace = true
 serde_json.workspace = true
 settings.workspace = true
@@ -25,3 +29,8 @@ trading_mandate.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
+
+[dev-dependencies]
+nostr.workspace = true
+tempfile.workspace = true
+url.workspace = true

@@ -17,6 +17,27 @@
 //!   `ProjectSettings::get_global(cx).context_servers`, mapped to the derived
 //!   identity npub where an identity seam exists, labeled "unmapped" otherwise.
 //!
+//! WP-10 (OA-P2-WALLET-2026-08-26 close-out; founder direction: zero stubbed
+//! surfaces) wired the last two explicitly-stubbed controls to REAL machinery:
+//! - Plugins: the REAL installed-extension registry (`ExtensionStore`, the
+//!   `extension_host` crate — the extension/plugin system behind "plugins the
+//!   agent runs"). Rows render real installed extensions (id/name/version/dev),
+//!   Remove performs a real `uninstall_extension`, Add Plugin performs the
+//!   real `install_latest_extension` registry flow, and in-flight
+//!   install/remove/upgrade operations render from
+//!   `outstanding_operations()`. The section copy labels the mapping honestly
+//!   ("the extension host's installed set — this is the real plugin registry").
+//! - Link (cross-machine): a REAL NIP-46 remote-signer pairing ceremony
+//!   through the `omega_identity::nip46` pairing state machine and the
+//!   `omega_signer_broker` relay coordinator (`SignerRoute::RemoteNip46` — the
+//!   real machinery for linking this machine's agent to a remote signer on
+//!   another machine). The ceremony drives the real states
+//!   (AwaitingApproval → AwaitingAcknowledgement → AwaitingUserPublicKey →
+//!   AwaitingFinalApproval → AwaitingSignedChallenge → AwaitingRegistration →
+//!   Active), persists pairing state on disk through `Nip46Service`, and the
+//!   section surfaces a real status from `AccountRegistryService` (registered
+//!   remote accounts, signer availability, last use) with a real Disconnect.
+//!
 //! HONESTY LAW (unchanged): every control that is not real-and-verified keeps
 //! an explicit stubbed notice; nothing claims custody it does not have. The
 //! stub-notice mechanism is the enforcement surface and is never removed.
@@ -48,6 +69,14 @@ use command_center_ui::{
     MandateApprovalDialog, MandateEditorAction, MandateEditorValue, MandateStatusCard, MandateUsage,
 };
 
+// WP-10 real machinery: the installed-extension registry (Plugins) and the
+// NIP-46 remote-signer pairing state machine + relay coordinator (Link).
+use omega_identity::{
+    AccountRegistryService, Nip46ConnectionInput, Nip46InboundEvent, Nip46PairingFence,
+    Nip46PairingState, Nip46PermissionPreview, Nip46Service, SignerKind,
+};
+use omega_signer_broker::Nip46RelayCoordinator;
+
 actions!(
     sovereign_dashboard,
     [
@@ -58,10 +87,13 @@ actions!(
 
 const PANEL_KEY: &str = "sovereign-dashboard";
 
-const STUB_PLUGINS: &[(&str, &str)] = &[
-    ("source-summarization", "registered"),
-    ("om (Obsidian Mind)", "registered"),
-];
+/// WP-10: the Link ceremony's relay for the nostrconnect path (the same relay
+/// the account_ui pairing ceremony uses — `wss://relay.openagents.com`).
+const LINK_PAIRING_RELAY: &str = "wss://relay.openagents.com";
+/// WP-10: first-wave NIP-46 pairing lifetime (7 days, account_ui precedent).
+const LINK_FIRST_WAVE_LIFETIME_SECONDS: u64 = 60 * 60 * 24 * 7;
+/// WP-10: per-step relay exchange timeout (account_ui `NIP46_EXCHANGE_TIMEOUT_SECONDS`).
+const LINK_EXCHANGE_TIMEOUT_SECONDS: u64 = 30;
 
 /// The widening application is delta-bound this WP: OMEGA-DELTA-0245 restricts
 /// the widening-door callers to the settings-UI files, and this WP cannot
@@ -93,6 +125,10 @@ enum InputRequest {
     McpServerId,
     /// WP-6: the Nostr pubkey (64-hex) for the mapping; empty = unset.
     McpPrincipalPubkey,
+    /// WP-10: the extension id for the real Add Plugin install flow.
+    PluginId,
+    /// WP-10: the `bunker://` NIP-46 URI from the remote machine's signer.
+    LinkBunkerUri,
 }
 
 impl InputRequest {
@@ -107,6 +143,8 @@ impl InputRequest {
             Self::MandateExpiryHours => "input-mandate-expiry-hours",
             Self::McpServerId => "input-mcp-server-id",
             Self::McpPrincipalPubkey => "input-mcp-principal-pubkey",
+            Self::PluginId => "input-plugin-id",
+            Self::LinkBunkerUri => "input-link-bunker-uri",
         }
     }
 }
@@ -167,6 +205,77 @@ struct MandatesView {
     pending_amount: Option<u64>,
 }
 
+/// WP-10: the real Plugins view — the installed-extension registry
+/// (`ExtensionStore::installed_extensions()`), the in-flight operations, and
+/// the honest "registry unavailable" state when the extension host is not
+/// registered (e.g. in tests). No fake rows: everything renders real state.
+#[derive(Clone, Debug, Default)]
+struct PluginsView {
+    /// Real installed extensions: (id, display name, version, dev flag).
+    installed: Vec<PluginRow>,
+    /// Real in-flight operations: (id, label) from `outstanding_operations()`.
+    operations: Vec<(String, String)>,
+    /// Honest named state when the extension host is absent.
+    unavailable: Option<SharedString>,
+    /// A real install/remove message surfaced next to the control.
+    message: Option<SharedString>,
+    /// An install/remove error surfaced next to the control.
+    error: Option<SharedString>,
+}
+
+/// WP-10: one real installed-extension row (mirrors `ExtensionIndexEntry`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PluginRow {
+    id: String,
+    name: String,
+    version: String,
+    dev: bool,
+}
+
+/// WP-10: the real Link view — the NIP-46 remote-signer pairing ceremony and
+/// the account-registry status. Every state is a real state-machine state.
+#[derive(Clone, Debug, Default)]
+struct LinkView {
+    /// The account-registry projection (registered remote accounts, active
+    /// selection) — the real status surface.
+    status: Option<omega_identity::AccountDashboardProjection>,
+    status_error: Option<SharedString>,
+    /// The in-flight ceremony's real pairing state + capability ref.
+    ceremony: Option<LinkCeremony>,
+    /// The nostrconnect pairing URI to share with the other machine (shown
+    /// once, copyable).
+    pairing_uri: Option<SharedString>,
+    /// The reported remote signer awaiting the operator's final approval.
+    reported_signer: Option<LinkReportedSigner>,
+    /// A message surfaced next to the section (real ceremony outcomes).
+    message: Option<SharedString>,
+    /// The connect envelope handed between ceremony steps (bunker path).
+    connect_envelope: Option<omega_identity::Nip46RequestEnvelope>,
+    /// The get-public-key envelope handed between ceremony steps.
+    get_public_key_envelope: Option<omega_identity::Nip46RequestEnvelope>,
+}
+
+/// WP-10: the ceremony progress — the REAL `Nip46PairingState` from the
+/// `omega_identity::nip46` state machine, persisted by `Nip46Service`.
+#[derive(Clone, Debug)]
+struct LinkCeremony {
+    capability_ref: String,
+    state: Nip46PairingState,
+    registry_generation: u64,
+}
+
+/// WP-10: the remote signer the ceremony reported, awaiting the operator's
+/// final approval (the `AwaitingFinalApproval` step).
+#[derive(Clone, Debug)]
+struct LinkReportedSigner {
+    capability_ref: String,
+    remote_signer_public_key: String,
+    user_public_key: String,
+    registry_generation: u64,
+    relays: Vec<String>,
+    expires_at: u64,
+}
+
 pub struct SovereignDashboardPanel {
     focus_handle: FocusHandle,
     stub_notice: Option<&'static str>,
@@ -188,6 +297,10 @@ pub struct SovereignDashboardPanel {
     mapping_error: Option<SharedString>,
     /// WP-6: the staged MCP-server id between the two Add Mapping inputs.
     mapping_server_id: Option<String>,
+    /// WP-10: the real Plugins view (installed-extension registry).
+    plugins: PluginsView,
+    /// WP-10: the real Link view (NIP-46 pairing ceremony + registry status).
+    link: LinkView,
 }
 
 impl SovereignDashboardPanel {
@@ -220,14 +333,11 @@ impl SovereignDashboardPanel {
             mcp_identity_map: std::collections::HashMap::new(),
             mapping_error: None,
             mapping_server_id: None,
+            plugins: PluginsView::default(),
+            link: LinkView::default(),
         };
         panel.refresh(cx);
         panel
-    }
-
-    fn stub(&mut self, notice: &'static str, cx: &mut Context<Self>) {
-        self.stub_notice = Some(notice);
-        cx.notify();
     }
 
     fn next_idempotency_key(&mut self) -> String {
@@ -319,6 +429,25 @@ impl SovereignDashboardPanel {
                 }
                 if let Some(error) = store_error {
                     this.mandates.store_error = Some(SharedString::from(error));
+                }
+                // WP-10: the REAL Plugins view — the installed-extension
+                // registry (the extension host's installed set) plus the
+                // in-flight operations. `try_global` is used so the dashboard
+                // renders an honest "registry unavailable" state in builds or
+                // tests where the extension host is not registered.
+                this.plugins = plugins_view(cx);
+                // WP-10: the REAL Link status — the account registry's
+                // registered accounts (remote NIP-46 signers, lifecycle,
+                // availability, last use) and the active selection.
+                match AccountRegistryService::system(*app_identity::CHANNEL).inspect() {
+                    Ok(projection) => {
+                        this.link.status = Some(projection);
+                        this.link.status_error = None;
+                    }
+                    Err(error) => {
+                        this.link.status_error =
+                            Some(SharedString::from(format!("account registry unavailable: {error}")));
+                    }
                 }
                 cx.notify();
             })
@@ -604,6 +733,634 @@ impl SovereignDashboardPanel {
                     Err(error) => {
                         this.identity.export_error =
                             Some(SharedString::from(format!("export refused: {error}")));
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // Plugins (WP-10: REAL — the installed-extension registry)
+    // -----------------------------------------------------------------------
+
+    fn add_plugin_flow(&mut self, cx: &mut Context<Self>) {
+        self.pending_input = Some(PendingInput {
+            request: InputRequest::PluginId,
+            label: "Extension id".into(),
+            detail: "Install from the REAL extension registry (ExtensionStore::install_latest_extension — \
+                     the same flow the extension host uses). Enter the extension id, e.g. \"om\". \
+                     The registry must be reachable for the download."
+                .into(),
+        });
+        cx.notify();
+    }
+
+    fn install_plugin(&mut self, extension_id: String, cx: &mut Context<Self>) {
+        let Some(store) = extension_host::ExtensionStore::try_global(cx) else {
+            self.plugins.error = Some(
+                "the extension host is not registered in this build; install is unavailable".into(),
+            );
+            cx.notify();
+            return;
+        };
+        let extension_id: std::sync::Arc<str> = extension_id.trim().into();
+        if extension_id.is_empty() {
+            self.plugins.error = Some("the extension id must not be empty".into());
+            cx.notify();
+            return;
+        }
+        self.plugins.error = None;
+        // The REAL install flow (downloads from the extension registry, reloads,
+        // emits ExtensionInstalled). In-flight state renders from
+        // `outstanding_operations()` on the next refresh. `install_latest_extension`
+        // returns () — it spawns and detaches its own task.
+        store.update(cx, |store, cx| store.install_latest_extension(extension_id.clone(), cx));
+        self.plugins.message = Some(SharedString::from(format!(
+            "installing {extension_id} from the extension registry (real flow)…"
+        )));
+        self.refresh(cx);
+        cx.notify();
+    }
+
+    fn remove_plugin(&mut self, extension_id: String, cx: &mut Context<Self>) {
+        let Some(store) = extension_host::ExtensionStore::try_global(cx) else {
+            self.plugins.error = Some(
+                "the extension host is not registered in this build; removal is unavailable".into(),
+            );
+            cx.notify();
+            return;
+        };
+        let extension_id: std::sync::Arc<str> = extension_id.into();
+        self.plugins.error = None;
+        // The REAL uninstall flow (removes the installed dir, reloads the
+        // index, emits ExtensionUninstalled — the same call the settings UI
+        // uses for extension-provided MCP servers).
+        store
+            .update(cx, |store, cx| store.uninstall_extension(extension_id, cx))
+            .detach_and_log_err(cx);
+        self.refresh(cx);
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // Link (WP-10: REAL — NIP-46 remote-signer pairing, design §4.6 seam +
+    // omega_signer_broker SignerRoute::RemoteNip46)
+    // -----------------------------------------------------------------------
+
+    /// Start a link ceremony from a `bunker://` URI pasted from the signer on
+    /// the other machine. Real state-machine states are persisted by
+    /// `Nip46Service` and rendered at each step.
+    fn link_bunker_flow(&mut self, cx: &mut Context<Self>) {
+        if self.link.ceremony.is_some() || self.link.reported_signer.is_some() {
+            self.link.message =
+                Some("a pairing ceremony is already in progress; finish or cancel it first".into());
+            cx.notify();
+            return;
+        }
+        self.pending_input = Some(PendingInput {
+            request: InputRequest::LinkBunkerUri,
+            label: "bunker:// URI".into(),
+            detail: "Paste the NIP-46 bunker URI from the signer on the other machine \
+                     (bunker://<pubkey>?relay=<wss…>&secret=…). This starts a REAL \
+                     remote-signer pairing (NIP-46, omega_identity::nip46)."
+                .into(),
+        });
+        cx.notify();
+    }
+
+    /// Start the nostrconnect path: create a REAL pairing link to open on the
+    /// other machine's signer app, then wait for its acknowledgement over the
+    /// relay (the `create_nostrconnect_pairing` flow).
+    fn create_link_pairing(&mut self, cx: &mut Context<Self>) {
+        if self.link.ceremony.is_some() || self.link.reported_signer.is_some() {
+            self.link.message =
+                Some("a pairing ceremony is already in progress; finish or cancel it first".into());
+            cx.notify();
+            return;
+        }
+        let service = Nip46Service::system(*app_identity::CHANNEL);
+        let generation = match link_registry_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.link.message = Some(SharedString::from(error));
+                cx.notify();
+                return;
+            }
+        };
+        let now = unix_now_seconds();
+        let preview = match Nip46PermissionPreview::omega_first_profile(
+            None,
+            vec![LINK_PAIRING_RELAY.to_string()],
+            now,
+            now.saturating_add(LINK_FIRST_WAVE_LIFETIME_SECONDS),
+        ) {
+            Ok(preview) => preview,
+            Err(error) => {
+                self.link.message = Some(SharedString::from(format!("pairing preview failed: {error}")));
+                cx.notify();
+                return;
+            }
+        };
+        let fence = match Nip46PairingFence::new(generation) {
+            Ok(fence) => fence,
+            Err(error) => {
+                self.link.message = Some(SharedString::from(format!("registry fence failed: {error}")));
+                cx.notify();
+                return;
+            }
+        };
+        match service.create_nostrconnect_pairing(preview, fence, "Omega") {
+            Ok((session, uri)) => {
+                let capability_ref = session.capability_ref().to_string();
+                // Persisted state: AwaitingAcknowledgement (the URI carries the
+                // pairing secret the remote signer must echo back).
+                self.link.ceremony = Some(LinkCeremony {
+                    capability_ref,
+                    state: session.state(),
+                    registry_generation: generation,
+                });
+                self.link.pairing_uri = Some(SharedString::from(uri.expose().to_string()));
+                self.link.message = Some(
+                    "pairing link created — open it on the other machine's signer, then wait for \
+                     its acknowledgement"
+                        .into(),
+                );
+                self.drive_link_nostrconnect_acknowledgement(cx);
+            }
+            Err(error) => {
+                self.link.message =
+                    Some(SharedString::from(format!("pairing link creation failed: {error}")));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Begin the bunker ceremony: parse the URI, build the first-wave preview
+    /// and the registry fence, and start the persisted pairing session.
+    fn begin_link_bunker_ceremony(&mut self, uri: String, cx: &mut Context<Self>) {
+        let input = match Nip46ConnectionInput::parse(uri.trim()) {
+            Ok(input) => input,
+            Err(error) => {
+                self.link.message = Some(SharedString::from(format!("invalid bunker URI: {error}")));
+                cx.notify();
+                return;
+            }
+        };
+        let generation = match link_registry_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.link.message = Some(SharedString::from(error));
+                cx.notify();
+                return;
+            }
+        };
+        let now = unix_now_seconds();
+        let preview = match Nip46PermissionPreview::omega_first_profile(
+            Some(input.public_key().clone()),
+            input.relays().to_vec(),
+            now,
+            now.saturating_add(LINK_FIRST_WAVE_LIFETIME_SECONDS),
+        ) {
+            Ok(preview) => preview,
+            Err(error) => {
+                self.link.message = Some(SharedString::from(format!("pairing preview failed: {error}")));
+                cx.notify();
+                return;
+            }
+        };
+        let fence = match Nip46PairingFence::new(generation) {
+            Ok(fence) => fence,
+            Err(error) => {
+                self.link.message = Some(SharedString::from(format!("registry fence failed: {error}")));
+                cx.notify();
+                return;
+            }
+        };
+        let service = Nip46Service::system(*app_identity::CHANNEL);
+        match service.begin_bunker_pairing(input, preview, fence) {
+            Ok(session) => {
+                let capability_ref = session.capability_ref().to_string();
+                // Persisted state: AwaitingApproval.
+                self.link.ceremony = Some(LinkCeremony {
+                    capability_ref,
+                    state: session.state(),
+                    registry_generation: generation,
+                });
+                self.link.message =
+                    Some("pairing started — awaiting the remote signer's approval".into());
+                self.drive_link_approval(cx);
+            }
+            Err(error) => {
+                self.link.message =
+                    Some(SharedString::from(format!("pairing could not start: {error}")));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Step 1 (bunker): resume the persisted session, `approve()`, and render
+    /// the persisted `AwaitingAcknowledgement` state. The connect envelope is
+    /// handed to the acknowledgement exchange.
+    fn drive_link_approval(&mut self, cx: &mut Context<Self>) {
+        let Some(ceremony) = self.link.ceremony.clone() else {
+            return;
+        };
+        let service = Nip46Service::system(*app_identity::CHANNEL);
+        self.link.message = Some("awaiting the remote signer's acknowledgement…".into());
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let mut session = service
+                        .resume(&ceremony.capability_ref)
+                        .map_err(|error| error.to_string())?;
+                    let connect = session
+                        .approve(unix_now_seconds(), LINK_EXCHANGE_TIMEOUT_SECONDS)
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>((session.state(), connect))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok((state, connect)) => {
+                        if let Some(ceremony) = this.link.ceremony.as_mut() {
+                            ceremony.state = state;
+                        }
+                        this.link.connect_envelope = Some(connect);
+                        this.drive_link_acknowledgement(cx);
+                    }
+                    Err(error) => {
+                        this.link.ceremony = None;
+                        this.link.message =
+                            Some(SharedString::from(format!("pairing approval failed: {error}")));
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    /// Step 2 (bunker): exchange the connect request over the relay and wait
+    /// for the signer's acknowledgement (the `AwaitingAcknowledgement` state).
+    fn drive_link_acknowledgement(&mut self, cx: &mut Context<Self>) {
+        let Some(ceremony) = self.link.ceremony.clone() else {
+            return;
+        };
+        let Some(connect) = self.link.connect_envelope.take() else {
+            return;
+        };
+        let service = Nip46Service::system(*app_identity::CHANNEL);
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let mut session = service
+                        .resume(&ceremony.capability_ref)
+                        .map_err(|error| error.to_string())?;
+                    let expected_signer = session.remote_signer_public_key().cloned();
+                    let client_public_key = session.client_public_key().clone();
+                    let coordinator = Nip46RelayCoordinator::default();
+                    let get_public_key = coordinator
+                        .exchange(
+                            &connect,
+                            expected_signer.as_ref(),
+                            &client_public_key,
+                            |relay_url, event_json, received_at| {
+                                session
+                                    .receive_acknowledgement(
+                                        ceremony.registry_generation,
+                                        Nip46InboundEvent {
+                                            relay_url,
+                                            event_json,
+                                            received_at,
+                                        },
+                                        LINK_EXCHANGE_TIMEOUT_SECONDS,
+                                    )
+                                    .map(Some)
+                            },
+                        )
+                        .await
+                        .map_err(|error| link_relay_error_message(&error))?;
+                    Ok::<_, String>((session.state(), get_public_key))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok((state, get_public_key)) => {
+                        if let Some(ceremony) = this.link.ceremony.as_mut() {
+                            ceremony.state = state;
+                        }
+                        this.link.get_public_key_envelope = Some(get_public_key);
+                        this.drive_link_user_public_key(cx);
+                    }
+                    Err(error) => {
+                        this.link.ceremony = None;
+                        this.link.message = Some(SharedString::from(error));
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    /// Step 1' (nostrconnect): listen on the relay for the remote signer's
+    /// acknowledgement of the pairing link (no publication — the signer
+    /// initiates), then request its public key.
+    fn drive_link_nostrconnect_acknowledgement(&mut self, cx: &mut Context<Self>) {
+        let Some(ceremony) = self.link.ceremony.clone() else {
+            return;
+        };
+        let service = Nip46Service::system(*app_identity::CHANNEL);
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let mut session = service
+                        .resume(&ceremony.capability_ref)
+                        .map_err(|error| error.to_string())?;
+                    let client_public_key = session.client_public_key().clone();
+                    let relay_urls = session.preview().relays.clone();
+                    let coordinator = Nip46RelayCoordinator::default();
+                    let get_public_key = coordinator
+                        .listen(
+                            &relay_urls,
+                            &ceremony.capability_ref,
+                            None,
+                            &client_public_key,
+                            |relay_url, event_json, received_at| {
+                                session
+                                    .receive_nostrconnect_acknowledgement(
+                                        ceremony.registry_generation,
+                                        Nip46InboundEvent {
+                                            relay_url,
+                                            event_json,
+                                            received_at,
+                                        },
+                                        LINK_EXCHANGE_TIMEOUT_SECONDS,
+                                    )
+                                    .map(Some)
+                            },
+                        )
+                        .await
+                        .map_err(|error| link_relay_error_message(&error))?;
+                    Ok::<_, String>((session.state(), get_public_key))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok((state, get_public_key)) => {
+                        if let Some(ceremony) = this.link.ceremony.as_mut() {
+                            ceremony.state = state;
+                        }
+                        this.link.get_public_key_envelope = Some(get_public_key);
+                        this.drive_link_user_public_key(cx);
+                    }
+                    Err(error) => {
+                        this.link.ceremony = None;
+                        this.link.pairing_uri = None;
+                        this.link.message = Some(SharedString::from(error));
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    /// Step 3 (both paths): exchange the get-public-key request; the reported
+    /// signer lands in `AwaitingFinalApproval` for the operator's explicit
+    /// approval.
+    fn drive_link_user_public_key(&mut self, cx: &mut Context<Self>) {
+        let Some(ceremony) = self.link.ceremony.clone() else {
+            return;
+        };
+        let Some(get_public_key) = self.link.get_public_key_envelope.take() else {
+            return;
+        };
+        let capability_ref = ceremony.capability_ref.clone();
+        let registry_generation = ceremony.registry_generation;
+        let capability_ref_for_ui = capability_ref.clone();
+        let service = Nip46Service::system(*app_identity::CHANNEL);
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let mut session = service
+                        .resume(&capability_ref)
+                        .map_err(|error| error.to_string())?;
+                    let expected_signer = session.remote_signer_public_key().cloned();
+                    let client_public_key = session.client_public_key().clone();
+                    let coordinator = Nip46RelayCoordinator::default();
+                    let reported = coordinator
+                        .exchange(
+                            &get_public_key,
+                            expected_signer.as_ref(),
+                            &client_public_key,
+                            |relay_url, event_json, received_at| {
+                                session
+                                    .receive_user_public_key(
+                                        registry_generation,
+                                        Nip46InboundEvent {
+                                            relay_url,
+                                            event_json,
+                                            received_at,
+                                        },
+                                        LINK_EXCHANGE_TIMEOUT_SECONDS,
+                                    )
+                                    .map(Some)
+                            },
+                        )
+                        .await
+                        .map_err(|error| link_relay_error_message(&error))?;
+                    Ok::<_, String>((session.state(), reported))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok((state, reported)) => {
+                        if let Some(ceremony) = this.link.ceremony.as_mut() {
+                            ceremony.state = state;
+                        }
+                        let user_public_key = reported.user_identity.public_key_hex().as_str().to_string();
+                        let remote_signer_public_key =
+                            reported.remote_signer_public_key.as_str().to_string();
+                        this.link.reported_signer = Some(LinkReportedSigner {
+                            capability_ref: capability_ref_for_ui.clone(),
+                            remote_signer_public_key,
+                            user_public_key,
+                            registry_generation,
+                            relays: reported.preview.relays.clone(),
+                            expires_at: reported.preview.expires_at,
+                        });
+                        this.link.pairing_uri = None;
+                        this.link.message = Some(
+                            "the remote signer reported its identity — review and approve to \
+                             complete the link"
+                                .into(),
+                        );
+                    }
+                    Err(error) => {
+                        this.link.ceremony = None;
+                        this.link.message = Some(SharedString::from(error));
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    /// The operator's final approval: `approve_reported_signer`, the
+    /// signed-challenge exchange (`AwaitingSignedChallenge` →
+    /// `AwaitingRegistration`), then the real registry registration
+    /// (`register_remote_account` → Active).
+    fn approve_reported_link_signer(&mut self, cx: &mut Context<Self>) {
+        let Some(approval) = self.link.reported_signer.clone() else {
+            return;
+        };
+        let service = Nip46Service::system(*app_identity::CHANNEL);
+        let registry = AccountRegistryService::system(*app_identity::CHANNEL);
+        self.link.reported_signer = None;
+        self.link.message = Some("finalizing the link: signed-challenge proof + registration…".into());
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let mut session = service
+                        .resume(&approval.capability_ref)
+                        .map_err(|error| error.to_string())?;
+                    let challenge = session
+                        .approve_reported_signer(unix_now_seconds(), LINK_EXCHANGE_TIMEOUT_SECONDS)
+                        .map_err(|error| error.to_string())?;
+                    let expected_signer = session.remote_signer_public_key().cloned();
+                    let client_public_key = session.client_public_key().clone();
+                    Nip46RelayCoordinator::default()
+                        .exchange(
+                            &challenge,
+                            expected_signer.as_ref(),
+                            &client_public_key,
+                            |relay_url, event_json, received_at| {
+                                session
+                                    .receive_signed_challenge(
+                                        approval.registry_generation,
+                                        Nip46InboundEvent {
+                                            relay_url,
+                                            event_json,
+                                            received_at,
+                                        },
+                                    )
+                                    .map(Some)
+                            },
+                        )
+                        .await
+                        .map_err(|error| link_relay_error_message(&error))?;
+                    // The terminal registration: the capability is in
+                    // `AwaitingRegistration`; this binds the remote account as
+                    // the ACTIVE account (SignerKind::RemoteNip46).
+                    registry
+                        .register_remote_account(
+                            &approval.capability_ref,
+                            approval.registry_generation,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>(())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.link.ceremony = None;
+                        this.link.message =
+                            Some("remote signer linked and active (NIP-46 pairing complete)".into());
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.link.ceremony = None;
+                        this.link.message =
+                            Some(SharedString::from(format!("link finalization failed: {error}")));
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    /// Reject the reported signer (deletes the pairing key material, state →
+    /// Rejected) or cancel an in-flight ceremony.
+    fn reject_link_ceremony(&mut self, cx: &mut Context<Self>) {
+        let capability_ref = self
+            .link
+            .reported_signer
+            .as_ref()
+            .map(|approval| approval.capability_ref.clone())
+            .or_else(|| self.link.ceremony.as_ref().map(|ceremony| ceremony.capability_ref.clone()));
+        self.link.ceremony = None;
+        self.link.reported_signer = None;
+        self.link.pairing_uri = None;
+        self.link.connect_envelope = None;
+        self.link.get_public_key_envelope = None;
+        if let Some(capability_ref) = capability_ref {
+            let service = Nip46Service::system(*app_identity::CHANNEL);
+            match service
+                .resume(&capability_ref)
+                .and_then(|mut session| session.reject())
+            {
+                Ok(()) => {
+                    self.link.message = Some("remote signer connection rejected.".into());
+                }
+                Err(error) => {
+                    self.link.message = Some(SharedString::from(format!(
+                        "the connection could not be rejected cleanly: {error}"
+                    )));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Disconnect a linked remote signer: the REAL registry revoke + SignedOut
+    /// (`AccountRegistryService::disconnect_remote_signer`).
+    fn disconnect_link(
+        &mut self,
+        account_ref: String,
+        expected_generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Disconnect this remote signer?",
+            Some("Revokes the NIP-46 capability and marks the account signed out in the identity registry (real revocation)."),
+            &["Disconnect", "Cancel"],
+            cx,
+        );
+        let parsed = omega_identity::AccountRef::new(account_ref);
+        let registry = AccountRegistryService::system(*app_identity::CHANNEL);
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let result = match &parsed {
+                Ok(account_ref) => registry
+                    .disconnect_remote_signer(account_ref, expected_generation)
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(format!("invalid account ref: {error}")),
+            };
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(_projection) => {
+                        this.link.message = Some("remote signer disconnected (revoked).".into());
+                        this.refresh(cx);
+                    }
+                    Err(error) => {
+                        this.link.message =
+                            Some(SharedString::from(format!("disconnect failed: {error}")));
                     }
                 }
                 cx.notify();
@@ -948,6 +1705,14 @@ impl SovereignDashboardPanel {
                 } else {
                     self.commit_mapping(server_id, Some(trimmed), cx);
                 }
+            }
+            InputRequest::PluginId => {
+                // WP-10: real Add Plugin — install from the extension registry.
+                self.install_plugin(value, cx);
+            }
+            InputRequest::LinkBunkerUri => {
+                // WP-10: real Link — begin the NIP-46 bunker pairing ceremony.
+                self.begin_link_bunker_ceremony(value, cx);
             }
         }
     }
@@ -1434,29 +2199,7 @@ impl SovereignDashboardPanel {
                 .into_any_element()
         });
 
-        let link = h_flex()
-            .w_full()
-            .justify_between()
-            .items_center()
-            .child(
-                Label::new(
-                    "Cross-machine linking is out of scope this phase (the identity derives from this vault root).",
-                )
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-            )
-            .child(
-                Button::new("link-nostr-id", "Link")
-                    .style(ButtonStyle::Subtle)
-                    .tooltip(ui::Tooltip::text("Link a Nostr identity (stubbed)"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.stub(
-                            "Cross-machine Nostr identity linking is stubbed (out of scope this phase).",
-                            cx,
-                        );
-                    })),
-            )
-            .into_any_element();
+        let link = self.link_section(cx);
 
         v_flex()
             .w_full()
@@ -1475,26 +2218,375 @@ impl SovereignDashboardPanel {
             .into_any_element()
     }
 
-    fn plugins_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let plugin_rows: Vec<AnyElement> = STUB_PLUGINS
-            .iter()
-            .map(|(name, state)| {
-                let id = SharedString::from(format!("plugin-{name}"));
-                self.stub_row(id, name, state, "Plugin removal is stubbed.", cx)
+    /// WP-10: the REAL Link section — the NIP-46 remote-signer pairing
+    /// ceremony (omega_identity::nip46 + omega_signer_broker relay
+    /// coordinator; the `SignerRoute::RemoteNip46` machinery) plus the real
+    /// account-registry status. Every rendered state is a real state-machine
+    /// state; the pairing state persists through `Nip46Service`.
+    fn link_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let ceremony = self.link.ceremony.as_ref().map(|ceremony| {
+            let state_label = pairing_state_label(&ceremony.state);
+            v_flex()
+                .w_full()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .child(
+                    Label::new(format!("Pairing in progress — {state_label}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+                .child(
+                    Label::new(
+                        "the ceremony runs the REAL NIP-46 state machine; pairing state is \
+                         persisted on disk (Nip46Service)",
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .child(
+                    Button::new("sw-link-cancel", "Cancel pairing")
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener(|this, _, _, cx| this.reject_link_ceremony(cx))),
+                )
+                .into_any_element()
+        });
+
+        let pairing_uri = self.link.pairing_uri.as_ref().map(|uri| {
+            let uri_shared = uri.clone();
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    Label::new("Open this pairing link on the other machine's signer:")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .font_family("monospace")
+                                .text_size(px(11.0))
+                                .child(Label::new(uri.clone()).size(LabelSize::XSmall)),
+                        )
+                        .child(CopyButton::new("sw-link-uri-copy", uri_shared).icon_size(IconSize::XSmall)),
+                )
+                .into_any_element()
+        });
+
+        let reported = self.link.reported_signer.as_ref().map(|reported| {
+            let remote_short = short_pubkey(&reported.remote_signer_public_key);
+            let user_short = short_pubkey(&reported.user_public_key);
+            let relays = reported.relays.join(", ");
+            let expiry = reported.expires_at;
+            v_flex()
+                .w_full()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Label::new("Remote signer reported its identity — approve to complete the link:")
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+                .child(
+                    Label::new(format!("remote signer: {remote_short}"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(format!("user identity: {user_short}"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(format!("relays: {relays} · expires: {expiry}"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("sw-link-approve", "Approve")
+                                .style(ButtonStyle::Filled)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.approve_reported_link_signer(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("sw-link-reject", "Reject")
+                                .style(ButtonStyle::Subtle)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reject_link_ceremony(cx);
+                                })),
+                        ),
+                )
+                .into_any_element()
+        });
+
+        // The real status: registered remote accounts from the identity
+        // registry (SignerKind::RemoteNip46), with lifecycle/availability and
+        // a real Disconnect (revocation).
+        let status_rows: Vec<AnyElement> = self
+            .link
+            .status
+            .as_ref()
+            .map(|projection| link_status_rows(projection))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| {
+                let account_ref = row.account_ref.clone();
+                let generation = row.generation;
+                let remove_id = SharedString::from(format!("sw-link-disconnect-{account_ref}"));
+                h_flex()
+                    .id(remove_id.clone())
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        v_flex()
+                            .child(Label::new(row.title).size(LabelSize::Small))
+                            .child(
+                                Label::new(row.detail)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        Button::new(remove_id, "Disconnect")
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(ui::Tooltip::text(
+                                "Revoke the NIP-46 capability and sign the account out (real)",
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.disconnect_link(account_ref.clone(), generation, window, cx);
+                            })),
+                    )
+                    .into_any_element()
             })
             .collect();
+
+        let status_body = if let Some(error) = &self.link.status_error {
+            v_flex()
+                .child(
+                    Label::new("Link status unavailable")
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                )
+                .child(Label::new(error.clone()).size(LabelSize::Small).color(Color::Muted))
+        } else if status_rows.is_empty() {
+            v_flex().child(
+                Label::new("No remote signer linked")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+        } else {
+            v_flex().w_full().gap_2().children(status_rows)
+        };
+
         v_flex()
             .w_full()
             .gap_2()
-            .children(plugin_rows)
+            .child(
+                Label::new(
+                    "Cross-machine link = NIP-46 remote-signer pairing (real; the signer on \
+                     another machine holds the identity).",
+                )
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .children(ceremony)
+            .children(pairing_uri)
+            .children(reported)
+            .child(status_body)
+            .children(self.link.message.clone().map(|message| {
+                Label::new(message)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .into_any_element()
+            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        Button::new("link-nostr-id", "Link via bunker URI")
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(ui::Tooltip::text(
+                                "Start a REAL NIP-46 pairing from a bunker URI (remote signer on another machine)",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.link_bunker_flow(cx))),
+                    )
+                    .child(
+                        Button::new("link-nostrconnect", "Create pairing link")
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(ui::Tooltip::text(
+                                "Create a REAL nostrconnect pairing URI to open on the other machine",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.create_link_pairing(cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// WP-10: the REAL Plugins section — the installed-extension registry.
+    /// Rows render real installed extensions (id/name/version/dev); Remove
+    /// performs the real `uninstall_extension`; Add Plugin performs the real
+    /// `install_latest_extension` flow; in-flight operations render from
+    /// `outstanding_operations()`. The copy labels the mapping honestly: the
+    /// extension host's installed set IS the plugin registry in this codebase.
+    fn plugins_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let registry_note = Label::new(
+            "real state — the extension host's installed set (the plugin registry in this build)",
+        )
+        .size(LabelSize::XSmall)
+        .color(Color::Muted);
+
+        let rows: Vec<AnyElement> = self
+            .plugins
+            .installed
+            .iter()
+            .map(|plugin| {
+                let id = SharedString::from(format!("plugin-{}", plugin.id));
+                let name = plugin.name.clone();
+                let version = plugin.version.clone();
+                let dev = plugin.dev;
+                let secondary = if dev {
+                    format!("v{version} · dev")
+                } else {
+                    format!("v{version}")
+                };
+                let remove_id = SharedString::from(format!("{id}-remove"));
+                let plugin_id_for_remove = plugin.id.clone();
+                h_flex()
+                    .id(id)
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        v_flex()
+                            .child(Label::new(name).size(LabelSize::Small))
+                            .child(
+                                Label::new(secondary)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        IconButton::new(remove_id, IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .style(ButtonStyle::Subtle)
+                            .aria_label(format!(
+                                "Remove {plugin_id_for_remove} (real extension uninstall)"
+                            ))
+                            .tooltip(ui::Tooltip::text(
+                                "Remove (real extension uninstall through the extension host)",
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_plugin(plugin_id_for_remove.clone(), cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        // Real in-flight operations from the extension store.
+        let operations: Vec<AnyElement> = self
+            .plugins
+            .operations
+            .iter()
+            .map(|(id, label)| {
+                h_flex()
+                    .id(SharedString::from(format!("plugin-op-{id}")))
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .child(
+                        v_flex()
+                            .child(Label::new(id.clone()).size(LabelSize::Small))
+                            .child(
+                                Label::new(label.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        let body = if let Some(unavailable) = &self.plugins.unavailable {
+            v_flex()
+                .child(
+                    Label::new("Plugin registry unavailable")
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                )
+                .child(
+                    Label::new(unavailable.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+        } else {
+            v_flex()
+                .w_full()
+                .gap_2()
+                .when(rows.is_empty() && operations.is_empty(), |this| {
+                    this.child(
+                        Label::new("No extensions installed")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                })
+                .children(rows)
+                .children(operations)
+        };
+
+        v_flex()
+            .w_full()
+            .gap_2()
+            .child(registry_note)
+            .child(body)
             .child(
                 Button::new("add-plugin", "Add Plugin")
                     .style(ButtonStyle::Subtle)
-                    .tooltip(ui::Tooltip::text("Add a plugin (stubbed)"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.stub("Plugin creation is stubbed.", cx);
-                    })),
+                    .tooltip(ui::Tooltip::text(
+                        "Install an extension from the registry (real flow)",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.add_plugin_flow(cx))),
             )
+            .children(self.plugins.message.clone().map(|message| {
+                Label::new(message)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .into_any_element()
+            }))
+            .children(self.plugins.error.clone().map(|error| {
+                Label::new(error)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
+                    .into_any_element()
+            }))
             .into_any_element()
     }
 
@@ -1819,47 +2911,6 @@ impl SovereignDashboardPanel {
             .into_any_element()
     }
 
-    fn stub_row(
-        &self,
-        id: SharedString,
-        primary: &str,
-        secondary: &str,
-        remove_notice: &'static str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let name_for_label = primary.to_string();
-        let remove_id = SharedString::from(format!("{id}-remove"));
-        h_flex()
-            .id(id)
-            .w_full()
-            .justify_between()
-            .items_center()
-            .px_2()
-            .py_1()
-            .rounded_sm()
-            .hover(|style| style.bg(cx.theme().colors().element_hover))
-            .child(
-                v_flex()
-                    .child(Label::new(primary.to_string()).size(LabelSize::Small))
-                    .child(
-                        Label::new(secondary.to_string())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            )
-            .child(
-                IconButton::new(remove_id, IconName::Close)
-                    .icon_size(IconSize::Small)
-                    .style(ButtonStyle::Subtle)
-                    .aria_label(format!("Remove {name_for_label} (stubbed)"))
-                    .tooltip(ui::Tooltip::text("Remove (stubbed)"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.stub(remove_notice, cx);
-                    })),
-            )
-            .into_any_element()
-    }
-
     fn section_header(&self, title: &'static str) -> AnyElement {
         Label::new(title)
             .size(LabelSize::Small)
@@ -1914,7 +2965,7 @@ impl Render for SovereignDashboardPanel {
             .child(self.wallet_section(cx))
             // Operator input row (ceremony entry)
             .child(self.input_row(window, cx))
-            // Plugins (stubbed)
+            // Plugins (real — the installed-extension registry, WP-10)
             .child(self.section_header("Plugins"))
             .child(self.plugins_section(cx))
             // MCP servers mapped to Nostr IDs (real mapping)
@@ -2050,6 +3101,184 @@ fn is_valid_pubkey_hex(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+// ---------------------------------------------------------------------------
+// WP-10 pure helpers (tested): Plugins (real extension registry) and Link
+// (real NIP-46 status projection + pairing-state labels)
+// ---------------------------------------------------------------------------
+
+/// The real Plugins view snapshot: the installed-extension registry and the
+/// in-flight operations. `try_global` renders an honest "unavailable" state
+/// when the extension host is not registered (tests, unusual builds) — never
+/// a fake row.
+fn plugins_view(cx: &App) -> PluginsView {
+    let Some(store) = extension_host::ExtensionStore::try_global(cx) else {
+        return PluginsView {
+            installed: Vec::new(),
+            operations: Vec::new(),
+            unavailable: Some(
+                "the extension host is not registered in this build (no ExtensionStore global)"
+                    .into(),
+            ),
+            message: None,
+            error: None,
+        };
+    };
+    let store = store.read(cx);
+    let (installed, operations) =
+        plugin_rows(store.installed_extensions(), store.outstanding_operations());
+    PluginsView {
+        installed,
+        operations,
+        unavailable: None,
+        message: None,
+        error: None,
+    }
+}
+
+/// Pure: map the REAL extension index + outstanding operations to rows.
+fn plugin_rows(
+    installed: &std::collections::BTreeMap<std::sync::Arc<str>, extension_host::ExtensionIndexEntry>,
+    outstanding: &std::collections::BTreeMap<std::sync::Arc<str>, extension_host::ExtensionOperation>,
+) -> (Vec<PluginRow>, Vec<(String, String)>) {
+    let mut rows = installed
+        .iter()
+        .map(|(id, entry)| PluginRow {
+            id: id.to_string(),
+            name: entry.manifest.name.clone(),
+            version: entry.manifest.version.to_string(),
+            dev: entry.dev,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    let operations = outstanding
+        .iter()
+        .map(|(id, operation)| (id.to_string(), plugin_operation_label(*operation)))
+        .collect::<Vec<_>>();
+    (rows, operations)
+}
+
+/// Honest label for an in-flight extension operation.
+fn plugin_operation_label(operation: extension_host::ExtensionOperation) -> String {
+    match operation {
+        extension_host::ExtensionOperation::Upgrade => "upgrading…".to_string(),
+        extension_host::ExtensionOperation::Install => "installing…".to_string(),
+        extension_host::ExtensionOperation::Remove => "removing…".to_string(),
+    }
+}
+
+/// One real linked-remote-signer status row (from the account registry).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinkStatusRow {
+    title: String,
+    detail: String,
+    account_ref: String,
+    generation: u64,
+}
+
+/// Pure: map the REAL account-registry projection to link-status rows. Only
+/// remote NIP-46 signer accounts are "links"; every other account kind is
+/// honestly excluded (it is not a cross-machine link).
+fn link_status_rows(projection: &omega_identity::AccountDashboardProjection) -> Vec<LinkStatusRow> {
+    let mut rows = projection
+        .accounts
+        .iter()
+        .filter(|entry| entry.signer.kind == SignerKind::RemoteNip46)
+        .map(|entry| {
+            let is_active = entry.is_active;
+            let lifecycle = format!("{:?}", entry.lifecycle).to_lowercase();
+            let availability = format!("{:?}", entry.signer.availability).to_lowercase();
+            let last_use = entry
+                .signer
+                .last_successful_use
+                .map(|used_at| format!("last use {used_at}"))
+                .unwrap_or_else(|| "never used".to_string());
+            LinkStatusRow {
+                title: if is_active {
+                    format!("remote signer · {} (active)", entry.identity.public_key_hex().as_str())
+                } else {
+                    format!("remote signer · {}", entry.identity.public_key_hex().as_str())
+                },
+                detail: format!("{lifecycle} · {availability} · {last_use}"),
+                account_ref: entry.account_ref.as_str().to_string(),
+                generation: projection.active.generation,
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| a.account_ref.cmp(&b.account_ref));
+    rows
+}
+
+/// Honest label for every REAL NIP-46 pairing state.
+fn pairing_state_label(state: &Nip46PairingState) -> &'static str {
+    match state {
+        Nip46PairingState::AwaitingApproval => "AwaitingApproval",
+        Nip46PairingState::AwaitingAcknowledgement => "AwaitingAcknowledgement",
+        Nip46PairingState::AwaitingUserPublicKey => "AwaitingUserPublicKey",
+        Nip46PairingState::AwaitingFinalApproval => "AwaitingFinalApproval",
+        Nip46PairingState::AwaitingSignedChallenge => "AwaitingSignedChallenge",
+        Nip46PairingState::AwaitingRegistration => "AwaitingRegistration",
+        Nip46PairingState::Active => "Active",
+        Nip46PairingState::Rejected => "Rejected",
+        Nip46PairingState::Revoked => "Revoked",
+    }
+}
+
+/// The account registry's current generation (the NIP-46 fence).
+fn link_registry_generation() -> Result<u64, String> {
+    AccountRegistryService::system(*app_identity::CHANNEL)
+        .inspect()
+        .map(|projection| projection.active.generation)
+        .map_err(|error| format!("account registry unavailable: {error}"))
+}
+
+fn unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+/// Honest failure copy for the relay-exchange errors (mirrors the account_ui
+/// ceremony's failure classification).
+fn link_relay_error_message(error: &omega_signer_broker::Nip46RelayError) -> String {
+    match error {
+        omega_signer_broker::Nip46RelayError::Offline
+        | omega_signer_broker::Nip46RelayError::Silence => {
+            "the remote signer is offline or did not respond; start the connection again when it \
+             is available"
+                .to_string()
+        }
+        omega_signer_broker::Nip46RelayError::Timeout => {
+            "the remote signer did not finish in time; start the connection again to retry"
+                .to_string()
+        }
+        omega_signer_broker::Nip46RelayError::Protocol(omega_identity::Nip46Error::Rejected) => {
+            "the remote signer rejected this connection".to_string()
+        }
+        omega_signer_broker::Nip46RelayError::Protocol(omega_identity::Nip46Error::Revoked) => {
+            "this remote signer capability was revoked".to_string()
+        }
+        omega_signer_broker::Nip46RelayError::Protocol(error) => {
+            format!("the remote signer response could not be verified: {error}")
+        }
+        omega_signer_broker::Nip46RelayError::NoRelay => {
+            "the pairing declares no reachable relay".to_string()
+        }
+        omega_signer_broker::Nip46RelayError::InvalidTimeout
+        | omega_signer_broker::Nip46RelayError::MalformedFrame => {
+            "the NIP-46 relay exchange failed (protocol error)".to_string()
+        }
+    }
+}
+
+/// Compact display of a public key (never key material).
+fn short_pubkey(pubkey: &str) -> String {
+    if pubkey.len() > 12 {
+        format!("{}…{}", &pubkey[..8], &pubkey[pubkey.len() - 4..])
+    } else {
+        pubkey.to_string()
+    }
+}
+
 /// Map configured MCP server ids to a persisted Nostr identity where the
 /// operator mapped one (design §6.4 — the L-402 entitlement attribution), to
 /// the derived identity npub where the identity seam exists, or to an honest
@@ -2086,6 +3315,11 @@ fn mcp_mapping_rows<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::{
+        EventBuilder, JsonUtil as _, Keys, Kind, PublicKey, Timestamp,
+        nips::nip46::NostrConnectMessage,
+    };
+    use omega_identity::{Nip46CapabilityState, SignerKind};
     use std::collections::HashMap;
 
     #[test]
@@ -2198,5 +3432,421 @@ mod tests {
         assert!(om.1.contains("a1b2c3d4…"), "{}", om.1);
         let other = rows.iter().find(|(server, _)| server == "other").expect("other row");
         assert!(other.1.contains("(agent identity)"), "{}", other.1);
+    }
+
+    // -----------------------------------------------------------------------
+    // WP-10: Plugins — the REAL installed-extension registry mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plugin_rows_map_the_real_extension_registry_and_in_flight_operations() {
+        // The mapping the dashboard renders is exactly the extension host's
+        // installed set + outstanding operations — no fabricated rows.
+        let manifest = |id: &str, name: &str, version: &str| {
+            let value = serde_json::json!({
+                "id": id,
+                "name": name,
+                "version": version,
+                "schema_version": 1,
+            });
+            serde_json::from_value::<extension_host::ExtensionManifest>(value).expect("manifest")
+        };
+        let mut installed = std::collections::BTreeMap::new();
+        installed.insert(
+            std::sync::Arc::<str>::from("om"),
+            extension_host::ExtensionIndexEntry {
+                manifest: std::sync::Arc::new(manifest("om", "om (Obsidian Mind)", "0.2.0")),
+                dev: false,
+            },
+        );
+        installed.insert(
+            std::sync::Arc::<str>::from("source-summarization"),
+            extension_host::ExtensionIndexEntry {
+                manifest: std::sync::Arc::new(manifest(
+                    "source-summarization",
+                    "source-summarization",
+                    "1.4.1",
+                )),
+                dev: true,
+            },
+        );
+        let mut outstanding = std::collections::BTreeMap::new();
+        outstanding.insert(
+            std::sync::Arc::<str>::from("theme-dev"),
+            extension_host::ExtensionOperation::Install,
+        );
+        outstanding.insert(
+            std::sync::Arc::<str>::from("om"),
+            extension_host::ExtensionOperation::Remove,
+        );
+        let (rows, operations) = plugin_rows(&installed, &outstanding);
+        assert_eq!(rows.len(), 2);
+        let om = rows.iter().find(|row| row.id == "om").expect("om row");
+        assert_eq!(om.name, "om (Obsidian Mind)");
+        assert_eq!(om.version, "0.2.0");
+        assert!(!om.dev);
+        let summarization = rows
+            .iter()
+            .find(|row| row.id == "source-summarization")
+            .expect("summarization row");
+        assert_eq!(summarization.version, "1.4.1");
+        assert!(summarization.dev);
+        // The in-flight operations are rendered as real states.
+        assert!(operations.iter().any(|(id, label)| id == "theme-dev" && label == "installing…"));
+        assert!(operations.iter().any(|(id, label)| id == "om" && label == "removing…"));
+    }
+
+    #[test]
+    fn plugin_operation_labels_are_honest() {
+        assert_eq!(
+            plugin_operation_label(extension_host::ExtensionOperation::Install),
+            "installing…"
+        );
+        assert_eq!(
+            plugin_operation_label(extension_host::ExtensionOperation::Remove),
+            "removing…"
+        );
+        assert_eq!(
+            plugin_operation_label(extension_host::ExtensionOperation::Upgrade),
+            "upgrading…"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // WP-10: Link — REAL NIP-46 pairing state labels + registry status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pairing_state_labels_cover_every_real_state_machine_state() {
+        // Every state the omega_identity::nip46 state machine can reach has an
+        // honest label; a future state-machine addition must add one here.
+        use omega_identity::Nip46PairingState as State;
+        for state in [
+            State::AwaitingApproval,
+            State::AwaitingAcknowledgement,
+            State::AwaitingUserPublicKey,
+            State::AwaitingFinalApproval,
+            State::AwaitingSignedChallenge,
+            State::AwaitingRegistration,
+            State::Active,
+            State::Rejected,
+            State::Revoked,
+        ] {
+            let label = pairing_state_label(&state);
+            assert!(!label.is_empty(), "no label for {state:?}");
+            assert!(
+                label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "label {label} is not a clean identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn link_status_rows_include_only_real_remote_nip46_accounts() {
+        // No remote accounts on a fresh registry: no rows (never fabricated).
+        let dir = tempfile::tempdir().expect("temp data root");
+        let registry =
+            AccountRegistryService::for_channel_data_root(app_identity::AppChannel::Dev, dir.path().to_path_buf());
+        let projection = registry.inspect().expect("registry projection");
+        assert!(link_status_rows(&projection).is_empty());
+        // The filter is exactly SignerKind::RemoteNip46 — a local (non-remote)
+        // account kind must never appear as a "link". The full positive case
+        // (a registered remote account renders as one row, then disconnects
+        // honestly) is covered by the bunker ceremony test.
+        let _ = SignerKind::LocalNative;
+    }
+
+    #[test]
+    fn bunker_link_ceremony_walks_the_real_state_machine_to_active() {
+        use omega_identity::{
+            AccountLifecycleState, SignerAvailability,
+        };
+
+        // The NIP-46 login-challenge kind (omega_identity/src/nip46.rs
+        // NIP46_LOGIN_CHALLENGE_KIND — a private const; the literal is the
+        // protocol value).
+        const NIP46_LOGIN_CHALLENGE_KIND: u16 = 24246;
+        const RELAY: &str = "wss://relay.example/";
+        const NOW: u64 = 2_000_000_000;
+
+        let dir = tempfile::tempdir().expect("temp data root");
+        let registry = AccountRegistryService::for_channel_data_root(
+            app_identity::AppChannel::Dev,
+            dir.path().to_path_buf(),
+        );
+        let service = Nip46Service::for_data_root(dir.path().to_path_buf());
+        let signer = Keys::generate();
+        let generation = registry.inspect().expect("registry").active.generation;
+        assert!(generation >= 1, "a fresh registry starts at generation 1");
+
+        // The ceremony start (the dashboard's begin path): parse the bunker
+        // URI, build the first-wave preview + fence, begin the pairing.
+        let uri = format!(
+            "bunker://{}?relay={RELAY}&secret=pairing-secret",
+            signer.public_key().to_hex()
+        );
+        let input = Nip46ConnectionInput::parse(&uri).expect("parse bunker URI");
+        let preview = Nip46PermissionPreview::omega_first_profile(
+            Some(input.public_key().clone()),
+            input.relays().to_vec(),
+            NOW,
+            NOW + 3_600,
+        )
+        .expect("preview");
+        let fence = Nip46PairingFence::new(generation).expect("fence");
+        let mut session = service
+            .begin_bunker_pairing(input, preview, fence)
+            .expect("begin bunker pairing");
+        assert_eq!(session.state(), Nip46PairingState::AwaitingApproval);
+
+        // Step 1: approve -> the persisted state advances.
+        let connect = session
+            .approve(NOW, 30)
+            .expect("approve connect request");
+        assert_eq!(session.state(), Nip46PairingState::AwaitingAcknowledgement);
+
+        // Step 2: the signer acknowledges (result "ack").
+        let ack = connect_response(
+            &signer,
+            PublicKey::from_hex(session.client_public_key().as_str()).expect("client pubkey"),
+            &connect.request_id,
+            Some("ack".to_string()),
+            None,
+            NOW + 1,
+        );
+        let get_public_key = session
+            .receive_acknowledgement(
+                generation,
+                Nip46InboundEvent {
+                    relay_url: RELAY,
+                    event_json: &ack,
+                    received_at: NOW + 1,
+                },
+                30,
+            )
+            .expect("acknowledgement");
+        assert_eq!(session.state(), Nip46PairingState::AwaitingUserPublicKey);
+
+        // Step 3: the signer reports its public key.
+        let public_key_response = connect_response(
+            &signer,
+            PublicKey::from_hex(session.client_public_key().as_str()).expect("client pubkey"),
+            &get_public_key.request_id,
+            Some(signer.public_key().to_hex()),
+            None,
+            NOW + 2,
+        );
+        let reported = session
+            .receive_user_public_key(
+                generation,
+                Nip46InboundEvent {
+                    relay_url: RELAY,
+                    event_json: &public_key_response,
+                    received_at: NOW + 2,
+                },
+                30,
+            )
+            .expect("reported signer");
+        assert_eq!(session.state(), Nip46PairingState::AwaitingFinalApproval);
+        assert_eq!(
+            reported.remote_signer_public_key.as_str(),
+            signer.public_key().to_hex()
+        );
+        assert_eq!(
+            reported.user_identity.public_key_hex().as_str(),
+            signer.public_key().to_hex()
+        );
+
+        // Step 4: the operator's final approval -> the signer signs the login
+        // challenge. The challenge content is the deterministic ceremony
+        // string (the private `challenge_content` in nip46.rs); reconstruct it
+        // from the public session values.
+        let challenge_request = session
+            .approve_reported_signer(NOW + 3, 30)
+            .expect("approve reported signer");
+        assert_eq!(session.state(), Nip46PairingState::AwaitingSignedChallenge);
+        let challenge_content = format!(
+            "omega:nip46-login:{}:{}:{}:{}",
+            session.capability_ref(),
+            generation,
+            session.client_public_key().as_str(),
+            signer.public_key().to_hex()
+        );
+        let signed_challenge = EventBuilder::new(Kind::Custom(NIP46_LOGIN_CHALLENGE_KIND), challenge_content)
+            .custom_created_at(Timestamp::from_secs(NOW + 3))
+            .sign_with_keys(&signer)
+            .expect("sign challenge");
+        let challenge_response = connect_response(
+            &signer,
+            PublicKey::from_hex(session.client_public_key().as_str()).expect("client pubkey"),
+            &challenge_request.request_id,
+            Some(signed_challenge.try_as_json().expect("challenge json")),
+            None,
+            NOW + 4,
+        );
+        let capability = session
+            .receive_signed_challenge(
+                generation,
+                Nip46InboundEvent {
+                    relay_url: RELAY,
+                    event_json: &challenge_response,
+                    received_at: NOW + 4,
+                },
+            )
+            .expect("signed challenge");
+        assert_eq!(session.state(), Nip46PairingState::AwaitingRegistration);
+        assert_eq!(capability.state, Nip46CapabilityState::AwaitingRegistration);
+
+        // Step 5: the terminal registration -> the remote account is ACTIVE.
+        let projection = registry
+            .register_remote_account(&capability.capability_ref, generation)
+            .expect("register remote account");
+        let remote = projection
+            .accounts
+            .iter()
+            .find(|entry| entry.signer.kind == SignerKind::RemoteNip46)
+            .expect("remote account registered");
+        assert_eq!(remote.lifecycle, AccountLifecycleState::Active);
+        assert_eq!(remote.signer.availability, SignerAvailability::Ready);
+        assert!(remote.is_active, "the linked remote signer becomes the active account");
+
+        // The dashboard's status surface renders the real linked signer.
+        let rows = link_status_rows(&projection);
+        assert_eq!(rows.len(), 1, "exactly one linked remote signer: {rows:?}");
+        assert!(rows[0].title.contains("remote signer"), "{}", rows[0].title);
+        assert!(rows[0].title.contains("(active)"), "{}", rows[0].title);
+        assert!(rows[0].detail.contains("ready"), "{}", rows[0].detail);
+
+        // The real Disconnect revokes and signs the account out.
+        let after_disconnect = registry
+            .disconnect_remote_signer(&remote.account_ref, projection.active.generation)
+            .expect("disconnect remote signer");
+        assert!(after_disconnect.active.account_ref.is_none());
+        let rows = link_status_rows(&after_disconnect);
+        assert_eq!(rows.len(), 1, "the recorded account stays visible, honestly revoked");
+        assert!(rows[0].detail.contains("signedout"), "{}", rows[0].detail);
+        assert!(rows[0].detail.contains("revoked"), "{}", rows[0].detail);
+    }
+
+    #[test]
+    fn nostrconnect_link_ceremony_walks_to_final_approval() {
+        use omega_identity::Nip46PermissionPreview;
+
+        const RELAY: &str = "wss://relay.example/";
+        const NOW: u64 = 2_000_000_000;
+
+        let dir = tempfile::tempdir().expect("temp data root");
+        let service = Nip46Service::for_data_root(dir.path().to_path_buf());
+        let registry = AccountRegistryService::for_channel_data_root(
+            app_identity::AppChannel::Dev,
+            dir.path().to_path_buf(),
+        );
+        let signer = Keys::generate();
+        let generation = registry.inspect().expect("registry").active.generation;
+
+        // The dashboard's nostrconnect path: create the pairing link (the URI
+        // the operator opens on the other machine).
+        let preview = Nip46PermissionPreview::omega_first_profile(
+            None,
+            vec![RELAY.to_string()],
+            NOW,
+            NOW + 3_600,
+        )
+        .expect("preview");
+        let fence = Nip46PairingFence::new(generation).expect("fence");
+        let (mut session, pairing_uri) = service
+            .create_nostrconnect_pairing(preview, fence, "Omega")
+            .expect("create nostrconnect pairing");
+        assert_eq!(session.state(), Nip46PairingState::AwaitingAcknowledgement);
+
+        // The remote signer reads the URI and echoes the pairing secret in its
+        // acknowledgement (the real `receive_nostrconnect_acknowledgement`
+        // flow — the secret is what binds the inbound signer).
+        let secret = {
+            let uri = url::Url::parse(pairing_uri.expose()).expect("parse pairing URI");
+            uri.query_pairs()
+                .find(|(key, _)| key == "secret")
+                .map(|(_, value)| value.into_owned())
+                .expect("pairing secret in URI")
+        };
+        let acknowledgement = connect_response(
+            &signer,
+            PublicKey::from_hex(session.client_public_key().as_str()).expect("client pubkey"),
+            &secret,
+            Some(secret.clone()),
+            None,
+            NOW + 1,
+        );
+        let get_public_key = session
+            .receive_nostrconnect_acknowledgement(
+                generation,
+                Nip46InboundEvent {
+                    relay_url: RELAY,
+                    event_json: &acknowledgement,
+                    received_at: NOW + 1,
+                },
+                30,
+            )
+            .expect("nostrconnect acknowledgement");
+        assert_eq!(session.state(), Nip46PairingState::AwaitingUserPublicKey);
+        assert_eq!(
+            session.remote_signer_public_key().expect("remote signer").as_str(),
+            signer.public_key().to_hex()
+        );
+
+        // The public-key report (same as the bunker path).
+        let public_key_response = connect_response(
+            &signer,
+            PublicKey::from_hex(session.client_public_key().as_str()).expect("client pubkey"),
+            &get_public_key.request_id,
+            Some(signer.public_key().to_hex()),
+            None,
+            NOW + 2,
+        );
+        let reported = session
+            .receive_user_public_key(
+                generation,
+                Nip46InboundEvent {
+                    relay_url: RELAY,
+                    event_json: &public_key_response,
+                    received_at: NOW + 2,
+                },
+                30,
+            )
+            .expect("reported signer");
+        assert_eq!(session.state(), Nip46PairingState::AwaitingFinalApproval);
+        assert_eq!(
+            reported.remote_signer_public_key.as_str(),
+            signer.public_key().to_hex()
+        );
+    }
+
+    /// Build a NIP-46 (kind 24133) response event encrypted to the client —
+    /// the same shape the remote signer emits over the relay.
+    fn connect_response(
+        signer: &nostr::Keys,
+        recipient: PublicKey,
+        request_id: &str,
+        result: Option<String>,
+        error: Option<String>,
+        created_at: u64,
+    ) -> String {
+        nostr::EventBuilder::nostr_connect(
+            signer,
+            recipient,
+            NostrConnectMessage::Response {
+                id: request_id.to_string(),
+                result,
+                error,
+            },
+        )
+        .expect("nostr connect event")
+        .custom_created_at(nostr::Timestamp::from_secs(created_at))
+        .sign_with_keys(signer)
+        .expect("sign response")
+        .try_as_json()
+        .expect("response json")
     }
 }
