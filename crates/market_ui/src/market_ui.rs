@@ -10,6 +10,8 @@ mod components;
 #[cfg(not(target_arch = "wasm32"))]
 mod discovery;
 #[cfg(not(target_arch = "wasm32"))]
+mod escrow;
+#[cfg(not(target_arch = "wasm32"))]
 mod nautilus_live;
 #[cfg(not(target_arch = "wasm32"))]
 mod nautilus_order;
@@ -41,6 +43,11 @@ pub use discovery::{
     MarketDiscoveryConfig, MarketRelayGate, NIP_MKT_EXTENSION, NIP11_ACCEPT_MEDIA_TYPE,
     OfferingListing, OfferingSideListing, ProviderListing, RELAY_URL_ENVIRONMENT_VARIABLE,
     SUBSCRIPTION_ID, validate_market_relay_information,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use escrow::{
+    AUTOMATED_RELEASE_FEE_SATS, ESCROW_LEDGER_SCHEMA, ESCROW_SESSION_SCHEMA, ESCROW_STORE_DIRECTORY,
+    ESCROW_STRATEGY, EscrowOpenParams, EscrowSession, EscrowState,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use nautilus_live::{

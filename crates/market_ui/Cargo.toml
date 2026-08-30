@@ -34,6 +34,7 @@ nautilus_sidecar.workspace = true
 paths.workspace = true
 rand.workspace = true
 trading_ledger.workspace = true
+trading_mandate.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
