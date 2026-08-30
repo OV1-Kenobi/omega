@@ -36,6 +36,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 
 use trading_ledger::{
@@ -519,6 +520,203 @@ impl EscrowSession {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Slice B — the receipt digest gate + the pay-first fee flow
+// ---------------------------------------------------------------------------
+
+/// The demo's receipt gate environment variable: real signet invoice minting
+/// for arbitration fees stays OFF until this is explicitly set (honestly
+/// labeled — no real funds move by default).
+pub const ARBITRATION_LIVE_FEES_ENVIRONMENT_VARIABLE: &str = "OMEGA_ARBITRATION_LIVE_FEES";
+
+/// The public-safe receipt event the digest gate re-derives from — the same
+/// wire shape the platform receipts publish (the `lbr-closeout` lifecycle
+/// event projection). Everything is a ref or hex id; no payment material.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReceiptEventProjection {
+    pub id: String,
+    pub pubkey: String,
+    pub kind: u32,
+    pub created_at: i64,
+    pub tags: Vec<Vec<String>>,
+    pub content: String,
+    pub sig: String,
+}
+
+impl ReceiptEventProjection {
+    fn validate(&self) -> Result<()> {
+        validate_pubkey("receipt event id", &self.id)?;
+        validate_pubkey("receipt author pubkey", &self.pubkey)?;
+        if self.kind == 0 {
+            bail!("receipt event kind must be positive");
+        }
+        if self.created_at < 0 {
+            bail!("receipt event timestamp must not be negative");
+        }
+        if self.sig.len() != 128 || !self.sig.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("receipt event signature must be 128-char hex");
+        }
+        Ok(())
+    }
+}
+
+/// Deterministic canonical projection of the receipt event (the demo's
+/// `lbr-closeout` adaptation): fixed alphabetical key order via
+/// `serde_json::Value`'s BTreeMap ordering, compact serialization, digest
+/// over the exact bytes. A reader re-derives the digest and confirms it
+/// matches the submitted claim — the claim is never the proof.
+pub fn canonical_receipt_digest(event: &ReceiptEventProjection) -> Result<String> {
+    event.validate()?;
+    let value = json!({
+        "content": event.content,
+        "created_at": event.created_at,
+        "id": event.id,
+        "kind": event.kind,
+        "pubkey": event.pubkey,
+        "sig": event.sig,
+        "tags": event.tags,
+    });
+    Ok(format!("{:x}", Sha256::digest(value.to_string().as_bytes())))
+}
+
+/// The receipt gate: re-derive the digest from the ACTUAL receipt event and
+/// drive the session's verification transition with it. Returns the reached
+/// state (`VerifiedPass` releases free; `VerifiedFail` stays in limbo).
+pub fn verify_receipt_claim(
+    session: &mut EscrowSession,
+    event: &ReceiptEventProjection,
+) -> Result<EscrowState> {
+    let recomputed = canonical_receipt_digest(event)?;
+    session.record_verification(&recomputed)
+}
+
+/// sha256 over the payment proof — the digest is what persists; the preimage
+/// itself never enters the ledger, the session, or any log (SEC-2026-088).
+pub fn fee_payment_digest(payment_proof: &str) -> Result<String> {
+    if payment_proof.is_empty() {
+        bail!("arbitration fee payment proof must not be empty");
+    }
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(payment_proof.as_bytes())
+    ))
+}
+
+/// Append the balanced pre-paid arbitration `Fee` entry: the escalator pays
+/// the platform-arbitrator, participant-to-participant (SEC-2026-085) — the
+/// platform's only custody event, collected on escalation, never pooled.
+/// Returns the `fee_payment_digest` the `ArbitrationRequested` entry
+/// references (pay-first invariant).
+pub fn record_fee_payment(
+    ledger: &LedgerStore,
+    session: &EscrowSession,
+    payer_pubkey: &str,
+    payment_proof: &str,
+    now_ms: i64,
+) -> Result<String> {
+    validate_pubkey("fee payer pubkey", payer_pubkey)?;
+    let digest = fee_payment_digest(payment_proof)?;
+    let fee = session.arbitration_fee_flat_sats as i64;
+    let mut draft = LedgerEntryDraft::new(
+        format!("escrow:{}:arbitration-fee", session.escrow_id),
+        now_ms,
+        ESCROW_STRATEGY,
+        LedgerEntryKind::Fee,
+    );
+    draft.postings = vec![
+        LedgerPosting::sats(
+            LedgerAccount::MarketParticipant {
+                role: "requester".into(),
+                participant: payer_pubkey.to_string(),
+            },
+            -fee,
+        ),
+        LedgerPosting::sats(
+            LedgerAccount::MarketParticipant {
+                role: "provider".into(),
+                participant: session.arbitrator_pubkey.clone(),
+            },
+            fee,
+        ),
+    ];
+    draft.metadata = json!({
+        "schema": ESCROW_LEDGER_SCHEMA,
+        "escrow_id": session.escrow_id,
+        "purpose": "arbitration_fee",
+        "fee_payment_digest": digest,
+        "fee_amount_sats": session.arbitration_fee_flat_sats,
+        "paid_by_pubkey": payer_pubkey,
+    });
+    ledger.append(draft).context("append arbitration Fee entry")?;
+    Ok(digest)
+}
+
+/// Honest gate: real signet invoice minting for arbitration fees is disabled
+/// unless the demo operator opts in explicitly. Called BEFORE any sidecar
+/// contact, so the default posture cannot touch funds.
+pub fn ensure_live_fees_allowed(allow_live_mint: bool) -> Result<()> {
+    if !allow_live_mint {
+        bail!(
+            "arbitration fee minting is gated for the demo (no real signet invoice); \
+             set {ARBITRATION_LIVE_FEES_ENVIRONMENT_VARIABLE}=1 to opt in"
+        );
+    }
+    Ok(())
+}
+
+/// Convenience reader for the demo opt-in.
+pub fn arbitration_live_fees_enabled() -> bool {
+    std::env::var(ARBITRATION_LIVE_FEES_ENVIRONMENT_VARIABLE).as_deref() == Ok("1")
+}
+
+/// The full pay-first escalation, wired end-to-end: mandate-gate the fee on
+/// the sovereign-wallet venue, mint + pay the flat-fee invoice through the
+/// sidecar, append the balanced `Fee` entry, then admit the human queue by
+/// appending `ArbitrationRequested`. The invoice mint is GATED: without the
+/// explicit opt-in this refuses before any sidecar contact (the demo proves
+/// the wiring, not a real payment).
+#[allow(dead_code)] // wired into the dashboard escalation seam (WP-5b)
+pub async fn pay_arbitration_fee_and_request_arbitration(
+    supervisor: &mut sovereign_wallet::SovereignWalletSupervisor,
+    ledger: &LedgerStore,
+    mandates: &MandateStore,
+    session: &mut EscrowSession,
+    escalator_pubkey: &str,
+    idempotency_key: &str,
+    allow_live_mint: bool,
+    now_ms: i64,
+) -> Result<()> {
+    ensure_live_fees_allowed(allow_live_mint)?;
+    let fee_sats = session.arbitration_fee_flat_sats;
+    // The fee is a wallet payment: the sovereign-wallet venue's principal
+    // mandate gates it (SEC-2026-043), separately from the escrow mandate.
+    match sovereign_wallet::authorize_sovereign_spend(
+        mandates,
+        fee_sats,
+        Some(escalator_pubkey),
+        now_ms,
+    )? {
+        MandateDecision::Authorized { .. } => {}
+        MandateDecision::Refused { reason, .. } => {
+            bail!("arbitration fee payment refused by the wallet mandate: {reason:?}")
+        }
+    }
+    let invoice = supervisor
+        .make_invoice(fee_sats, "arbitration fee", idempotency_key)
+        .await
+        .map_err(|error| anyhow::anyhow!("arbitration fee invoice mint failed: {error}"))?;
+    let paid = supervisor
+        .pay_invoice(&invoice.invoice, idempotency_key)
+        .await
+        .map_err(|error| anyhow::anyhow!("arbitration fee payment failed: {error}"))?;
+    let proof = paid
+        .preimage
+        .filter(|preimage| !preimage.is_empty())
+        .context("arbitration fee payment returned no preimage proof")?;
+    let digest = record_fee_payment(ledger, session, escalator_pubkey, &proof, now_ms)?;
+    session.request_arbitration(ledger, escalator_pubkey, digest, now_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,5 +1173,145 @@ mod tests {
         .expect("write");
         assert!(EscrowSession::load(&bad_path).is_err());
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // ----- Slice B: receipt digest gate + pay-first fee flow -----
+
+    fn receipt_event(content: &str) -> ReceiptEventProjection {
+        ReceiptEventProjection {
+            id: format!("{:0>64}", "aa"),
+            pubkey: AGENT.to_string(),
+            kind: 39603,
+            created_at: 1_770_000_000,
+            tags: vec![vec!["e".to_string(), format!("{:0>64}", "bb")]],
+            content: content.to_string(),
+            sig: format!("{:0>128}", "cc"),
+        }
+    }
+
+    #[test]
+    fn receipt_digest_is_deterministic_and_refuses_tampered_events() {
+        let event = receipt_event("delivery receipt v1");
+        let first = canonical_receipt_digest(&event).expect("digest");
+        let second = canonical_receipt_digest(&event).expect("digest");
+        assert_eq!(first, second, "same event bytes -> same digest");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        let mut tampered = event.clone();
+        tampered.content = "delivery receipt v2".to_string();
+        let tampered_digest = canonical_receipt_digest(&tampered).expect("digest");
+        assert_ne!(first, tampered_digest, "changed bytes -> changed digest");
+
+        let mut bad = event;
+        bad.id = "not-hex".to_string();
+        assert!(canonical_receipt_digest(&bad).is_err());
+    }
+
+    #[test]
+    fn verify_receipt_claim_drives_the_transition_from_the_real_projection() {
+        let (ledger, _mandates, mut session) = opened();
+        session.await_delivery().expect("await");
+
+        let event = receipt_event("delivery receipt v1");
+        let claimed = canonical_receipt_digest(&event).expect("digest");
+        session.submit_receipt(claimed).expect("submit");
+
+        // The honest re-derivation passes the gate.
+        let state = verify_receipt_claim(&mut session, &event).expect("verify");
+        assert_eq!(state, EscrowState::VerifiedPass);
+        session.release(&ledger, CUSTOMER, NOW + 1).expect("release");
+        assert_eq!(session.state, EscrowState::Released);
+
+        // A different (tampered) event fails the gate and stays in limbo.
+        let (ledger, _mandates, mut session) = opened();
+        session.await_delivery().expect("await");
+        let claimed = canonical_receipt_digest(&event).expect("digest");
+        session.submit_receipt(claimed).expect("submit");
+        let mut forged = event.clone();
+        forged.content = "forged delivery".to_string();
+        let state = verify_receipt_claim(&mut session, &forged).expect("verify");
+        assert_eq!(state, EscrowState::VerifiedFail);
+        assert_eq!(session.state, EscrowState::VerifiedFail);
+    }
+
+    #[test]
+    fn record_fee_payment_appends_a_balanced_fee_entry_and_persists_only_the_digest() {
+        let (ledger, _mandates, session) = opened();
+        let proof = "synthetic-payment-preimage-never-persisted";
+        let digest =
+            record_fee_payment(&ledger, &session, CUSTOMER, proof, NOW + 1).expect("fee entry");
+
+        assert_eq!(digest, fee_payment_digest(proof).expect("digest"));
+        let fee_entry = ledger
+            .entries(&trading_ledger::LedgerQuery::default())
+            .expect("entries")
+            .into_iter()
+            .find(|entry| matches!(entry.kind, LedgerEntryKind::Fee))
+            .expect("fee entry");
+        assert_eq!(fee_entry.postings.iter().map(|p| p.amount).sum::<i64>(), 0);
+        assert_eq!(fee_entry.postings.len(), 2);
+        let arbitrator = fee_entry
+            .postings
+            .iter()
+            .find(|p| {
+                matches!(&p.account,
+                    LedgerAccount::MarketParticipant { role, participant }
+                        if role == "provider" && participant == ARBITRATOR)
+            })
+            .expect("arbitrator fee posting");
+        assert_eq!(arbitrator.amount, FEE as i64);
+        assert_eq!(fee_entry.metadata["fee_payment_digest"], Value::String(digest));
+        // SEC-2026-088: the proof itself never persists — digest only.
+        let keys: Vec<String> = fee_entry
+            .metadata
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            keys.iter().all(|key| !key.to_ascii_lowercase().contains("preimage")),
+            "fee metadata must stay digest-only: {keys:?}"
+        );
+        ledger.verify().expect("verify");
+    }
+
+    #[test]
+    fn pay_first_composition_links_the_fee_entry_to_the_arbitration_request() {
+        let (ledger, _mandates, mut session) = opened();
+        session.await_delivery().expect("await");
+        let digest = record_fee_payment(&ledger, &session, CUSTOMER, "proof-1", NOW + 1)
+            .expect("fee entry");
+        session
+            .request_arbitration(&ledger, CUSTOMER, digest.clone(), NOW + 2)
+            .expect("arbitration admitted after the fee");
+        let entries = ledger
+            .entries(&trading_ledger::LedgerQuery::default())
+            .expect("entries");
+        let fee = entries
+            .iter()
+            .find(|entry| matches!(entry.kind, LedgerEntryKind::Fee))
+            .expect("fee entry");
+        let requested = entries
+            .iter()
+            .find(|entry| matches!(entry.kind, LedgerEntryKind::ArbitrationRequested))
+            .expect("requested entry");
+        assert_eq!(
+            fee.metadata["fee_payment_digest"],
+            requested.metadata["fee_payment_digest"],
+            "the request references the paid fee entry"
+        );
+        // Ledger order: the Fee entry (pay-first) precedes the request.
+        assert!(fee.sequence < requested.sequence);
+        ledger.verify().expect("verify");
+    }
+
+    #[test]
+    fn live_fee_mint_is_gated_off_by_default() {
+        let error = ensure_live_fees_allowed(false).expect_err("gated by default");
+        assert!(error.to_string().contains("gated for the demo"));
+        assert!(ensure_live_fees_allowed(true).is_ok());
+        // The default env-gated reader is off in tests (variable unset).
+        assert!(!arbitration_live_fees_enabled());
     }
 }

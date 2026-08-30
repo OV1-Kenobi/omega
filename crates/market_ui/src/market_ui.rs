@@ -46,8 +46,11 @@ pub use discovery::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use escrow::{
-    AUTOMATED_RELEASE_FEE_SATS, ESCROW_LEDGER_SCHEMA, ESCROW_SESSION_SCHEMA, ESCROW_STORE_DIRECTORY,
-    ESCROW_STRATEGY, EscrowOpenParams, EscrowSession, EscrowState,
+    ARBITRATION_LIVE_FEES_ENVIRONMENT_VARIABLE, AUTOMATED_RELEASE_FEE_SATS, ESCROW_LEDGER_SCHEMA,
+    ESCROW_SESSION_SCHEMA, ESCROW_STORE_DIRECTORY, ESCROW_STRATEGY, EscrowOpenParams,
+    EscrowSession, EscrowState, ReceiptEventProjection, arbitration_live_fees_enabled,
+    canonical_receipt_digest, ensure_live_fees_allowed, fee_payment_digest, record_fee_payment,
+    verify_receipt_claim,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use nautilus_live::{
