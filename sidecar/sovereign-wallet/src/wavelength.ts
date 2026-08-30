@@ -49,6 +49,20 @@ export interface StatusResponse {
   pending_count: number;
 }
 
+/**
+ * OMEGA-DELTA-0285 / SEC-2026-087 (WP-4b timeout observation): the waved
+ * getinfo surface, probed over the same REST gateway as WalletService. The
+ * Phase 2 implementation recorded that getinfo is gRPC-only on the pinned
+ * waved build (main.ts wallet-created marker note), so this probe is expected
+ * to answer UNIMPLEMENTED/404 there — it fails closed with
+ * WAVED_HEIGHT_UNAVAILABLE instead of inventing a height. [REQUIRES
+ * VERIFICATION: the live waved getinfo REST shape is confirmed at the staged
+ * operator step; only `block_height` is accepted, never guessed.]
+ */
+export interface GetInfoHeightResponse {
+  block_height: number | string;
+}
+
 // proto3 JSON encodes int64/uint64 fields as strings (api/rest.md); all sat
 // fields below are strings on the wire and are passed through uncoerced.
 export interface BalanceResponse {
@@ -272,6 +286,41 @@ export class WavelengthClient {
   async status(): Promise<StatusResponse> {
     const result = (await this.#call("status", {})) as StatusResponse;
     return result;
+  }
+
+  /**
+   * The waved getinfo height probe (WP-4b timeout observation, SEC-2026-087).
+   * POSTs the getinfo surface on the same grpc-gateway as WalletService and
+   * accepts ONLY a numeric `block_height` field. Any other answer — 404,
+   * UNIMPLEMENTED, or an unparseable body — is a typed
+   * WAVED_HEIGHT_UNAVAILABLE error, never a guessed height (the timeout gate
+   * must fail closed; the tip never comes from wall-clock).
+   */
+  async getInfoHeight(): Promise<number> {
+    let result: unknown;
+    try {
+      result = await this.#call("getinfo", {});
+    } catch (error) {
+      throw new WavedErrorImpl(
+        errorEnvelope("WAVED_HEIGHT_UNAVAILABLE", `waved getinfo height unavailable: ${redact(error instanceof Error ? error.message : String(error))}`, {
+          details: "the getinfo surface is gRPC-only on the pinned waved build (Phase 2 record)",
+          retryable: true,
+          remediation: "confirm the live waved getinfo REST shape at the staged operator step (amendment 09-06)",
+        }),
+      );
+    }
+    const height = (result as Partial<GetInfoHeightResponse> | null)?.block_height;
+    const parsed = typeof height === "number" ? height : typeof height === "string" ? Number(height) : NaN;
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+      throw new WavedErrorImpl(
+        errorEnvelope("WAVED_HEIGHT_UNAVAILABLE", "waved getinfo did not answer a usable block_height field", {
+          details: "only a numeric block_height is accepted; the shape is never guessed",
+          retryable: true,
+          remediation: "confirm the live waved getinfo REST shape at the staged operator step (amendment 09-06)",
+        }),
+      );
+    }
+    return parsed;
   }
 
   async createWallet(walletPassword: string): Promise<CreateResponse> {

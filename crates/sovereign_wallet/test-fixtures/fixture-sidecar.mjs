@@ -2,12 +2,16 @@
 // Speaks the framed protocol (openagents.omega.sovereign-wallet.v1) over
 // stdio. The reported network comes from `--network=<name>` (per-instance
 // arg, so parallel tests never race on env) with FIXTURE_NETWORK as a
-// fallback.
+// fallback. `--no-wallet-height` makes the WP-4b wallet-height probe fail
+// closed with WAVED_HEIGHT_UNAVAILABLE (test-only knob).
 
 import fs from "node:fs";
 
 const argNetwork = process.argv.find((arg) => arg.startsWith("--network="));
 const FIXTURE_NETWORK = argNetwork ? argNetwork.slice("--network=".length) : (process.env.FIXTURE_NETWORK ?? "signet");
+// WP-4b test knob: --no-wallet-height disables the fixture's height answer so
+// the typed WAVED_HEIGHT_UNAVAILABLE path is observable from Rust tests.
+const FIXTURE_NO_WALLET_HEIGHT = process.argv.includes("--no-wallet-height");
 
 const schema = "openagents.omega.sovereign-wallet.v1";
 let generation = 1;
@@ -124,6 +128,19 @@ process.stdin.on("data", (chunk) => {
           creditAvailableSat: "0",
           creditReservedSat: "0",
         });
+        break;
+      case "wallet-height":
+        if (FIXTURE_NO_WALLET_HEIGHT) {
+          respond(id, false, undefined, {
+            code: "WAVED_HEIGHT_UNAVAILABLE",
+            message: "waved getinfo height unavailable (fixture knob)",
+            details: "getinfo is gRPC-only on the pinned waved build (Phase 2 record)",
+            retryable: true,
+            remediation: "confirm the live waved getinfo REST shape at the staged operator step",
+          });
+          break;
+        }
+        respond(id, true, { blockHeight: 250000 });
         break;
       case "make-invoice":
         respond(id, true, {

@@ -3,7 +3,7 @@
 //! surface (api/rest.md + api/wallet/*) on 127.0.0.1:FAKE_WAVED_PORT
 //! (default 10031). Modes via env:
 //!   FAKE_WAVED_NETWORK  signet (default) | mainnet | regtest
-//!   FAKE_WAVED_MODE     normal | unimplemented | flaky
+//!   FAKE_WAVED_MODE     normal | unimplemented | flaky | no-getinfo
 //!   FAKE_WAVED_PORT     default 10031
 //!   FAKE_WAVED_DATA_ROOT  when set, writes <root>/wavelength/data/<network>/admin.macaroon
 //! It accepts the real waved launch args and ignores them (the sidecar spawns
@@ -77,6 +77,12 @@ const entry = (kind, status, amountSat) => ({
 const routes = {
   "/v1/wallet/status": () => statusBody(),
   "/v1/wallet/balance": () => statusBody().balance,
+  // WP-4b (SEC-2026-087): the getinfo height probe route. FAKE_WAVED_MODE
+  // "no-getinfo" omits it so the sidecar's WAVED_HEIGHT_UNAVAILABLE
+  // fail-closed path is testable end-to-end.
+  ...(mode === "no-getinfo"
+    ? {}
+    : { "/v1/wallet/getinfo": () => ({ block_height: 250000 }) }),
   "/v1/wallet/recv": () => ({ invoice: LNTCBS_INVOICE, entry: entry("ENTRY_KIND_RECV", "ENTRY_STATUS_PENDING", 10000) }),
   "/v1/wallet/prepare-send": () => ({
     send_intent_id: "intent-1",

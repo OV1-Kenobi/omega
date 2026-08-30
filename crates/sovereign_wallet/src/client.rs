@@ -4,8 +4,8 @@ use anyhow::{anyhow, Result};
 use serde_json::{Value, json};
 
 use crate::protocol::{
-    BalanceResult, CreateWalletResult, ErrorCode, ExportNostrSecretResult, IdentityStatusResult,
-    InvoiceResult, PayResult, StatusResult,
+    BalanceResult, BlockHeightResult, CreateWalletResult, ErrorCode, ExportNostrSecretResult,
+    IdentityStatusResult, InvoiceResult, PayResult, StatusResult,
 };
 use crate::supervisor::SovereignWalletSupervisor;
 
@@ -49,6 +49,16 @@ impl SovereignWalletSupervisor {
     pub async fn balance(&mut self) -> Result<BalanceResult, SovereignWalletError> {
         let result = self.request("balance", None, self.generation()).await?;
         decode(result, "balance result")
+    }
+
+    /// WP-4b (SEC-2026-087): the observed daemon tip height, probed through
+    /// the sidecar's `wallet-height` method (waved getinfo REST surface). The
+    /// canonical tip source for the escrow `timeout_at_height` gate; on
+    /// `WAVED_HEIGHT_UNAVAILABLE` no tip exists and the escrow caller must
+    /// fail closed (never wall-clock).
+    pub async fn wallet_height(&mut self) -> Result<BlockHeightResult, SovereignWalletError> {
+        let result = self.request("wallet-height", None, self.generation()).await?;
+        decode(result, "wallet-height result")
     }
 
     pub async fn create_wallet(

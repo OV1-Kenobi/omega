@@ -143,6 +143,48 @@ fn unsupported_runtime_network_is_refused() {
 }
 
 #[test]
+fn wallet_height_round_trips_the_observed_daemon_tip() {
+    // WP-4b (SEC-2026-087): the tip is read through the sidecar `wallet-height`
+    // seam. Daemon-level: answers while the wallet surface is still untouched.
+    smol::block_on(async {
+        let mut supervisor = make_supervisor("signet", fixture_command(&fixture_path()))
+            .expect("supervisor");
+        supervisor.start().await.context("initialize handshake").unwrap();
+        let height = supervisor.wallet_height().await.context("wallet height").unwrap();
+        assert_eq!(height.block_height, 250_000);
+        supervisor.stop().await.context("stop").unwrap();
+    });
+}
+
+#[test]
+fn wallet_height_unavailable_is_a_typed_fail_closed_error() {
+    // WP-4b (SEC-2026-087): when the waved build does not serve the REST
+    // getinfo surface (the pinned build's recorded posture), no tip exists —
+    // the typed error forces the escrow caller to fail closed instead of
+    // substituting wall-clock.
+    smol::block_on(async {
+        let command = {
+            let mut command = fixture_command(&fixture_path());
+            command.args.push("--no-wallet-height".to_owned());
+            command
+        };
+        let mut supervisor = make_supervisor("signet", command).expect("supervisor");
+        supervisor.start().await.context("initialize handshake").unwrap();
+        let error = supervisor
+            .wallet_height()
+            .await
+            .expect_err("the height probe must fail closed");
+        match error {
+            SovereignWalletError::Protocol { code, .. } => {
+                assert_eq!(code, crate::ErrorCode::WavedHeightUnavailable);
+            }
+            other => panic!("expected a typed WavedHeightUnavailable error, got: {other:?}"),
+        }
+        supervisor.stop().await.context("stop").unwrap();
+    });
+}
+
+#[test]
 fn protocol_error_mapping_is_typed() {
     smol::block_on(async {
         let mut supervisor = make_supervisor("signet", fixture_command(&fixture_path()))

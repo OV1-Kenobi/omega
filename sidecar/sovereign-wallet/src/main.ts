@@ -377,9 +377,10 @@ export class SidecarCore {
       protocolVersion: PROTOCOL_VERSION,
       serviceVersion: SERVICE_VERSION,
       generation: this.#generation,
-capabilities: [
+      capabilities: [
         "status",
         "balance",
+        "wallet-height",
         "create-wallet",
         "unlock",
         "lock",
@@ -415,6 +416,20 @@ capabilities: [
       creditAvailableSat: balance.credit_available_sat,
       creditReservedSat: balance.credit_reserved_sat,
     };
+  }
+
+  /**
+   * WP-4b (SEC-2026-087): the observed daemon tip height for the escrow
+   * HTLC-window gate. Daemon-level: no wallet-ready requirement (the tip is
+   * readable while the wallet is locked/syncing). Fails closed with
+   * WAVED_HEIGHT_UNAVAILABLE when the pinned build does not serve the REST
+   * getinfo surface — the escrow caller then renders a named unavailable
+   * state and never substitutes wall-clock.
+   */
+  async walletHeight(): Promise<Record<string, unknown>> {
+    this.#requireWaved();
+    const blockHeight = await this.#waved!.client.getInfoHeight();
+    return { blockHeight };
   }
 
 /** Operator-only: create the Wavelength wallet (never the agent channel). */
@@ -890,6 +905,10 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
         return this.statusProjection();
       case "balance":
         return this.balance();
+      case "wallet-height":
+        // WP-4b timeout observation (SEC-2026-087): the daemon-level block
+        // height probe. Read-only; needs the daemon, not an unlocked wallet.
+        return this.walletHeight();
       case "create-wallet":
         return this.createWallet(requireString(params, "idempotencyKey"), requireString(params, "password"));
       case "unlock":

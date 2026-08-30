@@ -36,6 +36,10 @@ pub enum ErrorCode {
     ExportAlreadyConsumed,
     WavedBinaryMissing,
     WavedWalletApiUnavailable,
+    /// WP-4b (SEC-2026-087): the waved getinfo height probe failed — the
+    /// pinned build serves getinfo gRPC-only, so no observed tip exists. The
+    /// escrow timeout gate fails closed on this (never wall-clock).
+    WavedHeightUnavailable,
     IncompatibleVersion,
     Internal,
 }
@@ -246,6 +250,18 @@ pub struct CreateWalletResult {
     pub vault_wallet_id: Option<String>,
     #[serde(default)]
     pub note: String,
+}
+
+/// WP-4b (SEC-2026-087): the observed daemon tip height, read through the
+/// sidecar's `wallet-height` probe of the waved getinfo surface. This is the
+/// ONLY sanctioned tip domain for the escrow `timeout_at_height` gate (the
+/// WP-3b decision: one source, cross-domain comparison refused). When the
+/// probe fails (`WAVED_HEIGHT_UNAVAILABLE`) no height exists and the escrow
+/// caller must fail closed — the tip never comes from wall-clock.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockHeightResult {
+    pub block_height: u32,
 }
 
 pub fn request_frame(id: impl Into<String>, generation: u64, method: &str, params: Option<Value>) -> RequestFrame {

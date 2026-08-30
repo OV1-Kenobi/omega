@@ -46,6 +46,7 @@ pattern).
 | `health` | host→sidecar | read | liveness + wallet state + waved connectivity (5 s cadence) | no |
 | `status` | host→sidecar | read | full read-only status projection | yes (read-only) |
 | `balance` | host→sidecar | read | unified balance in sats (WalletService.Balance) | yes (read-only) |
+| `wallet-height` | host→sidecar | read | WP-4b (SEC-2026-087): the observed daemon tip height (`{ blockHeight }`) for the escrow HTLC-window gate; probed over the waved REST getinfo surface and fails closed with `WAVED_HEIGHT_UNAVAILABLE` when the pinned build does not serve it (getinfo is gRPC-only there) | yes (read-only) |
 | `create-wallet` | host→sidecar | operator | creates the Wavelength wallet; returns the show-once aezeed | **no — operator only** |
 | `unlock` | host→sidecar | operator | unlocks with the vault-held password (vault is WP-4; WP-3 accepts the operator-supplied password and never persists it) | **no — operator only** |
 | `lock` | host→sidecar | operator | locks the wallet surface (vault idle-lock seam, WP-4) | no |
@@ -83,6 +84,7 @@ pattern).
 | `ALREADY_RUNNING` | data-root lock held | no |
 | `WAVED_BINARY_MISSING` | no pinned waved artifact configured | no |
 | `WAVED_WALLET_API_UNAVAILABLE` | waved build lacks WalletService (probe failed) | no |
+| `WAVED_HEIGHT_UNAVAILABLE` | WP-4b: the waved getinfo height probe failed (getinfo is gRPC-only on the pinned build); the tip is never guessed | yes |
 | `INCOMPATIBLE_VERSION` | schema/version mismatch | no |
 | `INTERNAL` | anything else | yes |
 

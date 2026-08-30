@@ -342,6 +342,30 @@ describe("protocol round-trip against fake waved", () => {
     }
   });
 
+  it("WP-4b (SEC-2026-087): wallet-height returns the observed daemon tip height", async () => {
+    const sidecar = spawnSidecar({});
+    try {
+      await sidecar.request("initialize");
+      // Daemon-level read: works while the wallet is still locked (no wallet
+      // created yet), because the tip does not depend on the wallet surface.
+      const height = expectOk(await sidecar.request("wallet-height"));
+      assert.equal(height.blockHeight, 250000);
+    } finally {
+      await sidecar.close();
+    }
+  });
+
+  it("WP-4b (SEC-2026-087): a waved without a REST getinfo surface fails closed with WAVED_HEIGHT_UNAVAILABLE", async () => {
+    const sidecar = spawnSidecar({ FAKE_WAVED_MODE: "no-getinfo" });
+    try {
+      await sidecar.request("initialize");
+      const refused = expectError(await sidecar.request("wallet-height"));
+      assert.equal(refused.code, "WAVED_HEIGHT_UNAVAILABLE");
+    } finally {
+      await sidecar.close();
+    }
+  });
+
   it("mainnet env is refused at startup (D4)", async () => {
     const sidecar = spawnSidecar({ OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet" });
     const exitCode = await waitForExit(sidecar.child);

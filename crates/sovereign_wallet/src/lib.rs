@@ -28,9 +28,9 @@ pub use mandate::{
     sovereign_wallet_mandate_candidate,
 };
 pub use protocol::{
-    BalanceResult, CreateWalletResult, ErrorCode, ExportNostrSecretResult, HealthResult,
-    IdentityStatusResult, InitializeResult, InvoiceResult, PayResult, PROTOCOL_SCHEMA,
-    PROTOCOL_VERSION, SERVICE_VERSION, StatusResult, WalletState,
+    BalanceResult, BlockHeightResult, CreateWalletResult, ErrorCode, ExportNostrSecretResult,
+    HealthResult, IdentityStatusResult, InitializeResult, InvoiceResult, PayResult,
+    PROTOCOL_SCHEMA, PROTOCOL_VERSION, SERVICE_VERSION, StatusResult, WalletState,
 };
 pub use supervisor::{
     SovereignWalletCommand, SovereignWalletSupervisor, SovereignWalletSupervisorOptions,
