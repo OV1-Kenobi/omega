@@ -255,6 +255,7 @@ pub const ENFORCED_DELTAS: &[&str] = &[
     "OMEGA-DELTA-0282",
     "OMEGA-DELTA-0283",
     "OMEGA-DELTA-0284",
+    "OMEGA-DELTA-0285",
 ];
 
 /// OMEGA-DELTA-0284. The sidecar identity keygen module — the sidecar's
@@ -32285,6 +32286,102 @@ mod tests {
             "OMEGA-DELTA-0284: crates/agent_ui/src/effective_principal.rs no longer \
              states that the identity derives from the BIP-39 shared root at the \
              NIP-06 path (the superseding statement is missing)"
+        );
+    }
+
+    /// OMEGA-DELTA-0285. `mkt-swp-escrow` is a principal-only mandate venue
+    /// for the Phase 3b minimal arbitration demo — HTLC 2-of-3 limbo
+    /// (customer / agent / platform-arbitrator) with additive nullable escrow
+    /// fields and four escrow ledger kinds; the full MKT-SWP hardening (exit
+    /// packages, HTLC script re-derivation, covenant reserves, Sig4Sats
+    /// bonds) stays deferred per amendment 02b.
+    ///
+    /// This check inspects REAL repository state rather than a copy of it:
+    /// 1. the venue is principal-only by calling `is_principal_only_venue`
+    ///    (the escrow venue true, the sovereign-wallet precedent still true,
+    ///    and the legacy venue false as the control);
+    /// 2. the four additive escrow fields and the venue constant exist in the
+    ///    mandate source outside its test module, with the schema version
+    ///    still pinned at 2 (no bump was authorized for the demo);
+    /// 3. the four escrow ledger kinds exist in the ledger source outside its
+    ///    test module, with the ledger schema version still pinned at 3;
+    /// 4. the delta is listed in ENFORCED_DELTAS (the OMEGA_DELTAS.md row
+    ///    itself is guarded by `the_registry_and_the_checks_agree`).
+    #[test]
+    fn escrow_venue_and_ledger_kinds_are_registered() {
+        // 1. Principal-only venue, by calling the real gate.
+        assert!(
+            trading_mandate::is_principal_only_venue("mkt-swp-escrow"),
+            "OMEGA-DELTA-0285: the mkt-swp-escrow venue is no longer \
+             principal-only; the demo's escrow mandates must never fall back \
+             to a venue-wide authorization"
+        );
+        assert!(
+            trading_mandate::is_principal_only_venue("sovereign-wallet"),
+            "OMEGA-DELTA-0285: the sovereign-wallet precedent (SEC-2026-043) \
+             was disturbed while adding the escrow venue"
+        );
+        assert!(
+            !trading_mandate::is_principal_only_venue("lnmarkets"),
+            "OMEGA-DELTA-0285: the legacy lnmarkets venue must stay \
+             non-principal-only; the escrow regime must not leak onto it"
+        );
+
+        // 2. The mandate side: fields, venue constant, and the pinned schema
+        //    version.
+        let mandate_source_raw = read_repository_file(
+            "crates/trading_mandate/src/trading_mandate.rs",
+        );
+        let mandate_source = outside_the_tests(&mandate_source_raw);
+        for required in [
+            "MKT_SWP_ESCROW_VENUE",
+            "allow_escrow",
+            "max_escrow_sats",
+            "escrow_timeout_blocks",
+            "arbitration_fee_flat_sats",
+        ] {
+            assert!(
+                mandate_source.contains(required),
+                "OMEGA-DELTA-0285: the mandate source lost `{required}`; the \
+                 additive escrow fields and the venue constant must stay \
+                 present"
+            );
+        }
+        assert_eq!(
+            trading_mandate::MANDATE_SCHEMA_VERSION, 2,
+            "OMEGA-DELTA-0285: MANDATE_SCHEMA_VERSION moved without a \
+             delta-owning work package (OQ-WP5-1)"
+        );
+
+        // 3. The ledger side: the four kinds and the pinned schema version.
+        let ledger_source_raw = read_repository_file(
+            "crates/trading_ledger/src/trading_ledger.rs",
+        );
+        let ledger_source = outside_the_tests(&ledger_source_raw);
+        for required in [
+            "EscrowCreated",
+            "ArbitrationRequested",
+            "ArbitrationReleased",
+            "ArbitrationRefunded",
+        ] {
+            assert!(
+                ledger_source.contains(required),
+                "OMEGA-DELTA-0285: the ledger source lost the `{required}` \
+                 escrow kind; the demo's hash-chained projection must stay \
+                 complete"
+            );
+        }
+        assert_eq!(
+            trading_ledger::LEDGER_SCHEMA_VERSION, 3,
+            "OMEGA-DELTA-0285: LEDGER_SCHEMA_VERSION moved without a \
+             delta-owning work package"
+        );
+
+        // 4. ENFORCED_DELTAS membership.
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0285"),
+            "OMEGA-DELTA-0285: the delta is no longer listed in \
+             ENFORCED_DELTAS"
         );
     }
 }

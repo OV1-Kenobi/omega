@@ -73,6 +73,11 @@ fn entry_kind_label(kind: &LedgerEntryKind) -> &'static str {
         LedgerEntryKind::Withdrawal => "withdrawal",
         LedgerEntryKind::BalanceAdjustment => "adjustment",
         LedgerEntryKind::ReconciliationMismatch(_) => "reconciliation",
+        // OMEGA-DELTA-0285: the Phase 3b escrow kinds.
+        LedgerEntryKind::EscrowCreated => "escrow created",
+        LedgerEntryKind::ArbitrationRequested => "arbitration requested",
+        LedgerEntryKind::ArbitrationReleased => "arbitration released",
+        LedgerEntryKind::ArbitrationRefunded => "arbitration refunded",
     }
 }
 

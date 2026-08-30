@@ -265,6 +265,11 @@ pub(crate) fn demo_mandate() -> TradingMandate {
         allowed_strategies: BTreeSet::from(["funding_carry".into(), "threshold_swing".into()]),
         review_cadence: ReviewCadence::Interval { seconds: 900 },
         expires_at_ms: 1_786_500_000_000,
+        // OMEGA-DELTA-0285: the demo mandate carries no escrow mode.
+        allow_escrow: None,
+        max_escrow_sats: None,
+        escrow_timeout_blocks: None,
+        arbitration_fee_flat_sats: None,
     }
 }
 

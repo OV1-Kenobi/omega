@@ -334,6 +334,12 @@ impl LnMarketsSettingsPage {
             allowed_strategies,
             review_cadence,
             expires_at_ms: parse_editor(&self.mandate_expires_at, "mandate expiry", cx)?,
+            // OMEGA-DELTA-0285: the LN Markets editor does not author escrow
+            // mandates; escrow fields stay None (mode `none`).
+            allow_escrow: None,
+            max_escrow_sats: None,
+            escrow_timeout_blocks: None,
+            arbitration_fee_flat_sats: None,
         };
         mandate.validate()?;
         Ok(mandate)

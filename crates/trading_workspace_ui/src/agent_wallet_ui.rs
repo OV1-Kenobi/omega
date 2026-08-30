@@ -995,6 +995,11 @@ mod tests {
             allowed_strategies: ["OMEGA-TRIVIAL-001".to_owned()].into_iter().collect(),
             review_cadence: trading_mandate::ReviewCadence::Interval { seconds: 3_600 },
             expires_at_ms: 1,
+            // OMEGA-DELTA-0285: no escrow mode on this fixture.
+            allow_escrow: None,
+            max_escrow_sats: None,
+            escrow_timeout_blocks: None,
+            arbitration_fee_flat_sats: None,
         };
 
         prepare_testnet_mandate_renewal(&mut mandate, 10).expect("renewal candidate");
@@ -1032,6 +1037,11 @@ mod tests {
             allowed_strategies: ["legacy".to_owned()].into_iter().collect(),
             review_cadence: trading_mandate::ReviewCadence::Interval { seconds: 3_600 },
             expires_at_ms: 1,
+            // OMEGA-DELTA-0285: no escrow mode on this fixture.
+            allow_escrow: None,
+            max_escrow_sats: None,
+            escrow_timeout_blocks: None,
+            arbitration_fee_flat_sats: None,
         };
 
         prepare_testnet_soak_mandate(&mut mandate, 10).expect("soak candidate");

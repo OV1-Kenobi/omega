@@ -233,6 +233,33 @@ pub enum LedgerEntryKind {
     Withdrawal,
     BalanceAdjustment,
     ReconciliationMismatch(ReconciliationMismatch),
+    /// OMEGA-DELTA-0285 (Phase 3b minimal arbitration demo): the HTLC escrow
+    /// opened. Zero-posting intent (SEC-2026-084): the funds sit in HTLC
+    /// limbo — unsettled to customer, agent, and platform-arbitrator alike —
+    /// so the entry records the intent and the external HTLC lock by digest
+    /// (`hash_lock_digest`, `timeout_at_height`) instead of posting a custody
+    /// claim. Like `Order`, it carries no postings and moves no value here.
+    EscrowCreated,
+    /// OMEGA-DELTA-0285: human arbitration requested for an escrow, admitted
+    /// only after the flat fee was paid in advance. Zero-value, no postings
+    /// (SEC-2026-084): nothing settles here; `metadata.fee_payment_digest`
+    /// references the separate balanced `Fee` entry that gated the human
+    /// queue (pay-first invariant, SEC-2026-085).
+    ArbitrationRequested,
+    /// OMEGA-DELTA-0285: 2-of-3 released the escrow (automated
+    /// `VerifiedPass` gate or human decision). Requires balanced per-asset
+    /// postings (SEC-2026-084/085): the principal leaves the customer, the
+    /// agent is credited, and the flat arbitration fee reroutes to the
+    /// arbitrator — participant-to-participant postings, never a platform
+    /// custody claim over the unsettled principal.
+    ArbitrationReleased,
+    /// OMEGA-DELTA-0285: the escrow refunded — a 2-of-3 signed refund, or the
+    /// HTLC timeout expiry observed on the chosen transport and projected
+    /// here once `observed_height >= timeout_at_height` (SEC-2026-086; the
+    /// gating lives with the caller that observes the tip). Requires
+    /// balanced per-asset postings (SEC-2026-084), with the optional flat-fee
+    /// reroute deducted from the refund (SEC-2026-085).
+    ArbitrationRefunded,
 }
 
 impl LedgerEntryKind {
@@ -244,8 +271,33 @@ impl LedgerEntryKind {
                 | Self::Deposit
                 | Self::Withdrawal
                 | Self::BalanceAdjustment
+                // OMEGA-DELTA-0285 (SEC-2026-084): the two settlement kinds
+                // move value, so they sit in the same gating class as `Fee` —
+                // an empty postings list is refused. `EscrowCreated` and
+                // `ArbitrationRequested` are deliberately NOT on this list:
+                // they are zero-posting intent entries (the HTLC lock is
+                // external; no value moves and no custody is claimed).
+                | Self::ArbitrationReleased
+                | Self::ArbitrationRefunded
         )
     }
+}
+
+/// OMEGA-DELTA-0285 (SEC-2026-086/087): the HTLC window expiry the escrow
+/// entries carry. `timeout_at_height` is derived from the observed signet tip
+/// height plus the mandate's `escrow_timeout_blocks` — blocks observed, never
+/// wall-clock alone — with checked arithmetic so an absurd input fails closed
+/// instead of wrapping.
+///
+/// Tip source (one source, named): the demo HTLC is the signet LN HTLC that
+/// already lives in LND, so the canonical tip is LND's `GetInfo` block height,
+/// read through the existing sovereign-wallet sidecar seam. WP-4b wires that
+/// call; no alternative height domain may be compared against it (the
+/// cross-domain staleness rule carried from SEC-2026-079).
+pub fn escrow_timeout_at_height(observed_height: u32, escrow_timeout_blocks: u32) -> Result<u64> {
+    u64::from(observed_height)
+        .checked_add(u64::from(escrow_timeout_blocks))
+        .context("escrow timeout height overflowed")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -375,6 +427,24 @@ impl LedgerEntryDraft {
             if mismatch.difference != expected_difference {
                 bail!("reconciliation alert carries an invalid balance difference");
             }
+        }
+        // OMEGA-DELTA-0285 (SEC-2026-088): the escrow kinds carry digests and
+        // references only. The HTLC preimage never enters this ledger — it
+        // lives in the external HTLC holder — and neither do private keys or
+        // payment secrets, so any metadata key naming a preimage is refused
+        // at validation instead of being persisted.
+        if matches!(
+            self.kind,
+            LedgerEntryKind::EscrowCreated
+                | LedgerEntryKind::ArbitrationRequested
+                | LedgerEntryKind::ArbitrationReleased
+                | LedgerEntryKind::ArbitrationRefunded
+        ) && self.metadata.as_object().is_some_and(|object| {
+            object
+                .keys()
+                .any(|key| key.to_ascii_lowercase().contains("preimage"))
+        }) {
+            bail!("escrow ledger metadata must stay digest-only (no preimage field)");
         }
         if self.kind.requires_postings() && self.postings.is_empty() {
             bail!(
@@ -2556,5 +2626,308 @@ mod tests {
                 .to_string()
                 .contains("unknown role")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // OMEGA-DELTA-0285: Phase 3b minimal arbitration demo — the four escrow
+    // kinds. The posting shapes and the digest-only law proven here are the
+    // conditions the WP-1b security review attached (SEC-2026-084..088).
+    // -----------------------------------------------------------------------
+
+    const ESCROW_VENUE: &str = "mkt-swp-escrow";
+    const ESCROW_STRATEGY: &str = "escrow_create";
+    // Synthetic fixture digests (sha256 of public strings) — never a real
+    // preimage or key (SEC-2026-088).
+    const ESCROW_ID: &str =
+        "3f2a9c1e3f2a9c1e3f2a9c1e3f2a9c1e3f2a9c1e3f2a9c1e3f2a9c1e3f2a9c1e";
+    const HASH_LOCK_DIGEST: &str =
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+    const FEE_PAYMENT_DIGEST: &str =
+        "bbd57b1f0a1f0017d05b5e5f3ef30ba1e6b0e3c01e0e2fd0a0c1e1f0b4d3a2c9";
+
+    fn escrow_participant(seed: &str) -> String {
+        seed.repeat(32)
+    }
+
+    fn participant_posting(role: &str, participant: &str, amount: i64) -> LedgerPosting {
+        posting(
+            LedgerAccount::MarketParticipant {
+                role: role.into(),
+                participant: participant.into(),
+            },
+            amount,
+        )
+    }
+
+    fn escrow_created_draft() -> LedgerEntryDraft {
+        let mut draft = LedgerEntryDraft::new(
+            format!("escrow:{ESCROW_ID}:created"),
+            1,
+            ESCROW_STRATEGY,
+            LedgerEntryKind::EscrowCreated,
+        );
+        draft.metadata = json!({
+            "schema": "omega.escrow.v1",
+            "escrow_id": ESCROW_ID,
+            "principal_pubkey": escrow_participant("11"),
+            "counterparty_pubkey": escrow_participant("22"),
+            "amount_sats": 50_000_i64,
+            "hash_lock_digest": HASH_LOCK_DIGEST,
+            "timeout_blocks": 144,
+            "timeout_at_height": escrow_timeout_at_height(250_000, 144)
+                .expect("timeout height"),
+            "mode": "htlc_2of3",
+        });
+        draft
+    }
+
+    fn arbitration_requested_draft() -> LedgerEntryDraft {
+        let mut draft = LedgerEntryDraft::new(
+            format!("escrow:{ESCROW_ID}:arbitration-requested"),
+            2,
+            ESCROW_STRATEGY,
+            LedgerEntryKind::ArbitrationRequested,
+        );
+        draft.metadata = json!({
+            "schema": "omega.escrow.v1",
+            "escrow_id": ESCROW_ID,
+            "requested_by_pubkey": escrow_participant("11"),
+            "fee_payment_digest": FEE_PAYMENT_DIGEST,
+            "fee_amount_sats": 1_000_i64,
+            "requested_at_ms": 2_i64,
+        });
+        draft
+    }
+
+    fn arbitration_released_draft(at_ms: i64) -> LedgerEntryDraft {
+        let mut draft = LedgerEntryDraft::new(
+            format!("escrow:{ESCROW_ID}:released"),
+            at_ms,
+            ESCROW_STRATEGY,
+            LedgerEntryKind::ArbitrationReleased,
+        );
+        // SEC-2026-084/085 settlement shape: principal leaves the customer,
+        // the agent is credited the principal minus the flat fee, and the fee
+        // reroutes to the platform-arbitrator as a participant posting — all
+        // balanced per asset, with no platform custody posting anywhere.
+        draft.postings = vec![
+            participant_posting("requester", &escrow_participant("11"), -50_000),
+            participant_posting("provider", &escrow_participant("22"), 49_000),
+            participant_posting("provider", &escrow_participant("33"), 1_000),
+        ];
+        draft.metadata = json!({
+            "schema": "omega.escrow.v1",
+            "escrow_id": ESCROW_ID,
+            "decision": "released",
+            "decided_by_pubkey": escrow_participant("33"),
+            "fee_rerouted_sats": 1_000_i64,
+        });
+        draft
+    }
+
+    fn arbitration_refunded_draft(at_ms: i64) -> LedgerEntryDraft {
+        let mut draft = LedgerEntryDraft::new(
+            format!("escrow:{ESCROW_ID}:refunded"),
+            at_ms,
+            ESCROW_STRATEGY,
+            LedgerEntryKind::ArbitrationRefunded,
+        );
+        // SEC-2026-086 refund shape: the principal returns to the customer
+        // with the flat fee reroute deducted from the refund.
+        draft.postings = vec![
+            participant_posting("provider", &escrow_participant("22"), -50_000),
+            participant_posting("requester", &escrow_participant("11"), 49_000),
+            participant_posting("provider", &escrow_participant("33"), 1_000),
+        ];
+        draft.metadata = json!({
+            "schema": "omega.escrow.v1",
+            "escrow_id": ESCROW_ID,
+            "decision": "refunded",
+            "decided_by_pubkey": escrow_participant("33"),
+            "fee_rerouted_sats": 1_000_i64,
+            "reason_code": "human_decision",
+        });
+        draft
+    }
+
+    #[test]
+    fn escrow_created_is_a_zero_posting_intent_entry() {
+        // SEC-2026-084 posting-shape map: the limbo intents carry no postings
+        // (the HTLC lock is external and no custody is claimed); the two
+        // settlement kinds require balanced postings like `Fee`.
+        assert!(!LedgerEntryKind::EscrowCreated.requires_postings());
+        assert!(!LedgerEntryKind::ArbitrationRequested.requires_postings());
+        assert!(LedgerEntryKind::ArbitrationReleased.requires_postings());
+        assert!(LedgerEntryKind::ArbitrationRefunded.requires_postings());
+
+        let store = LedgerStore::in_memory().expect("store");
+        let entry = store
+            .append(escrow_created_draft())
+            .expect("zero-posting escrow intent");
+        assert!(entry.postings.is_empty());
+        assert_eq!(entry.metadata["schema"], "omega.escrow.v1");
+        assert_eq!(entry.metadata["mode"], "htlc_2of3");
+        assert_eq!(entry.metadata["amount_sats"], 50_000);
+        assert!(entry.metadata["hash_lock_digest"].is_string());
+        store.verify().expect("hash chain covers the new kind");
+        // The escrow venue balance never moves: no platform custody claim
+        // exists for the unsettled principal.
+        assert_eq!(store.venue_balance(ESCROW_VENUE).expect("balance"), 0);
+    }
+
+    #[test]
+    fn arbitration_requested_is_zero_value_and_references_the_fee() {
+        let store = LedgerStore::in_memory().expect("store");
+        let entry = store
+            .append(arbitration_requested_draft())
+            .expect("zero-value arbitration request");
+        assert!(entry.postings.is_empty());
+        assert_eq!(entry.metadata["fee_payment_digest"], FEE_PAYMENT_DIGEST);
+        assert_eq!(entry.metadata["fee_amount_sats"], 1_000);
+        store.verify().expect("verify");
+    }
+
+    #[test]
+    fn arbitration_released_posts_balanced_settlement_with_fee_reroute() {
+        let store = LedgerStore::in_memory().expect("store");
+        store.append(escrow_created_draft()).expect("created");
+        // A Released entry without its settlement postings is refused — the
+        // kind sits in the requires-postings class (SEC-2026-084).
+        let mut empty = arbitration_released_draft(2);
+        empty.postings.clear();
+        assert!(
+            store
+                .append(empty)
+                .expect_err("released requires postings")
+                .to_string()
+                .contains("requires double-entry postings")
+        );
+        let entry = store
+            .append(arbitration_released_draft(2))
+            .expect("released settlement");
+        // Balanced per asset; the flat fee reroutes to the arbitrator as a
+        // participant posting (SEC-2026-085); the escrow venue balance still
+        // never moved — no platform custody of the unsettled principal.
+        assert_eq!(entry.postings.iter().map(|p| p.amount).sum::<i64>(), 0);
+        let arbitrator = entry
+            .postings
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.account,
+                    LedgerAccount::MarketParticipant { role, participant }
+                        if role == "provider" && participant == &escrow_participant("33")
+                )
+            })
+            .expect("arbitrator fee reroute posting");
+        assert_eq!(arbitrator.amount, 1_000);
+        assert_eq!(store.venue_balance(ESCROW_VENUE).expect("balance"), 0);
+        store.verify().expect("verify");
+    }
+
+    #[test]
+    fn arbitration_refunded_returns_principal_to_the_customer() {
+        let store = LedgerStore::in_memory().expect("store");
+        store.append(escrow_created_draft()).expect("created");
+        let entry = store
+            .append(arbitration_refunded_draft(2))
+            .expect("refunded settlement");
+        assert_eq!(entry.postings.iter().map(|p| p.amount).sum::<i64>(), 0);
+        assert_eq!(entry.metadata["decision"], "refunded");
+        assert_eq!(store.venue_balance(ESCROW_VENUE).expect("balance"), 0);
+        store.verify().expect("verify");
+    }
+
+    #[test]
+    fn escrow_entries_carry_the_derived_timeout_height() {
+        // SEC-2026-086/087: timeout_at_height is the observed signet tip
+        // height plus the mandate window, in blocks with checked arithmetic —
+        // never wall-clock alone.
+        assert_eq!(
+            escrow_timeout_at_height(250_000, 144).expect("timeout height"),
+            250_144
+        );
+        assert_eq!(
+            escrow_timeout_at_height(u32::MAX, u32::MAX).expect("u64 headroom"),
+            8_589_934_590
+        );
+        let draft = escrow_created_draft();
+        assert_eq!(draft.metadata["timeout_blocks"], 144);
+        assert_eq!(draft.metadata["timeout_at_height"], 250_144);
+    }
+
+    #[test]
+    fn escrow_replay_is_idempotent_and_conflicting_bytes_abort_the_group() {
+        let store = LedgerStore::in_memory().expect("store");
+        let group = vec![escrow_created_draft(), arbitration_requested_draft()];
+        let first = store.append_batch(group.clone()).expect("first batch");
+        let replay = store.append_batch(group).expect("exact replay");
+        assert_eq!(replay, first);
+        assert_eq!(first.len(), 2);
+
+        // A conflicting member (same event id, different bytes — the
+        // SEC-2026-086 `escrow:<id>:refunded` shape) rolls back the whole
+        // group, including the fresh entry appended beside it.
+        let refund = arbitration_refunded_draft(2);
+        store.append(refund.clone()).expect("refunded recorded");
+        let mut conflicting_refund = refund;
+        conflicting_refund.occurred_at_ms = 3;
+        let grown = vec![escrow_created_draft(), conflicting_refund];
+        assert!(
+            store
+                .append_batch(grown)
+                .expect_err("conflicting member rolls back the group")
+                .to_string()
+                .contains("different content")
+        );
+        assert_eq!(
+            store
+                .entries(&LedgerQuery::default())
+                .expect("entries after rollback")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn escrow_metadata_is_digest_only_and_refuses_a_preimage_field() {
+        // SEC-2026-088: no preimage field on any escrow draft — refused at
+        // validation, never persisted.
+        let mut leaked = escrow_created_draft();
+        leaked.metadata["preimage"] = json!("synthetic-refusal-fixture");
+        assert!(
+            leaked
+                .validate()
+                .expect_err("preimage metadata refused")
+                .to_string()
+                .contains("digest-only")
+        );
+        let mut smuggled = arbitration_released_draft(1);
+        smuggled.metadata["paymentPreimage"] = json!("also-refused");
+        assert!(smuggled.validate().is_err());
+
+        let store = LedgerStore::in_memory().expect("store");
+        for draft in [
+            escrow_created_draft(),
+            arbitration_requested_draft(),
+            arbitration_released_draft(2),
+            arbitration_refunded_draft(3),
+        ] {
+            store.append(draft).expect("sanctioned escrow entry");
+        }
+        for entry in store.entries(&LedgerQuery::default()).expect("entries") {
+            let keys = entry
+                .metadata
+                .as_object()
+                .expect("metadata object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(
+                keys.iter()
+                    .all(|key| !key.to_ascii_lowercase().contains("preimage")),
+                "escrow metadata must stay digest-only: {keys:?}"
+            );
+        }
     }
 }

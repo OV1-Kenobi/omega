@@ -557,6 +557,11 @@ mod tests {
                     allowed_strategies: BTreeSet::from(["rebalance_to_target".into()]),
                     review_cadence: ReviewCadence::Interval { seconds: 60 },
                     expires_at_ms: 200_000,
+                    // OMEGA-DELTA-0285: no escrow mode on this fixture.
+                    allow_escrow: None,
+                    max_escrow_sats: None,
+                    escrow_timeout_blocks: None,
+                    arbitration_fee_flat_sats: None,
                 }],
             },
             human_messages_during_window: 0,
@@ -739,6 +744,11 @@ mod tests {
             allowed_strategies: BTreeSet::from(["rebalance_to_target".into()]),
             review_cadence: ReviewCadence::Interval { seconds: 60 },
             expires_at_ms: ended_at_ms + 60 * 60 * 1_000,
+            // OMEGA-DELTA-0285: no escrow mode on this fixture.
+            allow_escrow: None,
+            max_escrow_sats: None,
+            escrow_timeout_blocks: None,
+            arbitration_fee_flat_sats: None,
         };
         let proposal = mandate_store.propose(mandate).expect("prepare mandate");
         let mandate = MandateStore::apply_ui_approved(&mandate_store, proposal, started_at_ms)

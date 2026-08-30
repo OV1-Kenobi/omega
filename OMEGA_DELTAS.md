@@ -11004,3 +11004,35 @@ vault) so one operator-held recovery artifact restores the whole sovereign
 surface.
 
 - **Enforced by:** `sovereign_identity_derives_from_bip39_nip06_root` in `omega_deltas`.
+
+### OMEGA-DELTA-0285 - The mkt-swp-escrow principal-only venue for the Phase 3b minimal arbitration demo
+
+Upstream Zed has no trading-mandate escrow surface. Omega registers
+`mkt-swp-escrow` as a principal-only mandate venue for the Phase 3b minimal
+arbitration demo: an HTLC 2-of-3 limbo (customer / agent /
+platform-arbitrator) where funds stay unsettled to all three parties for a
+bounded signet-block window (36..=432 blocks, 144 default) and the platform
+never holds the principal - the only custody event is the flat arbitration
+fee collected on a human decision, paid in advance before the human queue.
+
+`trading_mandate` gains four additive nullable fields (`allow_escrow`,
+`max_escrow_sats`, `escrow_timeout_blocks`, `arbitration_fee_flat_sats`),
+valid only on the escrow venue; an escrow-mode mandate must carry the
+complete set; turning escrow on widens through the existing settings-UI
+approval door, and the venue joins the SEC-2026-043 principal-only regime
+(no venue-wide fallback). `trading_ledger` gains four kinds -
+`EscrowCreated`/`ArbitrationRequested` (zero-posting intents; the HTLC lock
+is external and no custody is claimed) and
+`ArbitrationReleased`/`ArbitrationRefunded` (balanced participant-to-
+participant postings with the flat fee rerouted to the arbitrator) - all
+digest-only, with no preimage anywhere in the new metadata. The schema
+versions stay pinned (MANDATE_SCHEMA_VERSION 2, LEDGER_SCHEMA_VERSION 3);
+the full MKT-SWP hardening (exit packages, HTLC script re-derivation,
+covenant reserves, Sig4Sats bonds) remains deferred per amendment 02b.
+
+Why: founder-approved Phase 3b pivot (2026-08-27). The demo proves the
+minimal arbitration loop - limbo for the full HTLC window, free automated
+release on a verified receipt, pay-first human escalation - without
+re-deriving the preserved hardening design.
+
+- **Enforced by:** `escrow_venue_and_ledger_kinds_are_registered` in `omega_deltas`.

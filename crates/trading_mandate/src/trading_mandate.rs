@@ -24,6 +24,22 @@ pub const LEGACY_VENUE: &str = "lnmarkets";
 /// `authorize` never falls back to a venue-wide mandate on this venue.
 pub const SOVEREIGN_WALLET_VENUE: &str = "sovereign-wallet";
 
+/// The MKT-SWP escrow venue for the Phase 3b minimal arbitration demo
+/// (OMEGA-DELTA-0285): HTLC 2-of-3 limbo (customer / agent /
+/// platform-arbitrator) where the platform never has custody of the
+/// principal — the only custody event is the arbitration fee collected on a
+/// human decision. Following the sovereign-wallet precedent (SEC-2026-043),
+/// this venue is principal-only: every mandate for it MUST carry
+/// `principal_pubkey` (64-hex), the widening door refuses a venue-wide
+/// mandate, and `authorize` never falls back to one.
+pub const MKT_SWP_ESCROW_VENUE: &str = "mkt-swp-escrow";
+
+/// OMEGA-DELTA-0285 (Phase 3b minimal arbitration demo): the escrow HTLC
+/// window, in signet blocks, is bounded to 36..=432 (the 144-block ~24h
+/// default sits in the middle; the mandate field is tunable per escrow).
+pub const MIN_ESCROW_TIMEOUT_BLOCKS: u32 = 36;
+pub const MAX_ESCROW_TIMEOUT_BLOCKS: u32 = 432;
+
 /// Mandate schema version stored in SQLite `user_version`. Version 1 stores
 /// held one implicit-venue revision chain; version 2 rows carry an explicit
 /// (venue, network) scope. The principal-keyed scope dimension (WP-5) is an
@@ -36,8 +52,11 @@ pub const MANDATE_SCHEMA_VERSION: i64 = 2;
 /// SEC-2026-043: the sovereign-wallet venue is principal-only. The venue-wide
 /// fallback never applies to it, so a principal-keyed spend requires an exact
 /// principal mandate even when a venue-wide mandate exists.
+/// OMEGA-DELTA-0285: `mkt-swp-escrow` joins the same principal-only regime
+/// for the minimal arbitration demo (same refusal shape, no venue-wide
+/// fallback, widening door refuses a missing `principal_pubkey`).
 pub fn is_principal_only_venue(venue: &str) -> bool {
-    venue == SOVEREIGN_WALLET_VENUE
+    venue == SOVEREIGN_WALLET_VENUE || venue == MKT_SWP_ESCROW_VENUE
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -109,6 +128,24 @@ pub struct TradingMandate {
     pub allowed_strategies: BTreeSet<String>,
     pub review_cadence: ReviewCadence,
     pub expires_at_ms: i64,
+    /// OMEGA-DELTA-0285 (Phase 3b minimal arbitration demo). The escrow mode:
+    /// `None`/`Some(false)` = mode `none` (no escrow); `Some(true)` = mode
+    /// `HTLC 2-of-3 automated arbitration`. Widening from false/absent to
+    /// true requires UI approval (`MandateChangeClass::Widening`); turning it
+    /// off is a `Restriction`. Additive nullable on MANDATE_SCHEMA_VERSION=2
+    /// (no version bump — pre-escrow rows decode to `None`).
+    pub allow_escrow: Option<bool>,
+    /// OMEGA-DELTA-0285. Per-escrow cap in sats: an escrow instruction whose
+    /// amount exceeds it is refused (`VenueBalanceLimit`). Must be present
+    /// and positive whenever `allow_escrow` is `Some(true)`.
+    pub max_escrow_sats: Option<u64>,
+    /// OMEGA-DELTA-0285. The HTLC window in signet blocks (default 144,
+    /// bounded 36..=432 when present). Widening when it increases.
+    pub escrow_timeout_blocks: Option<u32>,
+    /// OMEGA-DELTA-0285. The flat arbitration fee in sats, paid in advance by
+    /// the escalator before the human queue (automated receipts are free).
+    /// Must be present and positive whenever `allow_escrow` is `Some(true)`.
+    pub arbitration_fee_flat_sats: Option<u64>,
 }
 
 impl TradingMandate {
@@ -154,6 +191,48 @@ impl TradingMandate {
         self.review_cadence.validate()?;
         if self.expires_at_ms <= 0 {
             bail!("mandate expiry must be a positive timestamp");
+        }
+        self.validate_escrow_fields()?;
+        Ok(())
+    }
+
+    /// OMEGA-DELTA-0285 (Phase 3b minimal arbitration demo): the escrow-scoped
+    /// field contract. Escrow fields are only valid on the `mkt-swp-escrow`
+    /// venue; when present they must be in range; and an escrow-mode mandate
+    /// (`allow_escrow == Some(true)`) must carry the complete set — cap,
+    /// timeout window, and flat arbitration fee — so the demo's two modes are
+    /// the only representable shapes.
+    fn validate_escrow_fields(&self) -> Result<()> {
+        let carries_escrow_fields = self.allow_escrow.is_some()
+            || self.max_escrow_sats.is_some()
+            || self.escrow_timeout_blocks.is_some()
+            || self.arbitration_fee_flat_sats.is_some();
+        if carries_escrow_fields && self.venue != MKT_SWP_ESCROW_VENUE {
+            bail!(
+                "escrow fields are only valid on the {MKT_SWP_ESCROW_VENUE} venue (OMEGA-DELTA-0285)"
+            );
+        }
+        if self.max_escrow_sats == Some(0) {
+            bail!("mandate escrow limit must be positive when present");
+        }
+        if let Some(timeout_blocks) = self.escrow_timeout_blocks
+            && !(MIN_ESCROW_TIMEOUT_BLOCKS..=MAX_ESCROW_TIMEOUT_BLOCKS).contains(&timeout_blocks)
+        {
+            bail!(
+                "mandate escrow timeout must be from {MIN_ESCROW_TIMEOUT_BLOCKS} through {MAX_ESCROW_TIMEOUT_BLOCKS} signet blocks"
+            );
+        }
+        if self.arbitration_fee_flat_sats == Some(0) {
+            bail!("mandate arbitration fee must be positive when present");
+        }
+        if self.allow_escrow == Some(true)
+            && (self.max_escrow_sats.is_none()
+                || self.escrow_timeout_blocks.is_none()
+                || self.arbitration_fee_flat_sats.is_none())
+        {
+            bail!(
+                "an escrow mandate must carry max_escrow_sats, escrow_timeout_blocks, and arbitration_fee_flat_sats (OMEGA-DELTA-0285)"
+            );
         }
         Ok(())
     }
@@ -204,6 +283,22 @@ impl Serialize for TradingMandate {
             state.serialize_field("allowed_strategies", &self.allowed_strategies)?;
             state.serialize_field("review_cadence", &self.review_cadence)?;
             state.serialize_field("expires_at_ms", &self.expires_at_ms)?;
+            // OMEGA-DELTA-0285: the escrow fields ride the non-legacy shape
+            // only when present, so every pre-escrow row — legacy AND
+            // venue-scoped/principal-keyed — serializes byte-identically and
+            // its stored approval digest still verifies.
+            if self.allow_escrow.is_some() {
+                state.serialize_field("allow_escrow", &self.allow_escrow)?;
+            }
+            if self.max_escrow_sats.is_some() {
+                state.serialize_field("max_escrow_sats", &self.max_escrow_sats)?;
+            }
+            if self.escrow_timeout_blocks.is_some() {
+                state.serialize_field("escrow_timeout_blocks", &self.escrow_timeout_blocks)?;
+            }
+            if self.arbitration_fee_flat_sats.is_some() {
+                state.serialize_field("arbitration_fee_flat_sats", &self.arbitration_fee_flat_sats)?;
+            }
             state.end()
         }
     }
@@ -236,6 +331,16 @@ struct TradingMandateRepr {
     allowed_strategies: BTreeSet<String>,
     review_cadence: ReviewCadence,
     expires_at_ms: i64,
+    // OMEGA-DELTA-0285: pre-escrow rows carry no escrow fields; they decode
+    // to None (mode `none`), which is valid on every pre-existing venue.
+    #[serde(default)]
+    allow_escrow: Option<bool>,
+    #[serde(default)]
+    max_escrow_sats: Option<u64>,
+    #[serde(default)]
+    escrow_timeout_blocks: Option<u32>,
+    #[serde(default)]
+    arbitration_fee_flat_sats: Option<u64>,
 }
 
 impl From<TradingMandateRepr> for TradingMandate {
@@ -255,6 +360,10 @@ impl From<TradingMandateRepr> for TradingMandate {
             allowed_strategies: repr.allowed_strategies,
             review_cadence: repr.review_cadence,
             expires_at_ms: repr.expires_at_ms,
+            allow_escrow: repr.allow_escrow,
+            max_escrow_sats: repr.max_escrow_sats,
+            escrow_timeout_blocks: repr.escrow_timeout_blocks,
+            arbitration_fee_flat_sats: repr.arbitration_fee_flat_sats,
         }
     }
 }
@@ -740,6 +849,22 @@ impl MandateStore {
                 instruction_asset: instruction.collateral_asset.clone(),
             }));
         }
+        // OMEGA-DELTA-0285 (Phase 3b minimal arbitration demo): an escrow-mode
+        // mandate caps the per-escrow amount at `max_escrow_sats` (validate
+        // guarantees the cap is present whenever `allow_escrow` is true). The
+        // refusal reuses `VenueBalanceLimit` — the amendment's open question
+        // about a dedicated escrow refusal code stays open for the hardening
+        // WP; reusing the existing wire code keeps this change minimal.
+        if mandate.allow_escrow == Some(true)
+            && let Some(max_escrow_sats) = mandate.max_escrow_sats
+            && instruction.venue_balance_after > max_escrow_sats
+        {
+            return Ok(refused(MandateRefusal::VenueBalanceLimit {
+                asset: mandate.collateral_asset.clone(),
+                limit: max_escrow_sats,
+                requested: instruction.venue_balance_after,
+            }));
+        }
         if instruction.venue_balance_after > mandate.max_venue_balance {
             return Ok(refused(MandateRefusal::VenueBalanceLimit {
                 asset: mandate.collateral_asset.clone(),
@@ -825,11 +950,13 @@ fn scope_of(mandate: &TradingMandate) -> MandateScope {
 /// sovereign-wallet venue): a mandate for that venue without a
 /// `principal_pubkey` is refused by the widening door (`propose` →
 /// `apply_ui_approved`), so no venue-wide sovereign-wallet mandate can ever
-/// exist to fall back on.
+/// exist to fall back on. OMEGA-DELTA-0285: `mkt-swp-escrow` joins the same
+/// principal-only regime for the minimal arbitration demo.
 fn venue_policy_check(candidate: &TradingMandate) -> Result<()> {
     if is_principal_only_venue(&candidate.venue) && candidate.principal_pubkey.is_none() {
         bail!(
-            "the {SOVEREIGN_WALLET_VENUE} venue is principal-only; a mandate for it must carry principal_pubkey (SEC-2026-043)"
+            "the {} venue is principal-only; a mandate for it must carry principal_pubkey (SEC-2026-043)",
+            candidate.venue
         );
     }
     Ok(())
@@ -967,6 +1094,22 @@ fn classify_change(
         (ReviewCadence::FundingSettlement, ReviewCadence::FundingSettlement) => false,
         _ => true,
     };
+    // OMEGA-DELTA-0285: turning escrow mode on (false/absent → true) widens;
+    // turning it off restricts. With the mode unchanged, a growing escrow
+    // limit, a longer limbo window, or a larger rerouted arbitration fee
+    // widens (fail-closed: any ambiguous escrow change asks the approval
+    // door); shrinking any of them restricts.
+    let escrow_widens = match (current.allow_escrow, candidate.allow_escrow) {
+        (None | Some(false), Some(true)) => true,
+        (Some(true), None | Some(false)) => false,
+        _ => {
+            candidate.max_escrow_sats.unwrap_or(0) > current.max_escrow_sats.unwrap_or(0)
+                || candidate.escrow_timeout_blocks.unwrap_or(0)
+                    > current.escrow_timeout_blocks.unwrap_or(0)
+                || candidate.arbitration_fee_flat_sats.unwrap_or(0)
+                    > current.arbitration_fee_flat_sats.unwrap_or(0)
+        }
+    };
     let widens = candidate.venue != current.venue
         || candidate.network != current.network
         || candidate.collateral_asset != current.collateral_asset
@@ -981,6 +1124,7 @@ fn classify_change(
             .allowed_strategies
             .is_subset(&current.allowed_strategies)
         || cadence_widens
+        || escrow_widens
         || candidate.expires_at_ms > current.expires_at_ms;
     if widens {
         MandateChangeClass::Widening
@@ -1240,6 +1384,10 @@ mod tests {
             allowed_strategies: strategies(&["rebalance_to_target"]),
             review_cadence: ReviewCadence::FundingSettlement,
             expires_at_ms: 10_000,
+            allow_escrow: None,
+            max_escrow_sats: None,
+            escrow_timeout_blocks: None,
+            arbitration_fee_flat_sats: None,
         }
     }
 
@@ -1259,6 +1407,10 @@ mod tests {
             allowed_strategies: strategies(&["hl_funding_carry"]),
             review_cadence: ReviewCadence::Interval { seconds: 3_600 },
             expires_at_ms: 10_000,
+            allow_escrow: None,
+            max_escrow_sats: None,
+            escrow_timeout_blocks: None,
+            arbitration_fee_flat_sats: None,
         }
     }
 
@@ -1856,6 +2008,10 @@ mod tests {
             allowed_strategies: strategies(&["wallet_payment"]),
             review_cadence: ReviewCadence::Interval { seconds: 3_600 },
             expires_at_ms: 100_000,
+            allow_escrow: None,
+            max_escrow_sats: None,
+            escrow_timeout_blocks: None,
+            arbitration_fee_flat_sats: None,
         }
     }
 
@@ -2182,5 +2338,254 @@ mod tests {
         );
         let revisions = store.history().expect("history");
         assert_eq!(revisions[0].principal_pubkey, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // OMEGA-DELTA-0285: Phase 3b minimal arbitration demo — the
+    // principal-only `mkt-swp-escrow` venue and its four additive escrow
+    // fields (amendment 02b; SEC-2026-084..088 conditions).
+    // -----------------------------------------------------------------------
+
+    fn escrow_mandate(principal: &str) -> TradingMandate {
+        TradingMandate {
+            venue: MKT_SWP_ESCROW_VENUE.into(),
+            network: TradingNetwork::Signet,
+            principal_pubkey: Some(principal.into()),
+            collateral_asset: AssetId::sats(),
+            objective: "Phase 3b minimal arbitration demo escrow".into(),
+            max_venue_balance: 100_000,
+            max_position_usd: 1,
+            max_leverage: 1,
+            daily_loss_stop: 100_000,
+            max_orders_per_hour: 60,
+            min_liquidation_buffer_bps: 0,
+            allowed_strategies: strategies(&["escrow_create"]),
+            review_cadence: ReviewCadence::Interval { seconds: 3_600 },
+            expires_at_ms: 100_000,
+            allow_escrow: Some(true),
+            max_escrow_sats: Some(50_000),
+            escrow_timeout_blocks: Some(144),
+            arbitration_fee_flat_sats: Some(1_000),
+        }
+    }
+
+    fn escrow_instruction(amount_sat: u64) -> TradingInstruction {
+        TradingInstruction {
+            venue: MKT_SWP_ESCROW_VENUE.into(),
+            network: TradingNetwork::Signet,
+            strategy_id: "escrow_create".into(),
+            collateral_asset: AssetId::sats(),
+            venue_balance_after: amount_sat,
+            position_notional_usd: 0,
+            leverage: 1,
+            daily_realized_loss: 0,
+            orders_last_hour: 0,
+            liquidation_buffer_bps: 10_000,
+        }
+    }
+
+    #[test]
+    fn escrow_venue_is_principal_only_and_never_falls_back() {
+        let store = MandateStore::in_memory().expect("store");
+        // A venue-wide mandate for the escrow venue is refused at the widening
+        // door (the SEC-2026-043 refusal shape, generalized by 0285).
+        let mut venue_wide = escrow_mandate(AGENT_PUBKEY);
+        venue_wide.principal_pubkey = None;
+        let error = store
+            .propose(venue_wide)
+            .expect_err("a venue-wide escrow mandate must be refused");
+        assert!(
+            error.to_string().contains("principal-only"),
+            "expected the principal-only refusal, got: {error}"
+        );
+
+        // The principal-keyed escrow mandate is the only creatable shape.
+        let candidate = escrow_mandate(AGENT_PUBKEY);
+        let proposal = store.propose(candidate.clone()).expect("proposal");
+        store
+            .apply_ui_approved(proposal, 1)
+            .expect("approved escrow mandate");
+
+        // The exact principal escrow instruction is authorized.
+        assert_eq!(
+            store
+                .authorize(&escrow_instruction(10_000), Some(AGENT_PUBKEY), 2)
+                .expect("customer decision"),
+            MandateDecision::Authorized { revision: 1 }
+        );
+        // A different principal is refused even though the pair has a
+        // mandate for another principal.
+        assert_eq!(
+            store
+                .authorize(&escrow_instruction(10_000), Some(OTHER_PUBKEY), 2)
+                .expect("other principal decision"),
+            refused(MandateRefusal::PrincipalNotAuthorized {
+                principal: OTHER_PUBKEY.into(),
+            })
+        );
+        // No venue-wide fallback exists on this principal-only venue: a
+        // None-principal flow resolves to the absent venue-wide slot.
+        assert_eq!(
+            store
+                .authorize(&escrow_instruction(10_000), None, 2)
+                .expect("venue-wide flow"),
+            refused(MandateRefusal::Missing)
+        );
+    }
+
+    #[test]
+    fn escrow_fields_validate_and_only_exist_on_the_escrow_venue() {
+        // Timeout window bounds (36..=432 signet blocks).
+        for timeout_blocks in [35_u32, 0, 433] {
+            let mut candidate = escrow_mandate(AGENT_PUBKEY);
+            candidate.escrow_timeout_blocks = Some(timeout_blocks);
+            assert!(
+                candidate.validate().is_err(),
+                "timeout {timeout_blocks} must be refused"
+            );
+        }
+        for timeout_blocks in [36_u32, 144, 432] {
+            let mut candidate = escrow_mandate(AGENT_PUBKEY);
+            candidate.escrow_timeout_blocks = Some(timeout_blocks);
+            candidate.validate().expect("in-range timeout");
+        }
+        // Caps and fees must be positive when present.
+        let mut zero_cap = escrow_mandate(AGENT_PUBKEY);
+        zero_cap.max_escrow_sats = Some(0);
+        assert!(zero_cap.validate().is_err());
+        let mut zero_fee = escrow_mandate(AGENT_PUBKEY);
+        zero_fee.arbitration_fee_flat_sats = Some(0);
+        assert!(zero_fee.validate().is_err());
+        // An escrow-mode mandate must carry the complete set.
+        for (label, mut candidate) in [
+            (
+                "max_escrow_sats",
+                escrow_mandate(AGENT_PUBKEY),
+            ),
+            ("timeout", escrow_mandate(AGENT_PUBKEY)),
+            ("fee", escrow_mandate(AGENT_PUBKEY)),
+        ] {
+            match label {
+                "max_escrow_sats" => candidate.max_escrow_sats = None,
+                "timeout" => candidate.escrow_timeout_blocks = None,
+                _ => candidate.arbitration_fee_flat_sats = None,
+            }
+            assert!(
+                candidate.validate().is_err(),
+                "an escrow mandate without {label} must be refused"
+            );
+        }
+        // Escrow fields are only valid on the escrow venue.
+        let mut legacy = mandate();
+        legacy.allow_escrow = Some(false);
+        assert!(
+            legacy.validate().is_err(),
+            "escrow fields on a non-escrow venue must be refused"
+        );
+        let mut wallet = principal_mandate(
+            SOVEREIGN_WALLET_VENUE,
+            TradingNetwork::Signet,
+            AGENT_PUBKEY,
+        );
+        wallet.allow_escrow = Some(true);
+        assert!(
+            wallet.validate().is_err(),
+            "escrow fields on the sovereign-wallet venue must be refused"
+        );
+    }
+
+    #[test]
+    fn escrow_mode_changes_classify_as_widening_or_restriction() {
+        let store = MandateStore::in_memory().expect("store");
+        // Mode `none` first: the escrow venue mandate without escrow enabled.
+        let mut mode_off = escrow_mandate(AGENT_PUBKEY);
+        mode_off.allow_escrow = Some(false);
+        mode_off.max_escrow_sats = None;
+        mode_off.escrow_timeout_blocks = None;
+        mode_off.arbitration_fee_flat_sats = None;
+        let proposal = store.propose(mode_off.clone()).expect("creation");
+        store.apply_ui_approved(proposal, 1).expect("approved");
+
+        // off -> on widens through the approval door.
+        let mode_on = escrow_mandate(AGENT_PUBKEY);
+        let proposal = store.propose(mode_on.clone()).expect("widening proposal");
+        assert_eq!(proposal.change_class(), MandateChangeClass::Widening);
+        assert!(store.save_restriction(proposal, 2).is_err());
+        store.apply_ui_approved(store.propose(mode_on.clone()).expect("proposal"), 2)
+            .expect("approved");
+
+        // With the mode unchanged, growing any escrow field widens.
+        let mut grow_cap = mode_on.clone();
+        grow_cap.max_escrow_sats = Some(60_000);
+        assert_eq!(
+            store.propose(grow_cap).expect("proposal").change_class(),
+            MandateChangeClass::Widening
+        );
+        let mut grow_window = mode_on.clone();
+        grow_window.escrow_timeout_blocks = Some(145);
+        assert_eq!(
+            store.propose(grow_window).expect("proposal").change_class(),
+            MandateChangeClass::Widening
+        );
+        let mut grow_fee = mode_on.clone();
+        grow_fee.arbitration_fee_flat_sats = Some(2_000);
+        assert_eq!(
+            store.propose(grow_fee).expect("proposal").change_class(),
+            MandateChangeClass::Widening
+        );
+
+        // Shrinking a field restricts without approval.
+        let mut shrink_cap = mode_on.clone();
+        shrink_cap.max_escrow_sats = Some(49_999);
+        let proposal = store.propose(shrink_cap).expect("restriction proposal");
+        assert_eq!(proposal.change_class(), MandateChangeClass::Restriction);
+        store.save_restriction(proposal, 3).expect("saved");
+
+        // on -> off restricts (append-only, no UI approval needed).
+        let mut mode_off_again = mode_on;
+        mode_off_again.allow_escrow = Some(false);
+        mode_off_again.max_escrow_sats = None;
+        mode_off_again.escrow_timeout_blocks = None;
+        mode_off_again.arbitration_fee_flat_sats = None;
+        let proposal = store
+            .propose(mode_off_again.clone())
+            .expect("restriction proposal");
+        assert_eq!(proposal.change_class(), MandateChangeClass::Restriction);
+        let snapshot = store.save_restriction(proposal, 4).expect("saved");
+        assert_eq!(
+            snapshot.mandate_for_principal(
+                MKT_SWP_ESCROW_VENUE,
+                TradingNetwork::Signet,
+                Some(AGENT_PUBKEY)
+            ),
+            Some(&mode_off_again)
+        );
+    }
+
+    #[test]
+    fn escrow_mandate_caps_the_per_escrow_amount() {
+        let store = MandateStore::in_memory().expect("store");
+        let candidate = escrow_mandate(AGENT_PUBKEY);
+        let proposal = store.propose(candidate).expect("proposal");
+        store.apply_ui_approved(proposal, 1).expect("approved");
+
+        // At the cap: authorized.
+        assert_eq!(
+            store
+                .authorize(&escrow_instruction(50_000), Some(AGENT_PUBKEY), 2)
+                .expect("cap boundary"),
+            MandateDecision::Authorized { revision: 1 }
+        );
+        // One sat over the per-escrow cap: refused with VenueBalanceLimit.
+        assert_eq!(
+            store
+                .authorize(&escrow_instruction(50_001), Some(AGENT_PUBKEY), 2)
+                .expect("over cap"),
+            refused(MandateRefusal::VenueBalanceLimit {
+                asset: AssetId::sats(),
+                limit: 50_000,
+                requested: 50_001,
+            })
+        );
     }
 }

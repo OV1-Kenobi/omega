@@ -42,3 +42,10 @@ scv.workspace = true
 # goes stale silently, which is the failure mode this whole crate exists for.
 # Another leaf: no gpui, no process, no filesystem.
 omega_zero_base.workspace = true
+
+# OMEGA-DELTA-0285. The escrow mandate venue and the escrow ledger kinds, so
+# the check calls `is_principal_only_venue` and reads the pinned schema
+# versions rather than scraping copies of them into this crate. Both are leaf
+# crates: no gpui, no process, no filesystem beyond their own stores.
+trading_ledger.workspace = true
+trading_mandate.workspace = true

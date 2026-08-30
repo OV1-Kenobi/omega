@@ -3627,6 +3627,11 @@ mod tests {
             allowed_strategies: BTreeSet::from([STRATEGY_ID.into()]),
             review_cadence: MandateReviewCadence::Interval { seconds: 3_600 },
             expires_at_ms: now.saturating_add(3_600_000),
+            // OMEGA-DELTA-0285: governance mandates carry no escrow mode.
+            allow_escrow: None,
+            max_escrow_sats: None,
+            escrow_timeout_blocks: None,
+            arbitration_fee_flat_sats: None,
         };
         let proposal = runtime.mandate.propose(mandate)?;
         trading_mandate::MandateStore::apply_ui_approved(&runtime.mandate, proposal, now)?;
@@ -4369,6 +4374,11 @@ mod tests {
             allowed_strategies: BTreeSet::from([STRATEGY_ID.into()]),
             review_cadence: MandateReviewCadence::Interval { seconds: 3_600 },
             expires_at_ms: now.saturating_add(600_000),
+            // OMEGA-DELTA-0285: governance mandates carry no escrow mode.
+            allow_escrow: None,
+            max_escrow_sats: None,
+            escrow_timeout_blocks: None,
+            arbitration_fee_flat_sats: None,
         };
         let proposal = runtime.mandate.propose(mandate)?;
         let approved =

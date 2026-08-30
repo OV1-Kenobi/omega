@@ -1221,6 +1221,11 @@ mod tests {
             allowed_strategies: BTreeSet::from(["funding_carry".into()]),
             review_cadence: ReviewCadence::Interval { seconds: 3_600 },
             expires_at_ms: 10_000,
+            // OMEGA-DELTA-0285: no escrow mode on this fixture.
+            allow_escrow: None,
+            max_escrow_sats: None,
+            escrow_timeout_blocks: None,
+            arbitration_fee_flat_sats: None,
         };
         let narrowed = narrowed_mandate(original.clone());
 
