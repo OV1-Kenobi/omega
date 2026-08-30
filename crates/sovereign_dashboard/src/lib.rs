@@ -56,6 +56,7 @@ use sovereign_wallet::{
     BalanceResult, IdentityStatusResult, InvoiceResult, SharedSovereignWalletSupervisor,
     StatusResult,
 };
+use trading_ledger::LedgerStore;
 use trading_mandate::{MandateSnapshot, MandateStore, TradingMandate, TradingNetwork};
 use ui::prelude::*;
 use ui::{CopyButton, MarketTokens, QrCodeCanvas};
@@ -301,6 +302,17 @@ pub struct SovereignDashboardPanel {
     plugins: PluginsView,
     /// WP-10: the real Link view (NIP-46 pairing ceremony + registry status).
     link: LinkView,
+    /// WP-5b: the persisted escrow sessions (HTLC 2-of-3 limbo, digest-only
+    /// state) loaded from the escrow store on refresh.
+    escrow_sessions: Vec<market_ui::EscrowSession>,
+    /// WP-5b: the observed signet tip for the timeout countdown (fail-closed
+    /// when the probe is unavailable — never wall-clock).
+    escrow_height: Option<u32>,
+    /// WP-5b: an escrow action error surfaced next to the section.
+    escrow_error: Option<SharedString>,
+    /// WP-5b: the ledger of record for escrow entries (same store the
+    /// trading surfaces use — no second ledger).
+    ledger_store: Option<LedgerStore>,
 }
 
 impl SovereignDashboardPanel {
@@ -335,6 +347,12 @@ impl SovereignDashboardPanel {
             mapping_server_id: None,
             plugins: PluginsView::default(),
             link: LinkView::default(),
+            escrow_sessions: Vec::new(),
+            escrow_height: None,
+            escrow_error: None,
+            ledger_store: LedgerStore::open_default()
+                .map_err(|error| log::error!("sovereign dashboard: {error:#}"))
+                .ok(),
         };
         panel.refresh(cx);
         panel
@@ -417,6 +435,14 @@ impl SovereignDashboardPanel {
             } else {
                 std::collections::HashMap::new()
             };
+            // WP-5b: the observed signet tip for the escrow timeout countdown.
+            // Fail-closed: when the probe fails the countdown shows the
+            // unavailable state and never substitutes wall-clock.
+            let escrow_height = if status.is_some() {
+                guard.wallet_height().await.ok().map(|result| result.block_height)
+            } else {
+                None
+            };
             this.update(cx, |this, cx| {
                 this.wallet.status = status;
                 this.wallet.balance = balance;
@@ -424,6 +450,9 @@ impl SovereignDashboardPanel {
                 this.identity.status = identity_status;
                 this.identity.identity_error = identity_error;
                 this.mcp_identity_map = mcp_identity_map;
+                this.escrow_height = escrow_height;
+                // WP-5b: reload the persisted escrow sessions (digest-only).
+                this.escrow_sessions = load_escrow_sessions();
                 if let Some(snapshot) = snapshot {
                     this.mandates.snapshot = Some(snapshot);
                 }
@@ -2911,6 +2940,271 @@ impl SovereignDashboardPanel {
             .into_any_element()
     }
 
+    // -----------------------------------------------------------------------
+    // Escrow section (WP-5b — real persisted sessions, honest limbo labels)
+    // -----------------------------------------------------------------------
+
+    fn escrow_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let body = if !self.escrow_sessions.is_empty() {
+            let rows: Vec<AnyElement> = self
+                .escrow_sessions
+                .iter()
+                .map(|session| self.escrow_row(session, cx))
+                .collect();
+            v_flex().w_full().gap_2().children(rows).into_any_element()
+        } else if let Some(error) = &self.escrow_error {
+            v_flex()
+                .child(
+                    Label::new("Escrow unavailable")
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                )
+                .child(Label::new(error.clone()).size(LabelSize::Small).color(Color::Muted))
+                .into_any_element()
+        } else {
+            v_flex()
+                .child(
+                    Label::new("No active escrows")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(
+                        "Escrows open through the market session flow (agent service delivery); \
+                         sessions appear here once persisted.",
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .into_any_element()
+        };
+
+        v_flex()
+            .w_full()
+            .gap_2()
+            .child(body)
+            // Honesty label (amendment 02b §3): the demo HTLC is external and
+            // simulated — the dashboard never claims on-chain settlement.
+            .child(
+                Label::new(
+                    "external signet LN HTLC — simulated limbo in demo; settlement authority \
+                     stays with Bitcoin/Lightning",
+                )
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+
+    fn escrow_row(&self, session: &market_ui::EscrowSession, cx: &mut Context<Self>) -> AnyElement {
+        let (state_label, state_color) = escrow_state_label(session.state);
+        let id_short: SharedString = format!(
+            "{}…{}",
+            &session.escrow_id[..session.escrow_id.len().min(8)],
+            &session.escrow_id[session.escrow_id.len().saturating_sub(4)..]
+        )
+        .into();
+
+        // Timeout countdown from the same observed tip the gate uses —
+        // fail-closed: no probe, no fabricated countdown.
+        let timeout_line: SharedString = match self.escrow_height {
+            Some(height) => {
+                let created_height = session.timeout_at_height.saturating_sub(session.timeout_blocks as u64);
+                let elapsed = height.saturating_sub(created_height as u32);
+                let remaining = session
+                    .timeout_at_height
+                    .saturating_sub(height as u64);
+                let fraction = if session.timeout_blocks == 0 {
+                    1.0
+                } else {
+                    elapsed as f64 / session.timeout_blocks as f64
+                };
+                let tone = if fraction >= 0.95 {
+                    "RED"
+                } else if fraction >= 0.75 {
+                    "amber"
+                } else {
+                    "ok"
+                };
+                format!(
+                    "HTLC window: {} blocks total · {} remaining (tip {}) [{tone}] · expires at height {}",
+                    session.timeout_blocks, remaining, height, session.timeout_at_height
+                )
+                .into()
+            }
+            None => format!(
+                "HTLC window: {} blocks · tip unavailable (countdown fail-closed) · expires at height {}",
+                session.timeout_blocks, session.timeout_at_height
+            )
+            .into(),
+        };
+
+        let receipt_line: SharedString = match (&session.state, &session.receipt_digest) {
+            (market_ui::EscrowState::ReceiptSubmitted, Some(digest))
+            | (market_ui::EscrowState::VerifiedFail, Some(digest)) => {
+                format!("receipt claim {}…{} (re-derivation pending/failed)", &digest[..8], &digest[digest.len() - 4..]).into()
+            }
+            (market_ui::EscrowState::VerifiedPass, Some(digest)) => {
+                format!("receipt verified {}…{}", &digest[..8], &digest[digest.len() - 4..]).into()
+            }
+            _ => "no receipt submitted".into(),
+        };
+
+        // Pay-first escalation (SEC-2026-085): reachable only from limbo
+        // states with an attempted delivery; the button carries the fee.
+        let escalation = matches!(
+            session.state,
+            market_ui::EscrowState::AwaitingDelivery | market_ui::EscrowState::VerifiedFail
+        );
+        let escalate_button = escalation.then(|| {
+            let escrow_id = session.escrow_id.clone();
+            Button::new(
+                SharedString::from(format!("escrow-escalate-{escrow_id}")),
+                format!(
+                    "Request Human Arbitration (pay {} sats first)",
+                    session.arbitration_fee_flat_sats
+                ),
+            )
+            .style(ButtonStyle::Subtle)
+            .tooltip(ui::Tooltip::text(
+                "Pays the flat arbitration fee in advance (pay-first), then admits the human queue",
+            ))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.request_arbitration(&escrow_id, window, cx);
+            }))
+        });
+
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .child(
+                        Label::new(format!("escrow {id_short} · {} sats", session.amount_sats))
+                            .size(LabelSize::Small),
+                    )
+                    .child(
+                        Label::new(state_label)
+                            .size(LabelSize::XSmall)
+                            .color(state_color),
+                    ),
+            )
+            .child(Label::new(timeout_line).size(LabelSize::XSmall).color(Color::Muted))
+            .child(Label::new(receipt_line).size(LabelSize::XSmall).color(Color::Muted))
+            .children(escalate_button.map(|button| {
+                h_flex().w_full().justify_end().child(button).into_any_element()
+            }))
+            .into_any_element()
+    }
+
+    /// WP-5b: the pay-first escalation. Gated exactly like the flow it calls:
+    /// without the demo opt-in the honest gate message surfaces and nothing
+    /// touches the sidecar; with the opt-in the flow mandate-gates the fee on
+    /// the sovereign-wallet venue, pays, appends the Fee + ArbitrationRequested
+    /// entries hash-chained (Fee first), and the session state advances.
+    fn request_arbitration(&mut self, escrow_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_index) = self
+            .escrow_sessions
+            .iter()
+            .position(|session| session.escrow_id == escrow_id)
+        else {
+            return;
+        };
+        let session = self.escrow_sessions[session_index].clone();
+        let Some(supervisor) = self.supervisor.clone() else {
+            self.escrow_error = Some("sidecar unavailable — the fee cannot be paid (fail closed)".into());
+            cx.notify();
+            return;
+        };
+        let Some(ledger) = self.ledger_store.clone() else {
+            self.escrow_error = Some("ledger of record unavailable — refusing to move escrow state".into());
+            cx.notify();
+            return;
+        };
+        let Some(mandates) = self.mandate_store.clone() else {
+            self.escrow_error = Some("mandate store unavailable — refusing to move escrow state".into());
+            cx.notify();
+            return;
+        };
+        let allow_live_mint = market_ui::arbitration_live_fees_enabled();
+        let escalator = session.principal_pubkey.clone();
+        let idempotency_key = self.next_idempotency_key();
+        let now_ms = command_center_ui::unix_now_ms();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!(
+                "Request human arbitration for escrow {}… (fee {} sats, paid first)?",
+                &escrow_id[..escrow_id.len().min(8)],
+                session.arbitration_fee_flat_sats
+            ),
+            Some(
+                "The fee is paid in advance by the escalator and rerouted to the platform \
+                 arbitrator on the decision (SEC-2026-085). Automated receipts resolve free.",
+            ),
+            &["Pay fee & request arbitration", "Cancel"],
+            cx,
+        );
+        let escrow_id = escrow_id.to_string();
+        let task = cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let mut guard = supervisor.lock().await;
+            let started = guard.ensure_started().await;
+            let result = match started {
+                Ok(()) => {
+                    let mut session = session.clone();
+                    market_ui::pay_arbitration_fee_and_request_arbitration(
+                        &mut guard,
+                        &ledger,
+                        &mandates,
+                        &mut session,
+                        &escalator,
+                        &idempotency_key,
+                        allow_live_mint,
+                        now_ms,
+                    )
+                    .await
+                    .map(|_| session)
+                }
+                Err(error) => Err(anyhow::anyhow!("sidecar unavailable: {error}")),
+            };
+            drop(guard);
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(updated) => {
+                        let directory = paths::data_dir().join(market_ui::ESCROW_STORE_DIRECTORY);
+                        match updated.persist(&directory) {
+                            Ok(_) => {
+                                if let Some(slot) = this
+                                    .escrow_sessions
+                                    .iter_mut()
+                                    .find(|session| session.escrow_id == escrow_id)
+                                {
+                                    *slot = updated;
+                                }
+                                this.escrow_error = None;
+                            }
+                            Err(error) => {
+                                this.escrow_error =
+                                    Some(SharedString::from(format!("escrow persist failed: {error:#}")));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        this.escrow_error = Some(SharedString::from(error.to_string()));
+                    }
+                }
+                this.refresh(cx);
+                cx.notify();
+            })
+            .log_err();
+        });
+        task.detach();
+    }
+
     fn section_header(&self, title: &'static str) -> AnyElement {
         Label::new(title)
             .size(LabelSize::Small)
@@ -2952,7 +3246,7 @@ impl Render for SovereignDashboardPanel {
                 v_flex()
                     .child(Label::new("Sovereign Agents"))
                     .child(
-                        Label::new("plugins · MCP · wallet · spending authorizations")
+                        Label::new("plugins · MCP · wallet · spending authorizations · escrow")
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     ),
@@ -2974,6 +3268,9 @@ impl Render for SovereignDashboardPanel {
             // Spending authorizations (real generalized store)
             .child(self.section_header("Spending Authorizations"))
             .child(self.authorizations_section(cx))
+            // Escrow (WP-5b — real persisted sessions, honest limbo labels)
+            .child(self.section_header("Escrow"))
+            .child(self.escrow_section(cx))
             // Stub notice
             .children(self.stub_notice.map(|notice| {
                 div()
@@ -3093,6 +3390,48 @@ fn network_label(network: TradingNetwork) -> &'static str {
         TradingNetwork::Signet => "signet",
         TradingNetwork::Testnet => "testnet",
         TradingNetwork::Mainnet => "mainnet",
+    }
+}
+
+/// WP-5b: load the persisted escrow sessions (digest-only state) from the
+/// escrow store beside the market sessions. Unreadable files are skipped
+/// with a log line — the section surfaces what it can read, never a fake row.
+fn load_escrow_sessions() -> Vec<market_ui::EscrowSession> {
+    let directory = paths::data_dir().join(market_ui::ESCROW_STORE_DIRECTORY);
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        if !name.starts_with("escrow-") || !name.ends_with(".json") {
+            continue;
+        }
+        match market_ui::EscrowSession::load(&path) {
+            Ok(session) => sessions.push(session),
+            Err(error) => log::error!("sovereign dashboard: skipping escrow store {name}: {error:#}"),
+        }
+    }
+    sessions.sort_by(|a, b| a.escrow_id.cmp(&b.escrow_id));
+    sessions
+}
+
+/// WP-5b: the honest escrow state-pill label. The HTLC is always labeled as
+/// the external signet LN HTLC — the demo simulates the limbo and never
+/// claims on-chain settlement (amendment 02b §3 honesty rule).
+fn escrow_state_label(state: market_ui::EscrowState) -> (&'static str, Color) {
+    use market_ui::EscrowState as S;
+    match state {
+        S::Created => ("created — HTLC lock external (limbo)", Color::Muted),
+        S::AwaitingDelivery => ("awaiting delivery — limbo", Color::Muted),
+        S::ReceiptSubmitted => ("receipt submitted — limbo", Color::Muted),
+        S::VerifiedPass => ("verified pass — sign-off ready", Color::Created),
+        S::VerifiedFail => ("verified fail — limbo held", Color::Warning),
+        S::ArbitrationRequested => ("human arbitration requested", Color::Warning),
+        S::Released => ("released to agent", Color::Created),
+        S::Refunded => ("refunded to customer", Color::Created),
+        S::Closed => ("closed", Color::Muted),
     }
 }
 
