@@ -669,6 +669,69 @@ pub fn arbitration_live_fees_enabled() -> bool {
     std::env::var(ARBITRATION_LIVE_FEES_ENVIRONMENT_VARIABLE).as_deref() == Ok("1")
 }
 
+// ---------------------------------------------------------------------------
+// Slice C — live-tip timeout observation (the sanctioned seam)
+// ---------------------------------------------------------------------------
+
+/// Pure gate the async wrapper uses (unit-testable): the HTLC window is open
+/// until the observed tip reaches `timeout_at_height` — blocks, never
+/// wall-clock (SEC-2026-086/087).
+pub fn timeout_window_open(session: &EscrowSession, observed_height: u32) -> bool {
+    u64::from(observed_height) < session.timeout_at_height
+}
+
+/// Read the observed signet tip through the sanctioned seam — the sidecar's
+/// `wallet-height` probe of the waved getinfo surface (the WP-3b decision:
+/// ONE tip source). Any probe failure propagates: the escrow timeout gate
+/// fails closed and never falls back to wall-clock (SEC-2026-087).
+pub async fn observe_wallet_height(
+    supervisor: &mut sovereign_wallet::SovereignWalletSupervisor,
+) -> Result<u32> {
+    let result = supervisor
+        .wallet_height()
+        .await
+        .map_err(|error| anyhow::anyhow!("observed tip unavailable — escrow timeout fails closed: {error}"))?;
+    Ok(result.block_height)
+}
+
+/// Open an escrow against the live tip: the height is observed through the
+/// sanctioned seam, never assumed.
+pub async fn open_with_live_tip(
+    ledger: &LedgerStore,
+    mandates: &MandateStore,
+    params: EscrowOpenParams,
+    network: TradingNetwork,
+    supervisor: &mut sovereign_wallet::SovereignWalletSupervisor,
+    now_ms: i64,
+) -> Result<EscrowSession> {
+    let observed_height = observe_wallet_height(supervisor).await?;
+    EscrowSession::open(ledger, mandates, params, network, observed_height, now_ms)
+}
+
+/// Timeout check + refund through the live tip. Returns `Ok(false)` while
+/// the window is open (nothing settled), `Ok(true)` once the HTLC expiry was
+/// observed at/after `timeout_at_height` and projected as `ArbitrationRefunded`.
+pub async fn refund_on_timeout_with_live_tip(
+    ledger: &LedgerStore,
+    session: &mut EscrowSession,
+    supervisor: &mut sovereign_wallet::SovereignWalletSupervisor,
+    decided_by_pubkey: &str,
+    now_ms: i64,
+) -> Result<bool> {
+    let observed_height = observe_wallet_height(supervisor).await?;
+    if timeout_window_open(session, observed_height) {
+        return Ok(false);
+    }
+    session.refund(
+        ledger,
+        decided_by_pubkey,
+        "htlc_timeout",
+        Some(observed_height),
+        now_ms,
+    )?;
+    Ok(true)
+}
+
 /// The full pay-first escalation, wired end-to-end: mandate-gate the fee on
 /// the sovereign-wallet venue, mint + pay the flat-fee invoice through the
 /// sidecar, append the balanced `Fee` entry, then admit the human queue by
@@ -1313,5 +1376,15 @@ mod tests {
         assert!(ensure_live_fees_allowed(true).is_ok());
         // The default env-gated reader is off in tests (variable unset).
         assert!(!arbitration_live_fees_enabled());
+    }
+
+    // ----- Slice C: live-tip timeout observation -----
+
+    #[test]
+    fn timeout_window_gate_is_block_height_only() {
+        let (_ledger, _mandates, session) = opened();
+        assert!(timeout_window_open(&session, OBSERVED_HEIGHT), "window open before the timeout height");
+        assert!(!timeout_window_open(&session, TIMEOUT_AT as u32), "window closed at the timeout height");
+        assert!(!timeout_window_open(&session, TIMEOUT_AT as u32 + 5), "window closed after the timeout height");
     }
 }

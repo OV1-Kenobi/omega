@@ -49,7 +49,8 @@ pub use escrow::{
     ARBITRATION_LIVE_FEES_ENVIRONMENT_VARIABLE, AUTOMATED_RELEASE_FEE_SATS, ESCROW_LEDGER_SCHEMA,
     ESCROW_SESSION_SCHEMA, ESCROW_STORE_DIRECTORY, ESCROW_STRATEGY, EscrowOpenParams,
     EscrowSession, EscrowState, ReceiptEventProjection, arbitration_live_fees_enabled,
-    canonical_receipt_digest, ensure_live_fees_allowed, fee_payment_digest, record_fee_payment,
+    canonical_receipt_digest, ensure_live_fees_allowed, fee_payment_digest, observe_wallet_height,
+    open_with_live_tip, record_fee_payment, refund_on_timeout_with_live_tip, timeout_window_open,
     verify_receipt_claim,
 };
 #[cfg(not(target_arch = "wasm32"))]
