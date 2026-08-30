@@ -95,6 +95,12 @@ pub fn sovereign_wallet_mandate_candidate(
         allowed_strategies: BTreeSet::from([SOVEREIGN_WALLET_STRATEGY.to_string()]),
         review_cadence: ReviewCadence::Interval { seconds: 3_600 },
         expires_at_ms,
+        // OMEGA-DELTA-0285: escrow fields belong to the mkt-swp-escrow venue
+        // only; a sovereign-wallet mandate carries none of them (mode `none`).
+        allow_escrow: None,
+        max_escrow_sats: None,
+        escrow_timeout_blocks: None,
+        arbitration_fee_flat_sats: None,
     }
 }
 
