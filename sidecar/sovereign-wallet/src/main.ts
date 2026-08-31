@@ -24,7 +24,8 @@ import { acquireLock, type LockHandle } from "./lock.js";
 import type { ErrorCode } from "./protocol.js";
 import { PROTOCOL_SCHEMA, PROTOCOL_VERSION, SERVICE_VERSION, encodeResponse, errorEnvelope } from "./protocol.js";
 import { clearRegisteredSecrets, redact, registerSecret } from "./redact.js";
-import { MIN_PASSPHRASE_LEN, Vault } from "./vault/vault.js";
+import { MIN_PASSPHRASE_LEN, VAULT_FALLBACK_OPT_IN_ENV, Vault } from "./vault/vault.js";
+import { InMemoryKeychainBackend } from "./vault/keychain.js";
 import { listPrimaryIdentity } from "./identity/index.js";
 import { deriveFromMnemonic, encodeNsec, generateMnemonic12 } from "./identity/keygen.js";
 import { challengeLabels, verifyChallenge } from "./identity/ceremony.js";
@@ -60,6 +61,13 @@ export interface SidecarConfig {
    * fake waved on a per-test port).
    */
   wavedRestPort?: number;
+  /**
+   * OS-keychain backend selection (OMEGA-DELTA-0301 / RV6-REQ-1): `"os"` (the
+   * default — Windows Credential Manager / macOS Keychain Services via the
+   * typed keychain seam) or `"memory"` — a TEST-ONLY seam selected by
+   * `OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN=memory`; never set in production.
+   */
+  vaultKeychain?: "os" | "memory";
 }
 
 export interface WalletMarker {
@@ -184,7 +192,26 @@ export class SidecarCore {
     // WP-4 vault: satnam-derived identity/vault root at <data_root>/vault.
     // The vault is the sidecar's authority for the BIP-39 identity/vault root
     // and the Wavelength wallet secrets (Q1: aezeed vaulted, not derived).
-    this.#vault = new Vault({ vaultRoot: "vault", idleTimeoutMs: 900_000 }, dataRoot);
+    // WP-3a (OMEGA-DELTA-0301 / RV6-REQ-1..9): the master key is wrapped by
+    // K_os in the OS keychain; the passphrase is the degraded/portable
+    // fallback (opt-in `OMEGA_VAULT_ALLOW_PASSPHRASE_FALLBACK=1`). The
+    // `memory` backend is the test seam (OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN
+    // =memory); production defaults to the OS keychain.
+    const vaultKeychain = this.#config.vaultKeychain === "memory" ? new InMemoryKeychainBackend() : null;
+    this.#vault = new Vault(
+      {
+        vaultRoot: "vault",
+        idleTimeoutMs: 900_000,
+        // RV6-REQ-5: every degraded unlock is a security-relevant event —
+        // logged redacted (no secrets) here; surfaced on the operator surface
+        // by WP-7.
+        onSecurityEvent: () => {
+          console.error("vault security event: degraded unlock occurred (OMEGA-DELTA-0301)");
+        },
+      },
+      dataRoot,
+      vaultKeychain,
+    );
     this.#vaultState = (await this.#vault.existsOnDisk()) ? "locked" : "none";
 
     // WP-6: the L-402 gateway state store (SQLite; survives restarts by
@@ -723,10 +750,18 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
 
   /**
    * Operator-only vault unlock (design §4.2; the ceremony's passphrase step).
-   * Wrong passphrase is refused; a lost passphrase is unrecoverable without a
-   * recovery artifact (SEC-2026-052 consequence).
+   * WP-3a (OMEGA-DELTA-0301 / RV6-REQ-3/5): unlock is keychain-first — the
+   * passphrase is used only on the degraded path, which requires the explicit
+   * fallback opt-in (OMEGA_VAULT_ALLOW_PASSPHRASE_FALLBACK=1) and, on a
+   * mainnet-configured wallet, an explicit operator confirmation (the
+   * loopback bearer token alone is not sufficient). The result reports
+   * `wrapMethod` so callers surface degradation honestly; `migrated` is true
+   * when a pre-0301 argon2id-only vault migrated in place.
    */
-  async vaultUnlock(passphrase: string): Promise<Record<string, unknown>> {
+  async vaultUnlock(
+    passphrase: string,
+    opts?: { operatorConfirmed?: boolean },
+  ): Promise<Record<string, unknown>> {
     if (!this.#vault) {
       throw envelopeError("INTERNAL", "the vault is not initialized");
     }
@@ -735,22 +770,31 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
     }
     registerSecret(passphrase);
     try {
-      await this.#vault.unlock(passphrase);
+      const result = await this.#vault.unlock(passphrase, {
+        allowPassphraseFallback: process.env[VAULT_FALLBACK_OPT_IN_ENV] === "1",
+        // "Mainnet-configured" (RV6-REQ-5) reads the configured network env
+        // directly: the WavelengthNetwork enum cannot express "mainnet" until
+        // the 0286 grammar lands (WP-3), and this seam must exist before it.
+        mainnetConfigured: process.env.OMEGA_SOVEREIGN_WALLET_NETWORK === "mainnet",
+        operatorConfirmed: opts?.operatorConfirmed === true,
+      });
+      this.#vaultState = "unlocked";
+      const identity = await listPrimaryIdentity(this.#vault).catch(() => null);
+      return {
+        vaultState: "unlocked",
+        derivedNpub: identity?.npub ?? null,
+        derivedPubkeyHex: identity?.pubkeyHex ?? null,
+        wrapMethod: result.wrapMethod,
+        migrated: result.migrated ?? false,
+      };
     } catch (error) {
       if (error instanceof Error && "vaultError" in error && error.vaultError === "DecryptionFailed") {
-        throw envelopeError("INVALID_ARGS", "wrong vault passphrase", {
+        throw envelopeError("INVALID_ARGS", "vault decryption failed (wrong passphrase on the fallback path, wrong keychain entry, or corrupted master.key)", {
           remediation: "a lost passphrase is unrecoverable without a recovery artifact",
         });
       }
       throw error;
     }
-    this.#vaultState = "unlocked";
-    const identity = await listPrimaryIdentity(this.#vault).catch(() => null);
-    return {
-      vaultState: "unlocked",
-      derivedNpub: identity?.npub ?? null,
-      derivedPubkeyHex: identity?.pubkeyHex ?? null,
-    };
   }
 
   /**
@@ -936,7 +980,11 @@ case "identity-status":
           requireAnswers(params, "answers"),
         );
       case "vault-unlock":
-        return this.vaultUnlock(requireString(params, "passphrase"));
+        // RV6-REQ-5: the operator confirmation is passed through for
+        // mainnet-configured wallets (WP-7 wires the stdio prompt).
+        return this.vaultUnlock(requireString(params, "passphrase"), {
+          operatorConfirmed: params.operatorConfirmed === true,
+        });
       case "export-nostr-secret":
         // Operator-only: reachable only on the stdio control plane. The HTTP
         // surface registers read projections only, so this method is
@@ -1096,6 +1144,10 @@ export function parseEnvironment(): SidecarConfig {
   const generation = Number.parseInt(process.env.OMEGA_SOVEREIGN_WALLET_GENERATION ?? "1", 10) || 1;
   const wavedRestPortRaw = process.env.OMEGA_SOVEREIGN_WALLET_WAVED_REST_PORT;
   const wavedRestPort = wavedRestPortRaw ? Number.parseInt(wavedRestPortRaw, 10) : undefined;
+  // OMEGA-DELTA-0301 / RV6-REQ-1: "memory" is the TEST-ONLY keychain seam
+  // (never set in production); the production default is the OS keychain.
+  const vaultKeychainRaw = process.env.OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN;
+  const vaultKeychain = vaultKeychainRaw === "memory" ? "memory" : undefined;
   return {
     dataRoot,
     network: networkRaw as WavelengthNetwork,
@@ -1103,6 +1155,7 @@ export function parseEnvironment(): SidecarConfig {
     wavedBin,
     generation,
     wavedRestPort,
+    vaultKeychain,
   };
 }
 

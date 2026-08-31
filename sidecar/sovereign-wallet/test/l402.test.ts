@@ -39,6 +39,7 @@ import { generateLoopbackToken } from "../dist/http.js";
 import { L402Gateway, bolt11PaymentHash, DEMO_ECHO_PATH, DEMO_MCP_PATH_PREFIX } from "../dist/l402.js";
 import { L402Store } from "../dist/l402-store.js";
 import { Vault } from "../dist/vault/vault.js";
+import { InMemoryKeychainBackend } from "../dist/vault/keychain.js";
 import { buildTestBolt11 } from "./fixtures/build-bolt11.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "..", "..");
@@ -94,7 +95,9 @@ async function makeGateway(opts: {
 
 async function makeVault(): Promise<{ vault: Vault; dir: string }> {
   const dir = mkdtempSync(path.join(tmpdir(), "sw-l402-vault-"));
-  const vault = new Vault({ vaultRoot: "vault", idleTimeoutMs: 3_600_000 }, dir);
+  // OMEGA-DELTA-0301: tests inject the in-memory keychain seam — the real
+  // OS-keychain binding is never touched by the test suites.
+  const vault = new Vault({ vaultRoot: "vault", idleTimeoutMs: 3_600_000 }, dir, new InMemoryKeychainBackend());
   await vault.initialize(PASSPHRASE);
   return { vault, dir };
 }
@@ -560,6 +563,10 @@ function spawnSidecar(overrides: Record<string, string>): Sidecar {
     OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN: token,
     OMEGA_SOVEREIGN_WALLET_WAVED_BIN: FAKE_WAVED_CMD,
     OMEGA_SOVEREIGN_WALLET_WAVED_REST_PORT: String(port),
+    // OMEGA-DELTA-0301 (RV6-REQ-1): the TEST-ONLY in-memory keychain seam —
+    // e2e processes must never touch the real OS keychain. Production never
+    // sets this; the default is the OS-keychain binding.
+    OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN: "memory",
     FAKE_WAVED_NETWORK: "signet",
     FAKE_WAVED_MODE: "normal",
     FAKE_WAVED_PORT: String(port),
@@ -833,12 +840,21 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
       await sleep(500);
 
       // Restart on the SAME data root: the gateway DB + vault survived.
-      const restarted = spawnSidecar({ OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot });
+      // OMEGA-DELTA-0301 (updated-with-citation): the in-memory keychain seam
+      // is per-process, so the restarted process honestly models a device
+      // whose OS keychain is unavailable — the unlock uses the DEGRADED path
+      // (explicit opt-in OMEGA_VAULT_ALLOW_PASSPHRASE_FALLBACK=1) and reports
+      // wrapMethod "passphrase-fallback" (RV6-REQ-5).
+      const restarted = spawnSidecar({
+        OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot,
+        OMEGA_VAULT_ALLOW_PASSPHRASE_FALLBACK: "1",
+      });
       try {
         await restarted.request("initialize");
         // The normal operator flow after restart: unlock the vault (the
         // gateway's HMAC key is re-loaded from the vault entry) and the wallet.
-        expectOk(await restarted.request("vault-unlock", { passphrase: PASSPHRASE }));
+        const vaultUnlock = expectOk(await restarted.request("vault-unlock", { passphrase: PASSPHRASE }));
+        assert.equal(vaultUnlock.wrapMethod, "passphrase-fallback", "restart unlock uses the degraded path (RV6-REQ-5)");
         expectOk(
           await restarted.request("unlock", {
             idempotencyKey: "l402-33333333-3333-4333-8333-333333333333",

@@ -11036,3 +11036,35 @@ release on a verified receipt, pay-first human escalation - without
 re-deriving the preserved hardening design.
 
 - **Enforced by:** `escrow_venue_and_ledger_kinds_are_registered` in `omega_deltas`.
+
+### OMEGA-DELTA-0301 - Sovereign wallet vault OS-keychain master-key wrapping (RV-6/SEC-2026-052 closure)
+
+Upstream Zed has no sovereign-wallet vault. Omega-before-this (the WP-4 satnam
+adaptation, SEC-2026-052) wrapped the vault master key with argon2id only
+(m:65536,t:3,p:4) and recorded the OS-keychain layer as a flagged hardening
+item mandatory before any mainnet-adjacent phase. Per the founder's RV-1b
+ruling (2026-08-31), the vault master-key wrap is now LAYERED: the OS keychain
+(Windows Credential Manager generic credentials / macOS Keychain Services via
+the @napi-rs/keyring 2.0.0 binding behind the typed seam
+sidecar/sovereign-wallet/src/vault/keychain.ts +
+os-keychain.ts) holds ONLY a per-data-root 32-byte random K_os;
+master.key stays AES-256-GCM(K_os, masterKey); wrapping.kek is
+AES-256-GCM(argon2id(passphrase, salt), K_os) so argon2id protects K_os as the
+degraded/portable path. Keychain-unavailable unlocks are FAIL CLOSED
+(VaultError.KeychainUnavailable) with an explicit degraded-mode opt-in
+(OMEGA_VAULT_ALLOW_PASSPHRASE_FALLBACK=1) that reports wrapMethod and
+requires operator confirmation on a mainnet-configured wallet. K_os is
+zeroized immediately after unlock; lock() is unchanged; the backup envelope
+moves to v3 with fresh-device restore + keychain re-enrollment; argon2id-only
+vaults migrate in place at the first successful unlock with the old path
+intact on failure; re-key and keychain-revocation paths exist. The argon2id
+path is RETAINED as the degraded/portable fallback — additive hardening, not a
+removal. No seed material (aezeed), nsecs, L-402 keys, or NWC secrets ever
+enter the OS keychain.
+
+Why: the founder ruling (RV-1b, 2026-08-31) — the wallet is mainnet-adjacent
+now and the at-rest custody posture for its keys must be materially stronger
+than the signet-phase argon2id-only minimum (SEC-2026-052); the change must
+register its own delta so the delta suite enforces it (SEC-2026-099).
+
+- **Enforced by:** `sovereign_wallet_vault_os_keychain_wrapping` in `omega_deltas`.

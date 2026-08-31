@@ -256,6 +256,7 @@ pub const ENFORCED_DELTAS: &[&str] = &[
     "OMEGA-DELTA-0283",
     "OMEGA-DELTA-0284",
     "OMEGA-DELTA-0285",
+    "OMEGA-DELTA-0301",
 ];
 
 /// OMEGA-DELTA-0284. The sidecar identity keygen module — the sidecar's
@@ -3765,6 +3766,19 @@ pub const SARAH_CONVERSATION_PATH: &str = "crates/omega_effectd/src/sarah_conver
 /// because `observe` contains `serve` and the lane's own preflight is named
 /// `observe`.
 pub const EXO_SERVER_START_LITERALS: &[&str] = &["serve", "exo serve", "--bind", "serve --bind"];
+
+/// OMEGA-DELTA-0301. The sidecar vault implementing the OS-keychain
+/// master-key wrap (RV-6/SEC-2026-052 closure; founder RV-1b ruling).
+pub const SOVEREIGN_VAULT_VAULT_PATH: &str = "sidecar/sovereign-wallet/src/vault/vault.ts";
+/// OMEGA-DELTA-0301. The typed OS-keychain seam (interface + credential-id
+/// derivation; no provider import).
+pub const SOVEREIGN_VAULT_KEYCHAIN_SEAM_PATH: &str = "sidecar/sovereign-wallet/src/vault/keychain.ts";
+/// OMEGA-DELTA-0301. The production binding — the single static import site
+/// of the provider package.
+pub const SOVEREIGN_VAULT_OS_KEYCHAIN_PATH: &str = "sidecar/sovereign-wallet/src/vault/os-keychain.ts";
+/// OMEGA-DELTA-0301. The sidecar identity/vault tests carrying the
+/// updated-with-citation markers (fresh-device restore, SEC-2026-052 floor).
+pub const SOVEREIGN_VAULT_IDENTITY_TEST_PATH: &str = "sidecar/sovereign-wallet/test/identity.test.ts";
 
 #[cfg(test)]
 mod tests {
@@ -32381,6 +32395,98 @@ mod tests {
         assert!(
             ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0285"),
             "OMEGA-DELTA-0285: the delta is no longer listed in \
+             ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0301. The sovereign wallet vault master key is wrapped by
+    /// the OS keychain (RV-6/SEC-2026-052 closure; founder RV-1b ruling): the
+    /// OS keychain holds ONLY a per-data-root 32-byte random K_os; `master.key`
+    /// stays AES-256-GCM(K_os, masterKey); `wrapping.kek` is
+    /// AES-256-GCM(argon2id(passphrase, salt), K_os) so argon2id protects K_os
+    /// as the degraded/portable path with an explicit opt-in; keychain-
+    /// unavailable unlocks fail closed and report `wrapMethod`; the backup
+    /// envelope is v3; argon2id-only vaults migrate in place; re-key/revocation
+    /// paths exist; the argon2id path is RETAINED as the fallback (additive
+    /// hardening, not a removal).
+    ///
+    /// This check inspects REAL repository state (never comment-only):
+    /// 1. the typed keychain seam carries the `KeychainBackend` interface and
+    ///    the RV6-REQ-4 credential-name prefix;
+    /// 2. vault.ts writes `wrapping.meta` with the `"os-keychain"` method
+    ///    default, defines the fallback opt-in constant
+    ///    (`OMEGA_VAULT_ALLOW_PASSPHRASE_FALLBACK`), and cites the delta in
+    ///    its posture comment (updated-with-citation, never deleted);
+    /// 3. vault.ts has NO static import of the provider package — the seam
+    ///    module (os-keychain.ts, with the `createOsKeychainBackend` factory)
+    ///    is the single static import site;
+    /// 4. the fresh-device restore test and the SEC-2026-052-tagged
+    ///    passphrase-floor test in identity.test.ts carry the delta citation
+    ///    (assertions unchanged, citations added);
+    /// 5. the delta is listed in ENFORCED_DELTAS (the OMEGA_DELTAS.md row
+    ///    itself is guarded by `the_registry_and_the_checks_agree`).
+    #[test]
+    fn sovereign_wallet_vault_os_keychain_wrapping() {
+        // 1. The typed seam: interface + credential-name prefix.
+        let keychain_seam = read_repository_file(SOVEREIGN_VAULT_KEYCHAIN_SEAM_PATH);
+        for required in ["KeychainBackend", "omega-sovereign-wallet:"] {
+            assert!(
+                keychain_seam.contains(required),
+                "OMEGA-DELTA-0301: the keychain seam lost `{required}`; the typed \
+                 KeychainBackend interface and the RV6-REQ-4 credential prefix \
+                 must stay present"
+            );
+        }
+
+        // 2. vault.ts: wrapping.meta method default, fallback opt-in, citation.
+        let vault_source = read_repository_file(SOVEREIGN_VAULT_VAULT_PATH);
+        for required in [
+            "method: \"os-keychain\"",
+            "OMEGA_VAULT_ALLOW_PASSPHRASE_FALLBACK",
+            "OMEGA-DELTA-0301",
+        ] {
+            assert!(
+                vault_source.contains(required),
+                "OMEGA-DELTA-0301: vault.ts lost `{required}`; the os-keychain \
+                 wrapping.meta default, the fallback opt-in constant, and the \
+                 delta citation must stay present"
+            );
+        }
+
+        // 3. Serving-plane seam: no static provider import in vault.ts; the
+        //    factory lives in os-keychain.ts with the provider import.
+        assert!(
+            !vault_source.contains("from \"@napi-rs/keyring\""),
+            "OMEGA-DELTA-0301: vault.ts statically imports the provider package; \
+             the binding must stay behind the typed seam"
+        );
+        let os_keychain = read_repository_file(SOVEREIGN_VAULT_OS_KEYCHAIN_PATH);
+        assert!(
+            os_keychain.contains("createOsKeychainBackend")
+                && os_keychain.contains("from \"@napi-rs/keyring\""),
+            "OMEGA-DELTA-0301: os-keychain.ts lost the factory or the provider \
+             import; the seam must be the single static import site"
+        );
+
+        // 4. Updated-with-citation tests (assertions unchanged; citations
+        //    added): the fresh-device restore test and the SEC-2026-052
+        //    passphrase-floor test.
+        let identity_test = read_repository_file(SOVEREIGN_VAULT_IDENTITY_TEST_PATH);
+        assert!(
+            identity_test.contains("OMEGA-DELTA-0301"),
+            "OMEGA-DELTA-0301: identity.test.ts lost the delta citation on the \
+             fresh-device restore / passphrase-floor tests (updated-with-citation)"
+        );
+        assert!(
+            identity_test.contains("SEC-2026-052"),
+            "OMEGA-DELTA-0301: identity.test.ts lost the SEC-2026-052 tag on the \
+             passphrase-floor test"
+        );
+
+        // 5. ENFORCED_DELTAS membership.
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0301"),
+            "OMEGA-DELTA-0301: the delta is no longer listed in \
              ENFORCED_DELTAS"
         );
     }

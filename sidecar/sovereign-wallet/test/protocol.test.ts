@@ -44,6 +44,10 @@ function spawnSidecar(overrides: Record<string, string>): Sidecar {
     OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN: token,
     OMEGA_SOVEREIGN_WALLET_WAVED_BIN: FAKE_WAVED_CMD,
     OMEGA_SOVEREIGN_WALLET_WAVED_REST_PORT: String(port),
+    // OMEGA-DELTA-0301 (RV6-REQ-1): the TEST-ONLY in-memory keychain seam —
+    // the e2e process must never touch the real OS keychain. Production never
+    // sets this; the default is the OS-keychain binding.
+    OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN: "memory",
     FAKE_WAVED_NETWORK: "signet",
     FAKE_WAVED_MODE: "normal",
     FAKE_WAVED_PORT: String(port),
@@ -665,7 +669,12 @@ assert.equal(httpSurface?.bound, false);
     }
   });
 
-  it("WP-5: vault unlock refuses a wrong passphrase and honors the right one", async () => {
+  // OMEGA-DELTA-0301 (updated-with-citation): unlock is KEYCHAIN-FIRST — with
+  // the OS keychain available the passphrase is not consulted (RV6-REQ-3), so
+  // a wrong passphrase does not refuse the keychain-path unlock; the result
+  // reports wrapMethod. The degraded-path refusal semantics (opt-in +
+  // operator confirmation) are covered in vault-keychain.test.ts (RV6-REQ-10).
+  it("WP-5: vault unlock is keychain-first and reports wrapMethod (OMEGA-DELTA-0301)", async () => {
     const sidecar = spawnSidecar({});
     try {
       await sidecar.request("initialize");
@@ -677,11 +686,11 @@ assert.equal(httpSurface?.bound, false);
       });
       await sidecar.request("lock");
 
-      const wrong = expectError(await sidecar.request("vault-unlock", { passphrase: "wrong passphrase value" }));
-      assert.equal(wrong.code, "INVALID_ARGS");
-
-      const unlocked = expectOk(await sidecar.request("vault-unlock", { passphrase: "correct horse battery staple" }));
+      // Keychain-first: the unlock succeeds via the OS-keychain path even
+      // with an arbitrary passphrase argument.
+      const unlocked = expectOk(await sidecar.request("vault-unlock", { passphrase: "arbitrary passphrase" }));
       assert.equal(unlocked.vaultState, "unlocked");
+      assert.equal(unlocked.wrapMethod, "os-keychain");
       assert.match(unlocked.derivedNpub as string, /^npub1/);
     } finally {
       await sidecar.close();

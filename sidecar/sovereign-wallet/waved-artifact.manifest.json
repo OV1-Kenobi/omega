@@ -51,6 +51,29 @@
     "new official release publish",
     "OS/arch change",
     "Node/ABI shift affecting the sidecar",
-    "any mainnet-adjacent phase (per SEC-2026-052 posture)"
-  ]
+    "any mainnet-adjacent phase (per SEC-2026-052 posture)",
+    "@napi-rs/keyring version change (OMEGA-DELTA-0301 binding package)",
+    "cold-cache re-fetch or re-resolution of the @napi-rs/keyring subtree (rebuild/re-download)",
+    "OSV/CVE hit on @napi-rs/keyring or its native artifact",
+    "binding package maintainership change (maintainer/org handover)"
+  ],
+  "binding_package": {
+    "schema": "openagents.omega.sovereign-wallet.artifact-manifest.v1.binding-package",
+    "component": "@napi-rs/keyring (napi-rs binding of hwchen/keyring-rs) — OS-keychain seam for the vault master-key wrap (OMEGA-DELTA-0301 / RV6-REQ-1)",
+    "pinned_version": "2.0.0",
+    "exact_pin": "package.json dependencies \"@napi-rs/keyring\": \"2.0.0\"",
+    "lockfile": "package-lock.json committed (lockfileVersion 3)",
+    "integrity_verification": "lockfile dist.integrity == registry dist.integrity byte-exact, verified 2026-08-31 (main sha512-TnrIt0nO9U2Ue9E9vJQjso1hqhIYiGrn2Ew1HBsMSqQe4+ceOqPJJwRVsV0/Wy7pqp04/doOLASyIFM3gGwZJw==; resident win32-x64-msvc sha512-POpEUTV6U+pb69cpuOgtLV4xhcyEWDWq+/9zdiZmNxTL1AenE0MllWrbepS+Hng4M7EarQ5TB3kX69ASqGwfIw==)",
+    "lifecycle_audit": "zero install-time scripts in the whole subtree (registry scripts + lockfile hasInstallScript, verified 2026-08-31)",
+    "osv_scan": "api.osv.dev npm @napi-rs/keyring@2.0.0: 0 records (2026-08-31)",
+    "native_binary": {
+      "file": "node_modules/@napi-rs/keyring-win32-x64-msvc/keyring.win32-x64-msvc.node",
+      "size_bytes": 1931776,
+      "sha256": "2570C01C84D50089F5005146D12BA5F65AF878FA3ED24D7C9B585CD8D499D92E",
+      "provenance": "prebuilt napi-rs artifact shipped inside the registry tarball (win32-x64-msvc platform package, exact-pinned 2.0.0); installed copy byte-verified against the registry integrity"
+    },
+    "maintainership": "REQUIRES VERIFICATION — maintainer identity (napi-rs org: broooooklyn, forehalo) and the org's long-term maintenance posture are NOT independently verifiable at install time; recorded, never assumed (RV6-REQ-1)",
+    "os_level_mapping": "REQUIRES VERIFICATION — Windows Credential Manager CRED_TYPE_GENERIC (DPAPI at rest) and macOS Keychain Services kSecClassGenericPassword are keyring-rs's documented platform behavior; the definitive runtime probe on each OS is a staging/WP-9 step",
+    "capability_manifest": "planning/2026-08-31-omega-mainnet-transition/evidence/05-wp3a-evidence.md (install-gate section; agent-and-skill-security-policy section 2 fields); founder approval required before activation"
+  }
 }

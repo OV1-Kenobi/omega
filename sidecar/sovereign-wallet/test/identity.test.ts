@@ -24,6 +24,7 @@ import {
 import { verifyChallenge, CHALLENGE_INDEXES, challengeLabels } from "../dist/identity/ceremony.js";
 import { Vault, MIN_PASSPHRASE_LEN } from "../dist/vault/vault.js";
 import { FileBackend } from "../dist/vault/store.js";
+import { InMemoryKeychainBackend, keychainCredentialId } from "../dist/vault/keychain.js";
 import {
   verifyNip98,
   constructNip98Event,
@@ -112,20 +113,34 @@ describe("mnemonic ceremony (show-once + word challenge)", () => {
   });
 });
 
-describe("vault (desktop file store, WP-4)", () => {
+//! WP-3a (OMEGA-DELTA-0301 / RV6-REQ-10): the vault tests below run against
+//! an in-memory keychain seam — the real OS-keychain binding
+//! (os-keychain.ts) is never imported by the test suites (structural test in
+//! vault-keychain.test.ts). Updated-with-citation changes in this file:
+//! the fresh-device restore test (v3 envelope), the wrong-passphrase test
+//! (keychain-first semantics), and the SEC-2026-052 passphrase-floor test
+//! (citation added; assertion unchanged).
+
+describe("vault (desktop file store, WP-4 / WP-3a)", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "sw-vault-"));
   const root = path.join(dir, "vault");
   let vault: Vault;
 
+  /** A vault over the given root with an in-memory keychain seam. */
+  function makeVault(vaultRoot: string): { vault: Vault; keychain: InMemoryKeychainBackend } {
+    const keychain = new InMemoryKeychainBackend();
+    return { vault: new Vault({ vaultRoot: "vault" }, vaultRoot, keychain), keychain };
+  }
+
   before(() => {
-    vault = new Vault({ vaultRoot: "vault" }, root);
+    vault = makeVault(root).vault;
   });
   after(() => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("enforces the minimum passphrase length (SEC-2026-052)", async () => {
-    const short = new Vault({ vaultRoot: "vault" }, path.join(dir, "short"));
+  it("enforces the minimum passphrase length (SEC-2026-052; OMEGA-DELTA-0301 keeps the floor)", async () => {
+    const short = makeVault(path.join(dir, "short")).vault;
     await assert.rejects(() => short.initialize("short"), /at least/);
     assert.ok(MIN_PASSPHRASE_LEN >= 12);
   });
@@ -161,24 +176,58 @@ describe("vault (desktop file store, WP-4)", () => {
     assert.deepEqual(await vault.listIdentities(), [derived.publicPart.npub]);
   });
 
-  it("rejects the wrong passphrase on unlock", async () => {
-    vault.lock();
-    await assert.rejects(() => vault.unlock("wrong passphrase value"), (e) => {
-      return e instanceof Error && (e as { vaultError?: string }).vaultError === "DecryptionFailed";
-    });
+  // OMEGA-DELTA-0301 (updated-with-citation): unlock is now KEYCHAIN-FIRST —
+  // with the OS keychain available, the passphrase is not consulted at all
+  // (RV6-REQ-3 positive 1). The passphrase is the DEGRADED-path factor
+  // (RV6-REQ-5): a wrong passphrase is refused only when the passphrase path
+  // is actually used. Full refusal semantics live in vault-keychain.test.ts
+  // (RV6-REQ-10); here the pre-0301 assertion is updated to the new posture.
+  it("unlock is keychain-first; the passphrase is the degraded-path factor (OMEGA-DELTA-0301)", async () => {
+    const { vault: kcVault, keychain } = makeVault(path.join(dir, "keychain-first"));
+    await kcVault.initialize(PASSPHRASE);
+    kcVault.lock();
+
+    // Keychain path: succeeds regardless of the passphrase argument.
+    const keychainResult = await kcVault.unlock("not the real passphrase");
+    assert.equal(keychainResult.wrapMethod, "os-keychain");
+    assert.equal(kcVault.isUnlocked(), true);
+    kcVault.lock();
+
+    // Degraded path (keychain entry removed): wrong passphrase → refused.
+    await kcVault.unlock(); // keychain path, to reach the revoke path
+    await kcVault.revokeKeychainEntry();
+    assert.equal(keychain.has(keychainCredentialId(path.join(dir, "keychain-first"))), false);
+    kcVault.lock();
+    await assert.rejects(
+      () => kcVault.unlock("wrong passphrase value", { allowPassphraseFallback: true }),
+      (e) => e instanceof Error && (e as { vaultError?: string }).vaultError === "DecryptionFailed",
+    );
+    kcVault.lock();
+    // Correct passphrase on the degraded path → success (wrapMethod reported).
+    const degraded = await kcVault.unlock(PASSPHRASE, { allowPassphraseFallback: true });
+    assert.equal(degraded.wrapMethod, "passphrase-fallback");
   });
 
-  it("restores from the v2 encrypted backup on a fresh device (recovery artifact restores)", async () => {
-    await vault.unlock(PASSPHRASE);
+  // OMEGA-DELTA-0301 (updated-with-citation): the fresh-device restore test
+  // moved from the v2 envelope to the v3 envelope (RV6-REQ-7) — the
+  // passphrase now unwraps K_os from wrapping.kek, decrypts master.key, and
+  // re-enrolls K_os into the new device's keychain.
+  it("restores from the v3 encrypted backup on a fresh device (recovery artifact restores; OMEGA-DELTA-0301)", async () => {
+    await vault.unlock("correct horse battery staple");
     const backup = await vault.exportEncryptedBackup();
     assert.ok(backup.length > 100);
 
-    // Fresh device: a new vault over a new root, restored from the backup, then
-    // unlocked with the passphrase to recover the identity.
+    // Fresh device: a new vault over a new root, restored from the backup,
+    // then unlocked via the KEYCHAIN (K_os re-enrolled by the import).
     const freshRoot = path.join(dir, "fresh");
-    const fresh = new Vault({ vaultRoot: "vault" }, freshRoot);
-    await fresh.importEncryptedBackup(backup, PASSPHRASE);
-    await fresh.unlock(PASSPHRASE);
+    const freshKeychain = new InMemoryKeychainBackend();
+    const fresh = new Vault({ vaultRoot: "vault" }, freshRoot, freshKeychain);
+    const imported = await fresh.importEncryptedBackup(backup, "correct horse battery staple");
+    assert.equal(imported.keychainEnrolled, true);
+
+    // Subsequent unlocks are keychain-first — no passphrase needed.
+    const unlocked = await fresh.unlock();
+    assert.equal(unlocked.wrapMethod, "os-keychain");
     assert.equal(fresh.isUnlocked(), true);
 
     const identities = await fresh.listIdentities();
