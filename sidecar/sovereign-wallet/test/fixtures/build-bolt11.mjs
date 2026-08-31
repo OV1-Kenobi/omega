@@ -6,12 +6,13 @@
 import { bech32 } from "@scure/base";
 
 /**
- * Build a minimal signet BOLT11 (hrp `lntbs100u` = 100 μBTC = 10000 sats) with
+ * Build a minimal BOLT11 (default hrp `lntbs100u` = 100 μBTC = 10000 sats;
+ * pass e.g. `lnbc100u` for a mainnet-shaped invoice — OMEGA-DELTA-0286) with
  * `p` (payment hash), `s` (payment secret), and `d` (description) fields.
  * No signature field — the gateway only reads the `p` field, so the invoice
  * is structurally sufficient for the tests.
  */
-export function buildTestBolt11(paymentHashHex) {
+export function buildTestBolt11(paymentHashHex, hrp = "lntbs100u") {
   const words = [];
   // 35-bit timestamp (7 words of 5 bits).
   const ts = BigInt(Math.floor(Date.now() / 1000));
@@ -26,5 +27,5 @@ export function buildTestBolt11(paymentHashHex) {
   pushField(16, Buffer.from("c".repeat(64), "hex")); // s: payment secret (32 bytes)
   pushField(13, Buffer.from("fake waved demo invoice", "utf8")); // d
   // BOLT11 invoices exceed bech32's default 90-char cap; pass an explicit limit.
-  return bech32.encode("lntbs100u", words, 4096);
+  return bech32.encode(hrp, words, 4096);
 }

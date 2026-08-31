@@ -55,19 +55,45 @@ fn flag_is_off_by_default() {
 
 #[test]
 fn supervisor_refuses_mainnet_at_config() {
-    let options = default_options(
-        PathBuf::from(std::env::temp_dir()),
-        fixture_command(&fixture_path()),
-        "mainnet",
-    )
-    .unwrap();
-    let error = SovereignWalletSupervisor::new(options)
-        .err()
-        .expect("construction with mainnet must fail");
-    assert!(
-        error.to_string().contains("mainnet"),
-        "expected a mainnet refusal, got: {error}"
-    );
+    // OMEGA-DELTA-0286 (updated-with-citation): the refusal remains for the
+    // UN-OPTED-IN case — `mainnet` construction requires
+    // OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1 at the process level; without
+    // it the exact refusal stays. The gated construction path is covered by
+    // `supervisor_accepts_opted_in_mainnet_at_config` below.
+    crate::test_support::assert_allow_mainnet_opt_in_absent(|| {
+        let options = default_options(
+            PathBuf::from(std::env::temp_dir()),
+            fixture_command(&fixture_path()),
+            "mainnet",
+        )
+        .unwrap();
+        let error = SovereignWalletSupervisor::new(options)
+            .err()
+            .expect("construction with mainnet must fail");
+        assert!(
+            error.to_string().contains("mainnet"),
+            "expected a mainnet refusal, got: {error}"
+        );
+    });
+}
+
+#[test]
+fn supervisor_accepts_opted_in_mainnet_at_config() {
+    // OMEGA-DELTA-0286: with the explicit allow-mainnet opt-in at the
+    // process level, a mainnet-configured supervisor constructs (the sidecar
+    // env gate and the runtime assertion are covered by the sidecar suite).
+    crate::test_support::with_allow_mainnet_opt_in(|| {
+        let options = default_options(
+            PathBuf::from(std::env::temp_dir()),
+            fixture_command(&fixture_path()),
+            "mainnet",
+        )
+        .unwrap();
+        assert!(
+            SovereignWalletSupervisor::new(options).is_ok(),
+            "opted-in mainnet construction must succeed (OMEGA-DELTA-0286)"
+        );
+    });
 }
 
 #[test]
@@ -104,9 +130,13 @@ fn initialize_health_balance_round_trip() {
 #[test]
 fn mainnet_runtime_report_is_a_hard_bail() {
     smol::block_on(async {
-        // SEC-2026-050: the supervisor refuses the initialize-reported
-        // network (waved's ACTUAL runtime network from the sidecar probe),
-        // not just the env value. The fixture reports mainnet here.
+        // SEC-2026-050 (OMEGA-DELTA-0286, updated-with-citation): the
+        // supervisor refuses the initialize-reported network (waved's ACTUAL
+        // runtime network from the sidecar probe), not just the env value.
+        // A mainnet report on a SIGNET-configured supervisor is still a
+        // hard bail — mainnet is accepted only when configured mainnet AND
+        // opted in (covered by
+        // `mainnet_runtime_report_is_accepted_when_configured_and_opted_in`).
         let mut supervisor =
             make_supervisor("signet", fixture_command_with_network(&fixture_path(), "mainnet"))
                 .expect("supervisor");
@@ -128,16 +158,182 @@ fn mainnet_runtime_report_is_a_hard_bail() {
 }
 
 #[test]
+fn mainnet_runtime_report_is_accepted_when_configured_and_opted_in() {
+    // OMEGA-DELTA-0286: the SEC-2026-050 revision — reported network MUST
+    // equal configured; a mainnet report is accepted ONLY when configured
+    // mainnet AND the allow-mainnet opt-in is set at the process level.
+    crate::test_support::with_allow_mainnet_opt_in(|| {
+        smol::block_on(async {
+            let mut supervisor = make_supervisor(
+                "mainnet",
+                fixture_command_with_network(&fixture_path(), "mainnet"),
+            )
+            .expect("supervisor");
+            let initialize = supervisor.start().await.context("initialize").unwrap();
+            assert_eq!(initialize.network, "mainnet");
+            assert_eq!(initialize.waved_network.as_deref(), Some("mainnet"));
+            assert_eq!(supervisor.network(), "mainnet");
+            supervisor.stop().await.ok();
+        });
+    });
+}
+
+#[test]
 fn unsupported_runtime_network_is_refused() {
     smol::block_on(async {
+        // OMEGA-DELTA-0286 (updated-with-citation): the assertion is now
+        // "reported MUST equal configured" — `testnet` remains unsupported
+        // (a testnet report on a signet-configured supervisor is a mismatch,
+        // refused; a testnet-configured supervisor cannot even be
+        // constructed — the config gate refuses it).
         let mut supervisor =
             make_supervisor("signet", fixture_command_with_network(&fixture_path(), "testnet"))
                 .expect("supervisor");
         let result = supervisor.start().await;
         assert!(
             result.is_err(),
-            "a non-signet/regtest runtime network must be refused"
+            "a non-configured runtime network must be refused"
         );
+        supervisor.stop().await.ok();
+    });
+}
+
+#[test]
+fn the_spend_kill_refuses_mint_and_pay_before_forwarding() {
+    // OMEGA-DELTA-0300 (C2 semantics, SEC-2026-100): ALL-VALUE-TOUCHING —
+    // when the kill is set, mint AND pay are both refused at the supervisor
+    // choke point BEFORE the sidecar is touched (the fixture would answer
+    // both; the refusal must happen first).
+    smol::block_on(async {
+        // The env is set ONLY for the construction window (the supervisor
+        // reads OMEGA_SPEND_KILL once at construction); the policy snapshot
+        // stays killed for the assertions.
+        let mut supervisor = crate::test_support::with_spend_kill_env(|| {
+            make_supervisor("signet", fixture_command(&fixture_path())).expect("supervisor")
+        });
+        supervisor.start().await.context("initialize").unwrap();
+
+        let mint = supervisor
+            .make_invoice(10, "killed mint", "kill-key-1")
+            .await
+            .expect_err("a killed surface must refuse minting");
+        assert!(matches!(mint, SovereignWalletError::SpendHalted(_)), "{mint:?}");
+        assert!(mint.to_string().contains("SPEND_HALTED"), "{mint}");
+
+        let pay = supervisor
+            .pay_invoice("lntbs10u1p0example", "kill-key-2")
+            .await
+            .expect_err("a killed surface must refuse paying");
+        assert!(matches!(pay, SovereignWalletError::SpendHalted(_)), "{pay:?}");
+        assert!(pay.to_string().contains("SPEND_HALTED"), "{pay}");
+
+        supervisor.stop().await.ok();
+    });
+}
+
+#[test]
+fn the_daily_ceiling_refuses_an_over_limit_mint_and_allows_under_ceiling_flows() {
+    // OMEGA-DELTA-0300: the per-surface daily ceiling (1,000 sats first
+    // phase, reversible assumption) counts mints + payments on
+    // `wallet-l402` and refuses BEFORE forwarding.
+    smol::block_on(async {
+        let mut supervisor =
+            make_supervisor("signet", fixture_command(&fixture_path())).expect("supervisor");
+        supervisor.start().await.context("initialize").unwrap();
+
+        let over = supervisor
+            .make_invoice(1_001, "over the ceiling", "ceiling-key-1")
+            .await
+            .expect_err("a mint above the daily ceiling must be refused");
+        assert!(
+            matches!(over, SovereignWalletError::SpendPolicyRefused(_)),
+            "{over:?}"
+        );
+        assert!(over.to_string().contains("ceiling"), "{over}");
+
+        // Under the ceiling: 999 + 1 = 1,000 passes; the next 1 sat refuses.
+        supervisor
+            .make_invoice(999, "within the ceiling", "ceiling-key-2")
+            .await
+            .expect("999 sats fits the ceiling");
+        supervisor
+            .make_invoice(1, "ceiling edge", "ceiling-key-3")
+            .await
+            .expect("exactly 1,000 sats fits the ceiling");
+        let again = supervisor
+            .make_invoice(1, "over the ceiling now", "ceiling-key-4")
+            .await
+            .expect_err("1,001 sats across the day must be refused");
+        assert!(matches!(again, SovereignWalletError::SpendPolicyRefused(_)));
+
+        supervisor.stop().await.ok();
+    });
+}
+
+#[test]
+fn over_settlement_auto_kills_the_surface_fail_closed() {
+    // C3 / SEC-2026-098: the loss rule — a payment settling for MORE than
+    // the prepared-for total auto-sets the kill fail-closed, reports the
+    // named halted state, persists the kill, and refuses every later funded
+    // flow (mint AND pay) until the founder re-enables.
+    smol::block_on(async {
+        let dir = tempdir().context("create temp data root").expect("tempdir");
+        let options = SovereignWalletSupervisorOptions {
+            data_root: dir.path().to_path_buf(),
+            command: {
+                let mut command = fixture_command(&fixture_path());
+                command.args.push("--over-settle".to_owned());
+                command
+            },
+            network: "signet".to_string(),
+            initial_generation: 1,
+            request_timeout: Duration::from_secs(10),
+            node_require_minor: None,
+        };
+        let mut supervisor = SovereignWalletSupervisor::new(options).expect("supervisor");
+        supervisor.start().await.context("initialize").unwrap();
+
+        let over = supervisor
+            .pay_invoice("lntbs10u1p0example", "loss-key-1")
+            .await
+            .expect_err("an over-settled payment must trip the loss rule");
+        assert!(matches!(over, SovereignWalletError::SpendHalted(_)), "{over:?}");
+        assert!(
+            over.to_string().contains("over-settlement"),
+            "the named halted state must name the trigger: {over}"
+        );
+        assert!(
+            over.to_string().contains("Debug & Incident"),
+            "the halted state must open the Debug & Incident route: {over}"
+        );
+
+        // The auto-kill is persisted (a restart cannot silently un-halt):
+        // the budget file records the kill with the reason.
+        let budget_path = dir.path().join("run").join(crate::spend_policy::SPEND_BUDGET_FILE_NAME);
+        let raw = std::fs::read_to_string(&budget_path)
+            .expect("the spend-budget file must exist after the loss rule fires");
+        let state: serde_json::Value =
+            serde_json::from_str(&raw).expect("the budget file must be valid JSON");
+        assert_eq!(state["killed"], serde_json::json!(true));
+        assert!(
+            state["kill_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("over-settlement")),
+            "the persisted kill must name the loss-rule reason: {raw}"
+        );
+
+        // Every later funded flow refuses (C2 all-value-touching).
+        let mint = supervisor
+            .make_invoice(10, "after loss", "loss-key-2")
+            .await
+            .expect_err("a killed surface must refuse minting after the loss rule");
+        assert!(matches!(mint, SovereignWalletError::SpendHalted(_)));
+        let pay = supervisor
+            .pay_invoice("lntbs10u1p0example", "loss-key-3")
+            .await
+            .expect_err("a killed surface must refuse paying after the loss rule");
+        assert!(matches!(pay, SovereignWalletError::SpendHalted(_)));
+
         supervisor.stop().await.ok();
     });
 }

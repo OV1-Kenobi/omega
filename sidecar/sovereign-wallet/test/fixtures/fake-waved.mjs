@@ -20,6 +20,10 @@ const network = process.env.FAKE_WAVED_NETWORK ?? "signet";
 const mode = process.env.FAKE_WAVED_MODE ?? "normal";
 const port = Number.parseInt(process.env.FAKE_WAVED_PORT ?? "10031", 10);
 const dataRoot = process.env.FAKE_WAVED_DATA_ROOT;
+// OMEGA-DELTA-0286: the minted-invoice HRP knob — "lnbc100u" serves a
+// mainnet-shaped recv invoice so a mainnet-configured sidecar's mint path is
+// testable end-to-end (the default stays signet-shaped lntbs100u).
+const invoiceHrp = process.env.FAKE_WAVED_INVOICE_HRP ?? "lntbs100u";
 
 // Self-cleaning watchdog: when the spawning sidecar dies (abrupt kill paths),
 // this fake exits instead of lingering and holding ports/pipes. Windows has no
@@ -44,6 +48,7 @@ const watchdog = setInterval(() => {
 const PREIMAGE = "b".repeat(64);
 const PAYMENT_HASH = createHash("sha256").update(Buffer.from(PREIMAGE, "hex")).digest("hex");
 const LNTCBS_INVOICE = buildTestBolt11(PAYMENT_HASH);
+const RECV_INVOICE = invoiceHrp === "lntbs100u" ? LNTCBS_INVOICE : buildTestBolt11(PAYMENT_HASH, invoiceHrp);
 
 const statusBody = () => ({
   ready: true,
@@ -70,7 +75,7 @@ const entry = (kind, status, amountSat) => ({
   updated_at_unix: "1700000001",
   note: "",
   failure_reason: "",
-  request: { lightning_invoice: { invoice: LNTCBS_INVOICE, payment_hash: PAYMENT_HASH } },
+  request: { lightning_invoice: { invoice: RECV_INVOICE, payment_hash: PAYMENT_HASH } },
   progress: { phase: "WALLET_ENTRY_PHASE_CONFIRMED", phase_label: "confirmed", payment_hash: PAYMENT_HASH, preimage: PREIMAGE },
 });
 
@@ -83,7 +88,7 @@ const routes = {
   ...(mode === "no-getinfo"
     ? {}
     : { "/v1/wallet/getinfo": () => ({ block_height: 250000 }) }),
-  "/v1/wallet/recv": () => ({ invoice: LNTCBS_INVOICE, entry: entry("ENTRY_KIND_RECV", "ENTRY_STATUS_PENDING", 10000) }),
+  "/v1/wallet/recv": () => ({ invoice: RECV_INVOICE, entry: entry("ENTRY_KIND_RECV", "ENTRY_STATUS_PENDING", 10000) }),
   "/v1/wallet/prepare-send": () => ({
     send_intent_id: "intent-1",
     amount_sat: "10000",

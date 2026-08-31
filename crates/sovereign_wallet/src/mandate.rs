@@ -3,12 +3,18 @@
 //!
 //! The sidecar's `pay-invoice` is only reachable from Rust call sites that
 //! have already passed [`authorize_sovereign_spend`]: a `TradingInstruction`
-//! for venue `sovereign-wallet` / network `signet` is built with the spending
-//! agent's Nostr pubkey as the principal and run through the store's
-//! principal-aware `authorize`. `MandateDecision::Refused` blocks the payment
-//! — mandates are the only spend gate, and the sidecar cannot spend without an
-//! approved mandate (WP-5 security constraint; SEC-2026-043 principal-only on
-//! this venue).
+//! for venue `sovereign-wallet` is built with the spending agent's Nostr
+//! pubkey as the principal and run through the store's principal-aware
+//! `authorize`. `MandateDecision::Refused` blocks the payment — mandates are
+//! the only spend gate, and the sidecar cannot spend without an approved
+//! mandate (WP-5 security constraint; SEC-2026-043 principal-only on this
+//! venue).
+//!
+//! OMEGA-DELTA-0286: the instruction builder and the gate are network-aware.
+//! The escrow fee composition passes the session's network, so a mainnet
+//! escrow fee is gated by a `(sovereign-wallet, mainnet, principal)` mandate;
+//! signet behavior is unchanged (existing mandates keep working — signet and
+//! regtest both map to `TradingNetwork::Signet`, exactly as before).
 
 use std::collections::BTreeSet;
 
@@ -23,17 +29,30 @@ use trading_mandate::{
 /// exactly this id.
 pub const SOVEREIGN_WALLET_STRATEGY: &str = "wallet_payment";
 
-/// Build the spend instruction for a sovereign-wallet payment of `amount_sat`.
+/// OMEGA-DELTA-0286: map the supervisor's configured network label onto the
+/// mandate's `TradingNetwork`. signet/regtest mandates use `Signet` (the
+/// pre-0286 behavior — unchanged); `mainnet` maps to `Mainnet` so mainnet
+/// payments require a `(sovereign-wallet, mainnet, principal)` mandate.
+pub fn sovereign_wallet_network(label: &str) -> TradingNetwork {
+    if label == "mainnet" {
+        TradingNetwork::Mainnet
+    } else {
+        TradingNetwork::Signet
+    }
+}
+
+/// Build the spend instruction for a sovereign-wallet payment of `amount_sat`
+/// on `network` (the session/configured network — OMEGA-DELTA-0286).
 ///
 /// The instruction's limits are the wallet-payment shape: no position, no
 /// leverage, no daily-loss accounting, no order-rate accounting; the only
 /// meaningful control is `venue_balance_after` = the payment amount, capped by
 /// the mandate's `max_venue_balance` (the per-payment cap the operator
 /// approves).
-pub fn sovereign_wallet_instruction(amount_sat: u64) -> TradingInstruction {
+pub fn sovereign_wallet_instruction(amount_sat: u64, network: TradingNetwork) -> TradingInstruction {
     TradingInstruction {
         venue: SOVEREIGN_WALLET_VENUE.to_string(),
-        network: TradingNetwork::Signet,
+        network,
         strategy_id: SOVEREIGN_WALLET_STRATEGY.to_string(),
         collateral_asset: AssetId::sats(),
         venue_balance_after: amount_sat,
@@ -46,38 +65,45 @@ pub fn sovereign_wallet_instruction(amount_sat: u64) -> TradingInstruction {
 }
 
 /// The single spend gate: authorize a sovereign-wallet payment of
-/// `amount_sat` for `principal` (the spending agent's Nostr pubkey hex).
+/// `amount_sat` on `network` for `principal` (the spending agent's Nostr
+/// pubkey hex).
+///
+/// `network` is the session/configured network (OMEGA-DELTA-0286): the escrow
+/// composition passes the session's network; the L-402 client passes the
+/// supervisor's configured network. Signet behavior is unchanged.
 ///
 /// The store's `authorize` enforces SEC-2026-043 principal-only resolution on
-/// the sovereign-wallet venue: an exact `(sovereign-wallet, signet, principal)`
-/// mandate is required; `PrincipalNotAuthorized` fires otherwise. `Err` here
-/// means the gate could not be evaluated (store failure); `Refused` means the
-/// payment is blocked by policy.
+/// the sovereign-wallet venue: an exact `(sovereign-wallet, <network>,
+/// principal)` mandate is required; `PrincipalNotAuthorized` fires otherwise.
+/// `Err` here means the gate could not be evaluated (store failure); `Refused`
+/// means the payment is blocked by policy.
 pub fn authorize_sovereign_spend(
     store: &MandateStore,
     amount_sat: u64,
+    network: TradingNetwork,
     principal: Option<&str>,
     now_ms: i64,
 ) -> Result<MandateDecision> {
-    store.authorize(&sovereign_wallet_instruction(amount_sat), principal, now_ms)
+    store.authorize(&sovereign_wallet_instruction(amount_sat, network), principal, now_ms)
 }
 
 /// Build the candidate mandate for the dashboard's New Authorization flow:
-/// a principal-keyed sovereign-wallet mandate authorizing payments up to
-/// `max_payment_sat` per payment for `principal_pubkey_hex`.
+/// a principal-keyed sovereign-wallet mandate on `network` authorizing
+/// payments up to `max_payment_sat` per payment for `principal_pubkey_hex`.
 ///
 /// The candidate is validated by `MandateStore::propose`; the widening door
 /// (`apply_ui_approved`) is the only path that creates it, and the
 /// principal-only venue policy (SEC-2026-043) refuses any candidate without a
 /// principal.
 pub fn sovereign_wallet_mandate_candidate(
+    network: TradingNetwork,
     principal_pubkey_hex: &str,
     max_payment_sat: u64,
     expires_at_ms: i64,
 ) -> TradingMandate {
     TradingMandate {
         venue: SOVEREIGN_WALLET_VENUE.to_string(),
-        network: TradingNetwork::Signet,
+        network,
         principal_pubkey: Some(principal_pubkey_hex.to_string()),
         collateral_asset: AssetId::sats(),
         objective: format!(
@@ -113,8 +139,12 @@ mod tests {
     const OTHER: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
 
     fn approve_agent_mandate(store: &MandateStore, max_payment_sat: u64, now: i64) {
-        let candidate =
-            sovereign_wallet_mandate_candidate(AGENT, max_payment_sat, now + 100_000);
+        let candidate = sovereign_wallet_mandate_candidate(
+            TradingNetwork::Signet,
+            AGENT,
+            max_payment_sat,
+            now + 100_000,
+        );
         let proposal = store.propose(candidate).expect("proposal");
         // The widening application is the store's own test-support seam (the
         // production widening door stays on the settings-UI approval path,
@@ -128,7 +158,7 @@ mod tests {
         let store = MandateStore::in_memory().expect("store");
         approve_agent_mandate(&store, 50_000, 1);
         assert_eq!(
-            authorize_sovereign_spend(&store, 10_000, Some(AGENT), 2).expect("gate"),
+            authorize_sovereign_spend(&store, 10_000, TradingNetwork::Signet, Some(AGENT), 2).expect("gate"),
             MandateDecision::Authorized { revision: 1 }
         );
     }
@@ -137,7 +167,7 @@ mod tests {
     fn the_gate_refuses_without_an_approved_mandate() {
         let store = MandateStore::in_memory().expect("store");
         assert_eq!(
-            authorize_sovereign_spend(&store, 10_000, Some(AGENT), 1).expect("gate"),
+            authorize_sovereign_spend(&store, 10_000, TradingNetwork::Signet, Some(AGENT), 1).expect("gate"),
             MandateDecision::Refused {
                 reason: MandateRefusal::PrincipalNotAuthorized {
                     principal: AGENT.into(),
@@ -148,7 +178,7 @@ mod tests {
         // A None-principal flow on the principal-only venue is Missing (no
         // venue-wide mandate can exist — SEC-2026-043).
         assert_eq!(
-            authorize_sovereign_spend(&store, 10_000, None, 1).expect("gate"),
+            authorize_sovereign_spend(&store, 10_000, TradingNetwork::Signet, None, 1).expect("gate"),
             MandateDecision::Refused {
                 reason: MandateRefusal::Missing,
                 required_posture: trading_mandate::RequiredRiskPosture::FlatRisk,
@@ -163,7 +193,7 @@ mod tests {
         // SEC-2026-043: another principal's spend is refused even though a
         // principal-keyed mandate exists on the pair (no venue-wide fallback).
         assert_eq!(
-            authorize_sovereign_spend(&store, 10_000, Some(OTHER), 2).expect("gate"),
+            authorize_sovereign_spend(&store, 10_000, TradingNetwork::Signet, Some(OTHER), 2).expect("gate"),
             MandateDecision::Refused {
                 reason: MandateRefusal::PrincipalNotAuthorized {
                     principal: OTHER.into(),
@@ -178,7 +208,7 @@ mod tests {
         let store = MandateStore::in_memory().expect("store");
         approve_agent_mandate(&store, 50_000, 1);
         assert_eq!(
-            authorize_sovereign_spend(&store, 50_001, Some(AGENT), 2).expect("gate"),
+            authorize_sovereign_spend(&store, 50_001, TradingNetwork::Signet, Some(AGENT), 2).expect("gate"),
             MandateDecision::Refused {
                 reason: MandateRefusal::VenueBalanceLimit {
                     asset: AssetId::sats(),
@@ -191,16 +221,49 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_requires_a_mainnet_mandate_for_a_mainnet_instruction() {
+        // OMEGA-DELTA-0286: a (sovereign-wallet, mainnet, principal) mandate
+        // is required for a mainnet spend — the signet mandate does not
+        // authorize it, and the mainnet mandate does.
+        let store = MandateStore::in_memory().expect("store");
+        approve_agent_mandate(&store, 50_000, 1);
+        assert_eq!(
+            authorize_sovereign_spend(&store, 10_000, TradingNetwork::Mainnet, Some(AGENT), 2).expect("gate"),
+            MandateDecision::Refused {
+                reason: MandateRefusal::PrincipalNotAuthorized {
+                    principal: AGENT.into(),
+                },
+                required_posture: trading_mandate::RequiredRiskPosture::FlatRisk,
+            }
+        );
+        let mainnet_candidate = sovereign_wallet_mandate_candidate(
+            TradingNetwork::Mainnet,
+            AGENT,
+            50_000,
+            100_000,
+        );
+        let proposal = store.propose(mainnet_candidate).expect("mainnet proposal");
+        trading_mandate::apply_ui_approved_for_test(&store, proposal, 2)
+            .expect("approved mainnet mandate");
+        assert_eq!(
+            authorize_sovereign_spend(&store, 10_000, TradingNetwork::Mainnet, Some(AGENT), 3).expect("gate"),
+            MandateDecision::Authorized { revision: 2 }
+        );
+    }
+
+    #[test]
     fn the_candidate_is_principal_only_and_digest_bound() {
         let store = MandateStore::in_memory().expect("store");
-        let mut venue_wide = sovereign_wallet_mandate_candidate(AGENT, 50_000, 100_000);
+        let mut venue_wide =
+            sovereign_wallet_mandate_candidate(TradingNetwork::Signet, AGENT, 50_000, 100_000);
         venue_wide.principal_pubkey = None;
         assert!(
             store.propose(venue_wide).is_err(),
             "a principal-less sovereign-wallet mandate must be refused (SEC-2026-043)"
         );
         // A changed principal is a different scope (Creation), never a widening.
-        let candidate = sovereign_wallet_mandate_candidate(AGENT, 50_000, 100_000);
+        let candidate =
+            sovereign_wallet_mandate_candidate(TradingNetwork::Signet, AGENT, 50_000, 100_000);
         let proposal = store.propose(candidate).expect("proposal");
         assert_eq!(
             proposal.change_class(),

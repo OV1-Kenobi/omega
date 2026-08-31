@@ -4,9 +4,11 @@
 //! (`crates/omega_effectd/src/supervisor.rs`): generation fencing, bounded
 //! line reads, request timeouts, redacted stderr forwarding, Drop-kill, and
 //! the nautilus hard-bail posture (`nautilus_sidecar` refuses non-testnet;
-//! this supervisor refuses anything but signet/regtest at config AND at
-//! startup, and tears the child down if the initialize-reported network is
-//! ever mainnet — SEC-2026-050).
+//! this supervisor refuses anything outside its network grammar at config
+//! AND at startup, and tears the child down if the initialize-reported
+//! network ever mismatches the configured network — SEC-2026-050). Per
+//! OMEGA-DELTA-0286 the grammar includes mainnet, reachable ONLY with the
+//! explicit allow-mainnet opt-in set at the process level.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -28,6 +30,7 @@ use crate::protocol::{
     ErrorCode, HealthResult, InitializeResult, PROTOCOL_SCHEMA, PROTOCOL_VERSION, ResponseFrame,
     request_frame,
 };
+use crate::spend_policy::SpendPolicy;
 
 pub use crate::protocol::MAX_FRAME_BYTES;
 
@@ -71,22 +74,45 @@ pub struct SovereignWalletSupervisor {
     loopback_token: Zeroizing<String>,
     /// Negotiated network from the running child; `None` while stopped.
     negotiated_network: Option<String>,
+    /// OMEGA-DELTA-0300: the spend policy (kill switch + per-surface daily
+    /// budgets + loss-rule auto-kill) consulted by the client choke point
+    /// (crate::client) before any funded flow is forwarded to the sidecar.
+    pub(crate) spend_policy: SpendPolicy,
 }
 
 impl SovereignWalletSupervisor {
     pub fn new(options: SovereignWalletSupervisorOptions) -> Result<Self> {
-        // Mainnet hard-bail at config (nautilus pattern): refuse to even
-        // construct the supervisor for anything but signet/regtest (D4).
+        // OMEGA-DELTA-0286: the network grammar gate (nautilus pattern).
+        // mainnet is refused at construction UNLESS the explicit allow-mainnet
+        // opt-in is set at the process level — the supervisor spawns the
+        // sidecar, so the check lives here once.
         if !crate::SUPPORTED_NETWORKS.contains(&options.network.as_str()) {
             bail!(
-                "sovereign wallet network {:?} is refused; only signet/regtest are permitted (D4)",
+                "sovereign wallet network {:?} is refused; only signet/regtest/mainnet are \
+                 permitted (mainnet requires the allow-mainnet opt-in — OMEGA-DELTA-0286)",
                 options.network
+            );
+        }
+        if options.network == "mainnet"
+            && std::env::var(crate::ALLOW_MAINNET_ENVIRONMENT_VARIABLE).as_deref() != Ok("1")
+        {
+            bail!(
+                "sovereign wallet network \"mainnet\" requires {}=1 (OMEGA-DELTA-0286)",
+                crate::ALLOW_MAINNET_ENVIRONMENT_VARIABLE
             );
         }
         let mut token_bytes = [0u8; MAX_LOOPBACK_TOKEN_BYTES];
         rand::rng().fill_bytes(&mut token_bytes);
         let loopback_token = Zeroizing::new(hex_encode(&token_bytes));
         let generation = options.initial_generation.max(1);
+        // OMEGA-DELTA-0300: the spend policy loads the persisted budget state
+        // and reads the env-level kill at construction (founder-set). A
+        // corrupted budget file is a construction failure (fail-closed).
+        let spend_policy = SpendPolicy::new(
+            &options.data_root,
+            std::env::var(crate::SPEND_KILL_ENVIRONMENT_VARIABLE).as_deref() == Ok("1"),
+        )
+        .context("load the spend policy state (OMEGA-DELTA-0300)")?;
         Ok(Self {
             options,
             generation: AtomicU64::new(generation),
@@ -96,6 +122,7 @@ impl SovereignWalletSupervisor {
             stdout: None,
             loopback_token,
             negotiated_network: None,
+            spend_policy,
         })
     }
 
@@ -134,16 +161,28 @@ impl SovereignWalletSupervisor {
             self.stop().await.ok();
             bail!("sidecar protocol version is incompatible (want {PROTOCOL_VERSION}, got {})", result.protocol_version);
         }
-        // SEC-2026-050: the initialize-reported network (waved's actual
-        // runtime network from the sidecar's probe) must be signet/regtest.
+        // SEC-2026-050 (revised by OMEGA-DELTA-0286): the initialize-reported
+        // network (waved's ACTUAL runtime network from the sidecar's probe)
+        // MUST equal the configured network. `mainnet` is refused UNLESS
+        // configured mainnet AND the allow-mainnet opt-in is present — the
+        // opt-in is re-checked here at startup, never trusting the env alone.
         let reported = result.waved_network.as_deref().unwrap_or(&result.network);
-        if reported == "mainnet" {
+        let allow_mainnet =
+            std::env::var(crate::ALLOW_MAINNET_ENVIRONMENT_VARIABLE).as_deref() == Ok("1");
+        if reported == "mainnet" && !(self.options.network == "mainnet" && allow_mainnet) {
             self.stop().await.ok();
-            bail!("MAINNET_REFUSED: sidecar reported waved on mainnet; child torn down (SEC-2026-050)");
+            bail!(
+                "MAINNET_REFUSED: sidecar reported waved on mainnet; child torn down \
+                 (SEC-2026-050; OMEGA-DELTA-0286)"
+            );
         }
-        if !crate::SUPPORTED_NETWORKS.contains(&reported) {
+        if reported != self.options.network {
             self.stop().await.ok();
-            bail!("sidecar reported an unsupported network {reported:?}; child torn down");
+            bail!(
+                "sidecar reported network {reported:?}, expected {:?}; child torn down \
+                 (SEC-2026-050)",
+                self.options.network
+            );
         }
         self.negotiated_network = Some(reported.to_string());
         Ok(result)
@@ -529,31 +568,38 @@ pub fn fixture_command_with_network(fixture: &Path, network: &str) -> SovereignW
 mod tests {
     use super::*;
 
+    /// OMEGA-DELTA-0286 (updated-with-citation): the refusal remains for the
+    /// UN-OPTED-IN case — `mainnet` construction is refused without
+    /// OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1, and signet construction stays
+    /// accepted. The gated-mainnet construction path is covered by
+    /// `supervisor_accepts_opted_in_mainnet_at_config` in tests.rs.
     #[test]
     fn supervisor_refuses_non_signet_networks_at_config() {
-        let options = default_options(
-            PathBuf::from(std::env::temp_dir()),
-            SovereignWalletCommand {
-                program: PathBuf::from("node"),
-                args: Vec::new(),
-            },
-            "mainnet",
-        )
-        .unwrap();
-        let error = SovereignWalletSupervisor::new(options)
-            .err()
-            .expect("construction with mainnet must fail");
-        assert!(error.to_string().contains("mainnet"), "{error}");
-        let options = default_options(
-            PathBuf::from(std::env::temp_dir()),
-            SovereignWalletCommand {
-                program: PathBuf::from("node"),
-                args: Vec::new(),
-            },
-            "signet",
-        )
-        .unwrap();
-        assert!(SovereignWalletSupervisor::new(options).is_ok());
+        crate::test_support::assert_allow_mainnet_opt_in_absent(|| {
+            let options = default_options(
+                PathBuf::from(std::env::temp_dir()),
+                SovereignWalletCommand {
+                    program: PathBuf::from("node"),
+                    args: Vec::new(),
+                },
+                "mainnet",
+            )
+            .unwrap();
+            let error = SovereignWalletSupervisor::new(options)
+                .err()
+                .expect("construction with mainnet must fail");
+            assert!(error.to_string().contains("mainnet"), "{error}");
+            let options = default_options(
+                PathBuf::from(std::env::temp_dir()),
+                SovereignWalletCommand {
+                    program: PathBuf::from("node"),
+                    args: Vec::new(),
+                },
+                "signet",
+            )
+            .unwrap();
+            assert!(SovereignWalletSupervisor::new(options).is_ok());
+        });
     }
 
     #[test]

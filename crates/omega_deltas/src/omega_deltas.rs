@@ -256,6 +256,9 @@ pub const ENFORCED_DELTAS: &[&str] = &[
     "OMEGA-DELTA-0283",
     "OMEGA-DELTA-0284",
     "OMEGA-DELTA-0285",
+    "OMEGA-DELTA-0286",
+    "OMEGA-DELTA-0287",
+    "OMEGA-DELTA-0300",
     "OMEGA-DELTA-0301",
 ];
 
@@ -3779,6 +3782,29 @@ pub const SOVEREIGN_VAULT_OS_KEYCHAIN_PATH: &str = "sidecar/sovereign-wallet/src
 /// OMEGA-DELTA-0301. The sidecar identity/vault tests carrying the
 /// updated-with-citation markers (fresh-device restore, SEC-2026-052 floor).
 pub const SOVEREIGN_VAULT_IDENTITY_TEST_PATH: &str = "sidecar/sovereign-wallet/test/identity.test.ts";
+
+/// OMEGA-DELTA-0286. The sidecar entry — env grammar + allow-mainnet opt-in.
+pub const SOVEREIGN_SIDECAR_MAIN_PATH: &str = "sidecar/sovereign-wallet/src/main.ts";
+/// OMEGA-DELTA-0286. The waved launch + guards (network type, launch args,
+/// runtime assertion, invoice guard).
+pub const SOVEREIGN_WAVELENGTH_PATH: &str = "sidecar/sovereign-wallet/src/wavelength.ts";
+/// OMEGA-DELTA-0286/0287. The L-402 gateway (network type, mint HRP check,
+/// network-aware honesty labels).
+pub const SOVEREIGN_L402_GATEWAY_PATH: &str = "sidecar/sovereign-wallet/src/l402.ts";
+/// OMEGA-DELTA-0286. The Rust supervisor (grammar gate + startup assertion).
+pub const SOVEREIGN_SUPERVISOR_PATH: &str = "crates/sovereign_wallet/src/supervisor.rs";
+/// OMEGA-DELTA-0286/0300. The Rust client (choke point: kill + ceiling +
+/// loss rule) and the spend-mandate seam.
+pub const SOVEREIGN_CLIENT_PATH: &str = "crates/sovereign_wallet/src/client.rs";
+pub const SOVEREIGN_MANDATE_PATH: &str = "crates/sovereign_wallet/src/mandate.rs";
+/// OMEGA-DELTA-0300. The spend-policy module (kill + budgets + loss-rule
+/// auto-kill + persistence).
+pub const SOVEREIGN_SPEND_POLICY_PATH: &str = "crates/sovereign_wallet/src/spend_policy.rs";
+/// OMEGA-DELTA-0287. The Rust L-402 client (configured-network mandate).
+pub const SOVEREIGN_L402_CLIENT_PATH: &str = "crates/sovereign_wallet/src/l402.rs";
+/// OMEGA-DELTA-0286. The sidecar network-guard tests (invoice/network
+/// assertions, updated-with-citation).
+pub const SOVEREIGN_SIDECAR_UNIT_TEST_PATH: &str = "sidecar/sovereign-wallet/test/unit.test.ts";
 
 #[cfg(test)]
 mod tests {
@@ -32488,6 +32514,299 @@ mod tests {
             ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0301"),
             "OMEGA-DELTA-0301: the delta is no longer listed in \
              ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0286. The sovereign wallet mainnet grammar: `mainnet` is
+    /// accepted ONLY with the explicit allow-mainnet opt-in
+    /// (`OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1`); waved is launched
+    /// `--network=mainnet --allow-mainnet` for the opted-in case ONLY;
+    /// SEC-2026-050 is revised to "reported == configured, mainnet only when
+    /// opted in"; the invoice guard follows the configured network; the
+    /// spend-mandate builder is network-aware. Signet/regtest behavior is
+    /// unchanged; unset never defaults to mainnet.
+    ///
+    /// This check inspects REAL repository state (never comment-only):
+    /// 1. the sidecar env gate (main.ts) refuses mainnet without the opt-in
+    ///    (MAINNET_REFUSED — the negative branch) and carries the exact opt-in
+    ///    env name + the delta citation;
+    /// 2. wavelength.ts carries the `"mainnet"` network type, the
+    ///    `--allow-mainnet` launch flag, the gated runtime assertion, the
+    ///    network-parameterized invoice guard, and the delta citation;
+    /// 3. lib.rs `SUPPORTED_NETWORKS` includes `"mainnet"` and binds the
+    ///    opt-in env constant;
+    /// 4. supervisor.rs carries the config gate (mainnet requires the opt-in)
+    ///    and the revised startup assertion (reported == configured);
+    /// 5. mandate.rs carries the network parameter on the spend gate;
+    /// 6. ENFORCED_DELTAS membership.
+    #[test]
+    fn sovereign_wallet_mainnet_requires_allow_mainnet_opt_in() {
+        // 1. The sidecar env gate: refusal + opt-in + citation.
+        let main_ts = read_repository_file(SOVEREIGN_SIDECAR_MAIN_PATH);
+        for required in [
+            "OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET",
+            "MAINNET_REFUSED: OMEGA_SOVEREIGN_WALLET_NETWORK=mainnet requires",
+            "OMEGA-DELTA-0286",
+        ] {
+            assert!(
+                main_ts.contains(required),
+                "OMEGA-DELTA-0286: main.ts lost `{required}`; the env gate must \
+                 refuse mainnet without the opt-in (negative branch) and cite \
+                 the delta"
+            );
+        }
+        assert!(
+            main_ts.contains("allowMainnet"),
+            "OMEGA-DELTA-0286: main.ts lost the allowMainnet config field; the \
+             positive (opted-in) branch must exist"
+        );
+
+        // 2. wavelength.ts: network type, launch flag, gated assertion,
+        //    parameterized guard, citation.
+        let wavelength = read_repository_file(SOVEREIGN_WAVELENGTH_PATH);
+        for required in [
+            "\"signet\" | \"regtest\" | \"mainnet\"",
+            "--allow-mainnet",
+            "OMEGA-DELTA-0286",
+        ] {
+            assert!(
+                wavelength.contains(required),
+                "OMEGA-DELTA-0286: wavelength.ts lost `{required}`; the mainnet \
+                 network type, the gated --allow-mainnet launch, and the delta \
+                 citation must stay present"
+            );
+        }
+        assert!(
+            wavelength.contains("allowMainnet === true"),
+            "OMEGA-DELTA-0286: wavelength.ts lost the allow-mainnet launch gate; \
+             --allow-mainnet must be passed ONLY for the opted-in mainnet case"
+        );
+        assert!(
+            wavelength.contains("assertNetworkMatches(config.network, status.network")
+                || wavelength.contains("assertNetworkMatches(configured, reported, allowMainnet"),
+            "OMEGA-DELTA-0286: wavelength.ts lost the gated runtime assertion call"
+        );
+
+        // 3. lib.rs: the grammar includes mainnet; the opt-in env name is bound.
+        let lib_rs = read_repository_file("crates/sovereign_wallet/src/lib.rs");
+        for required in [
+            "[\"signet\", \"regtest\", \"mainnet\"]",
+            "OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET",
+            "OMEGA-DELTA-0286",
+        ] {
+            assert!(
+                lib_rs.contains(required),
+                "OMEGA-DELTA-0286: lib.rs lost `{required}`; SUPPORTED_NETWORKS \
+                 must include mainnet and bind the opt-in env name"
+            );
+        }
+
+        // 4. supervisor.rs: config gate + revised startup assertion.
+        let supervisor = read_repository_file(SOVEREIGN_SUPERVISOR_PATH);
+        for required in [
+            "ALLOW_MAINNET_ENVIRONMENT_VARIABLE",
+            "sidecar reported network",
+            "OMEGA-DELTA-0286",
+        ] {
+            assert!(
+                supervisor.contains(required),
+                "OMEGA-DELTA-0286: supervisor.rs lost `{required}`; the config \
+                 gate and the revised runtime assertion must stay present"
+            );
+        }
+
+        // 5. mandate.rs: the network parameter on the spend gate.
+        let mandate = read_repository_file(SOVEREIGN_MANDATE_PATH);
+        for required in ["network: TradingNetwork", "OMEGA-DELTA-0286"] {
+            assert!(
+                mandate.contains(required),
+                "OMEGA-DELTA-0286: mandate.rs lost `{required}`; the spend-mandate \
+                 seam must be network-aware"
+            );
+        }
+
+        // 6. ENFORCED_DELTAS membership.
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0286"),
+            "OMEGA-DELTA-0286: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0287. The L-402 gateway mints and accepts mainnet ONLY
+    /// when the configured network is mainnet; the D4 refusal branch is
+    /// replaced by an HRP-matches-configured-network check (the signet-
+    /// configured refusal kept exactly); the demo titles/state note are
+    /// network-aware ("never mainnet" wording removed only for the
+    /// mainnet-configured state); the Rust client follows the configured
+    /// network.
+    ///
+    /// This check inspects REAL repository state (never comment-only):
+    /// 1. l402.ts carries the `"mainnet"` network type, the HRP-match mint
+    ///    check (the `configuration_error` mismatch branch for a
+    ///    mainnet-configured gateway), the network-aware labels, the
+    ///    network-naming state note, and the delta citation;
+    /// 2. the Rust client (l402.rs) carries the delta citation;
+    /// 3. ENFORCED_DELTAS membership.
+    #[test]
+    fn l402_gateway_mainnet_follows_the_configured_network() {
+        let gateway = read_repository_file(SOVEREIGN_L402_GATEWAY_PATH);
+        for required in [
+            "network: \"signet\" | \"regtest\" | \"mainnet\"",
+            "mainnet-configured gateway",
+            "mainnet demo",
+            "OMEGA-DELTA-0287",
+        ] {
+            assert!(
+                gateway.contains(required),
+                "OMEGA-DELTA-0287: l402.ts lost `{required}`; the mainnet network \
+                 type, the HRP-match mint check, the network-aware labels, and \
+                 the delta citation must stay present"
+            );
+        }
+        assert!(
+            gateway.contains("mainnet_refused") && gateway.contains("configuration_error"),
+            "OMEGA-DELTA-0287: l402.ts lost the mint refusal branches; the signet-\
+             configured refusal AND the mainnet-configured mismatch refusal must \
+             both exist"
+        );
+
+        let l402_client = read_repository_file(SOVEREIGN_L402_CLIENT_PATH);
+        assert!(
+            l402_client.contains("OMEGA-DELTA-0287"),
+            "OMEGA-DELTA-0287: the Rust L-402 client lost the delta citation"
+        );
+
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0287"),
+            "OMEGA-DELTA-0287: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0300. Spend kill switch + per-surface daily budgets
+    /// (Decision 4): `OMEGA_SPEND_KILL=1` blocks every funded flow; the
+    /// per-surface daily ceiling (1,000 sats first phase, reversible
+    /// assumption) counts mints + payments on `wallet-l402`; spend-budget.json
+    /// persists at the locked data root (atomic write-then-rename, UTC-day
+    /// rollover, single Rust writer); the loss rule auto-sets the kill
+    /// fail-closed with a named halted state. **C2 semantics (SEC-2026-100,
+    /// bound by this check):** the kill scope is ALL-VALUE-TOUCHING — mint
+    /// AND pay are both refused when killed — with the corrected value-
+    /// direction label (minting commits the wallet to RECEIVE, not spend).
+    ///
+    /// This check inspects REAL repository state (never comment-only):
+    /// 1. spend_policy.rs carries the kill env name, the surface name, the
+    ///    ceiling value, the budget file name, and the delta citation;
+    /// 2. client.rs consults the policy in BOTH make_invoice and pay_invoice
+    ///    (at least two `check_spend` call sites — the C2 all-value-touching
+    ///    binding) and carries the loss-rule auto-kill;
+    /// 3. the registry row (OMEGA_DELTAS.md) records the decided C2 semantics
+    ///    text — ALL-VALUE-TOUCHING and the honest value-direction statement;
+    /// 4. ENFORCED_DELTAS membership;
+    /// 5. the sidecar gateway mint path (kill closure, 2026-08-31): the
+    ///    gateway's HTTP mint is sidecar-internal (a direct waved recv) and
+    ///    does NOT traverse the Rust choke point, so main.ts reads the kill
+    ///    env itself on the gateway mint callback and refuses with the
+    ///    SPEND_HALTED envelope BEFORE contacting waved, and l402.ts maps
+    ///    that envelope to the stable 503 spend_halted error.
+    #[test]
+    fn spend_kill_switch_and_budgets_are_enforced() {
+        let policy = read_repository_file(SOVEREIGN_SPEND_POLICY_PATH);
+        for required in [
+            "OMEGA_SPEND_KILL",
+            "wallet-l402",
+            "1_000",
+            "spend-budget.json",
+            "OMEGA-DELTA-0300",
+        ] {
+            assert!(
+                policy.contains(required),
+                "OMEGA-DELTA-0300: spend_policy.rs lost `{required}`; the kill env \
+                 name, the surface, the ceiling, the budget file, and the delta \
+                 citation must stay present"
+            );
+        }
+        assert!(
+            policy.contains("utc_day") && policy.contains("auto_kill_loss_rule"),
+            "OMEGA-DELTA-0300: spend_policy.rs lost the UTC-day rollover or the \
+             loss-rule auto-kill; the budget mechanism must stay complete"
+        );
+
+        // C2 binding: the choke point consults the policy on mint AND pay.
+        let client = read_repository_file(SOVEREIGN_CLIENT_PATH);
+        let check_sites = client.matches("check_spend").count();
+        assert!(
+            check_sites >= 2,
+            "OMEGA-DELTA-0300: client.rs has only {check_sites} spend-policy \
+             consult(s); make_invoice AND pay_invoice must both consult the \
+             policy (C2: ALL-VALUE-TOUCHING — mint AND pay blocked when killed)"
+        );
+        assert!(
+            client.contains("auto_kill_loss_rule") && client.contains("SpendHalted"),
+            "OMEGA-DELTA-0300: client.rs lost the loss-rule auto-kill or the \
+             SpendHalted refusal (SEC-2026-098)"
+        );
+
+        // Kill closure (WP-3, 2026-08-31): the L-402 gateway's HTTP mint
+        // path is sidecar-internal (a direct waved recv) and does NOT
+        // traverse the Rust choke point, so the sidecar reads the kill env
+        // itself on that mint path; the gateway maps the SPEND_HALTED
+        // envelope to the stable 503 spend_halted error.
+        let sidecar_main = read_repository_file(SOVEREIGN_SIDECAR_MAIN_PATH);
+        for required in [
+            "OMEGA_SPEND_KILL",
+            "process.env[SPEND_KILL_ENV] === \"1\"",
+            "SPEND_HALTED",
+            "OMEGA-DELTA-0300",
+        ] {
+            assert!(
+                sidecar_main.contains(required),
+                "OMEGA-DELTA-0300: main.ts lost `{required}`; the gateway mint \
+                 path must read the spend kill itself (it does not traverse \
+                 the Rust choke point) and refuse with the SPEND_HALTED \
+                 envelope until the founder re-enables"
+            );
+        }
+        let kill_check = sidecar_main
+            .find("process.env[SPEND_KILL_ENV] === \"1\"")
+            .expect("the gateway mint kill check must exist");
+        let gateway_recv = sidecar_main
+            .find("this.#waved!.client.recvInvoice")
+            .expect("the gateway mint's waved recv call must exist");
+        assert!(
+            kill_check < gateway_recv,
+            "OMEGA-DELTA-0300: the gateway kill check must precede the waved \
+             recv call on the mint path (killed -> refuse BEFORE contacting \
+             waved)"
+        );
+        let gateway = read_repository_file(SOVEREIGN_L402_GATEWAY_PATH);
+        assert!(
+            gateway.contains("SPEND_HALTED") && gateway.contains("spend_halted"),
+            "OMEGA-DELTA-0300: l402.ts lost the SPEND_HALTED envelope \
+             handling; the gateway must map a killed mint refusal to the \
+             stable 503 spend_halted error"
+        );
+
+        // C2 semantics recorded in the registry row (the decided scope +
+        // the honest value-direction label per SEC-2026-100).
+        let registry = read_repository_file(DELTA_REGISTRY_PATH);
+        let row = registry
+            .split("### OMEGA-DELTA-0300")
+            .nth(1)
+            .expect("the 0300 registry row must exist")
+            .split("### OMEGA-DELTA-0301")
+            .next()
+            .expect("the 0300 row must end before 0301");
+        for required in ["ALL-VALUE-TOUCHING", "commits the wallet to RECEIVE, not to spend"] {
+            assert!(
+                row.contains(required),
+                "OMEGA-DELTA-0300: the registry row lost `{required}`; the decided \
+                 C2 semantics must stay recorded"
+            );
+        }
+
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0300"),
+            "OMEGA-DELTA-0300: the delta is no longer listed in ENFORCED_DELTAS"
         );
     }
 }

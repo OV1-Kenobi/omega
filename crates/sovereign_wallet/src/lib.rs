@@ -17,6 +17,7 @@ mod client;
 mod l402;
 mod mandate;
 mod protocol;
+mod spend_policy;
 mod supervisor;
 #[cfg(test)]
 mod tests;
@@ -25,7 +26,7 @@ pub use client::SovereignWalletError;
 pub use l402::{L402PayError, L402Proof, call_paid_route, pay_l402_challenge, parse_l402_challenge_body};
 pub use mandate::{
     SOVEREIGN_WALLET_STRATEGY, authorize_sovereign_spend, sovereign_wallet_instruction,
-    sovereign_wallet_mandate_candidate,
+    sovereign_wallet_mandate_candidate, sovereign_wallet_network,
 };
 pub use protocol::{
     BalanceResult, BlockHeightResult, CreateWalletResult, ErrorCode, ExportNostrSecretResult,
@@ -48,8 +49,20 @@ use smol::lock::Mutex as AsyncMutex;
 
 /// Environment gate for the sovereign wallet lane (market_ui precedent).
 pub const SOVEREIGN_WALLET_ENVIRONMENT_VARIABLE: &str = "OMEGA_SOVEREIGN_WALLET";
-/// The sidecar is only ever launched on signet or regtest (D4).
-pub const SUPPORTED_NETWORKS: &[&str] = &["signet", "regtest"];
+/// The sidecar runs on signet, regtest, or mainnet — mainnet ONLY with the
+/// explicit allow-mainnet opt-in (OMEGA-DELTA-0286); the supervisor config
+/// gate and the sidecar env gate both enforce it.
+pub const SUPPORTED_NETWORKS: &[&str] = &["signet", "regtest", "mainnet"];
+/// OMEGA-DELTA-0286: the explicit mainnet opt-in env name (mirrors waved's
+/// `--allow-mainnet`). `OMEGA_SOVEREIGN_WALLET_NETWORK=mainnet` is refused
+/// without this at the supervisor config gate AND the sidecar env gate.
+pub const ALLOW_MAINNET_ENVIRONMENT_VARIABLE: &str = "OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET";
+/// OMEGA-DELTA-0300 (Decision 4): the environment-level spend kill. When
+/// "1", every funded flow through the supervisor client refuses BEFORE
+/// touching the sidecar; only the founder re-enables. Defined in
+/// `spend_policy` (the 0300 check binds the name there); re-exported here
+/// for the supervisor's construction gate.
+pub const SPEND_KILL_ENVIRONMENT_VARIABLE: &str = spend_policy::SPEND_KILL_ENVIRONMENT_VARIABLE;
 /// Optional override for the node binary used to launch the sidecar.
 pub const NODE_BIN_ENVIRONMENT_VARIABLE: &str = "OMEGA_SOVEREIGN_WALLET_NODE_BIN";
 /// Optional override for the sidecar network (defaults to signet).
@@ -158,4 +171,63 @@ pub fn shared_supervisor(cx: &App) -> Result<SharedSovereignWalletSupervisor> {
 /// True when the shared supervisor exists (flag ON and constructed).
 pub fn supervisor_available(cx: &App) -> bool {
     shared_supervisor(cx).is_ok()
+}
+
+/// OMEGA-DELTA-0286: test support shared by the crate's test modules. The
+/// allow-mainnet opt-in env is process-global, so tests that set it (the
+/// gated-mainnet paths) and tests that assert its absence (the inherited
+/// refusal paths) are serialized on one lock — a parallel race would make
+/// either side flaky.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static MAINNET_OPT_IN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static SPEND_KILL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `run` with the allow-mainnet opt-in env set (serialized), then
+    /// remove it. The unsafe env mutation matches the crate's existing test
+    /// style (edition-2024 env API).
+    pub(crate) fn with_allow_mainnet_opt_in<T>(run: impl FnOnce() -> T) -> T {
+        let _guard = MAINNET_OPT_IN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::set_var(crate::ALLOW_MAINNET_ENVIRONMENT_VARIABLE, "1");
+        }
+        let result = run();
+        unsafe {
+            std::env::remove_var(crate::ALLOW_MAINNET_ENVIRONMENT_VARIABLE);
+        }
+        result
+    }
+
+    /// Run `run` with the allow-mainnet opt-in env guaranteed ABSENT
+    /// (serialized) — the inherited un-opted-in refusal paths use this so a
+    /// concurrently-running gated test cannot make them flaky.
+    pub(crate) fn assert_allow_mainnet_opt_in_absent<T>(run: impl FnOnce() -> T) -> T {
+        let _guard = MAINNET_OPT_IN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::remove_var(crate::ALLOW_MAINNET_ENVIRONMENT_VARIABLE);
+        }
+        run()
+    }
+
+    /// Run `run` with OMEGA_SPEND_KILL=1 set (serialized), then remove it.
+    /// Keep the closure as short as possible — the env is process-global and
+    /// a concurrently-running test that constructs a supervisor would observe
+    /// the kill.
+    pub(crate) fn with_spend_kill_env<T>(run: impl FnOnce() -> T) -> T {
+        let _guard = SPEND_KILL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::set_var(crate::SPEND_KILL_ENVIRONMENT_VARIABLE, "1");
+        }
+        let result = run();
+        unsafe {
+            std::env::remove_var(crate::SPEND_KILL_ENVIRONMENT_VARIABLE);
+        }
+        result
+    }
 }

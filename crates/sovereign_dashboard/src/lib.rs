@@ -1450,8 +1450,16 @@ impl SovereignDashboardPanel {
         let expiry_ms = now_ms.saturating_add(
             (expiry_hours.clamp(1, 24 * 365) * 3_600 * 1_000) as i64,
         );
-        let candidate =
-            sovereign_wallet::sovereign_wallet_mandate_candidate(&pubkey_hex, amount_sat, expiry_ms);
+        // OMEGA-DELTA-0286: the mandate builder is network-aware; the
+        // dashboard's New Authorization flow keeps creating signet mandates
+        // (unchanged behavior — the network-aware operator surface is WP-7's
+        // scope; mainnet mandates are constructed by the escrow/L-402 lanes).
+        let candidate = sovereign_wallet::sovereign_wallet_mandate_candidate(
+            TradingNetwork::Signet,
+            &pubkey_hex,
+            amount_sat,
+            expiry_ms,
+        );
         match store.propose(candidate) {
             Ok(proposal) => {
                 let current = self
@@ -3696,7 +3704,10 @@ mod tests {
 
     #[test]
     fn mandate_scope_label_distinguishes_venue_wide_from_principal_keyed() {
+        // OMEGA-DELTA-0286: the candidate builder gained the network
+        // parameter; the label assertions are unchanged (signet candidate).
         let mut venue_wide = sovereign_wallet::sovereign_wallet_mandate_candidate(
+            TradingNetwork::Signet,
             "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
             1_000,
             1,
@@ -3704,6 +3715,7 @@ mod tests {
         venue_wide.principal_pubkey = None;
         assert!(mandate_scope_label(&venue_wide).contains("venue-wide"));
         let principal_keyed = sovereign_wallet::sovereign_wallet_mandate_candidate(
+            TradingNetwork::Signet,
             "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
             1_000,
             1,

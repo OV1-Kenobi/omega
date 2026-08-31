@@ -7,7 +7,9 @@
 //!
 //! Environment (injected by the supervisor; never secrets in args):
 //!   OMEGA_SOVEREIGN_WALLET_DATA_ROOT        (required)
-//!   OMEGA_SOVEREIGN_WALLET_NETWORK          signet | regtest (mainnet refused)
+//!   OMEGA_SOVEREIGN_WALLET_NETWORK          signet | regtest | mainnet
+//!     (mainnet requires OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1 — 0286)
+//!   OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET    the explicit mainnet opt-in (=1)
 //!   OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN   32-byte hex, per launch
 //!   OMEGA_SOVEREIGN_WALLET_WAVED_BIN        path to the pinned waved artifact
 
@@ -45,11 +47,35 @@ const PAY_TIMEOUT_MS = 180_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 
+/**
+ * OMEGA-DELTA-0286: the explicit mainnet opt-in env name. `mainnet` is
+ * accepted ONLY when this is "1" — mirrors waved's `--allow-mainnet`; the
+ * exact name is bound by the 0286 delta check.
+ */
+export const ALLOW_MAINNET_ENV = "OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET";
+
+/**
+ * OMEGA-DELTA-0300 (kill closure): the environment-level spend kill env
+ * name. The L-402 gateway's HTTP mint path is sidecar-internal (a direct
+ * waved recv call) and does NOT traverse the Rust spend_policy choke point,
+ * so the sidecar reads the kill itself on that mint path — a halted surface
+ * creates no new invoices at the HTTP surface either. Mirrors the Rust-side
+ * constant (crates/sovereign_wallet/src/spend_policy.rs).
+ */
+export const SPEND_KILL_ENV = "OMEGA_SPEND_KILL";
+
 export type WalletState = "none" | "locked" | "syncing" | "ready" | "error";
 
 export interface SidecarConfig {
   dataRoot: string;
   network: WavelengthNetwork;
+  /**
+   * OMEGA-DELTA-0286: the allow-mainnet launch authority. True only when the
+   * configured network is mainnet AND the explicit opt-in env is set at the
+   * process level (parseEnvironment). signet/regtest never set this, and
+   * `--allow-mainnet` is never passed for them.
+   */
+  allowMainnet: boolean;
   loopbackToken: string | undefined;
   wavedBin: string | undefined;
   generation: number;
@@ -252,6 +278,10 @@ export class SidecarCore {
           binary: this.#config.wavedBin,
           dataRoot,
           network,
+          // OMEGA-DELTA-0286: the allow-mainnet launch authority (only the
+          // mainnet-configured + opt-in state is true; signet/regtest never
+          // pass --allow-mainnet).
+          allowMainnet: this.#config.allowMainnet,
           restPort: this.#config.wavedRestPort,
         });
       } catch (error) {
@@ -281,6 +311,19 @@ export class SidecarCore {
         vault: this.#vault,
         walletReady: () => this.#requireWalletReady(),
         mintInvoice: async (amtSat, memo) => {
+          // OMEGA-DELTA-0300 (kill closure): the gateway mint is
+          // sidecar-internal (direct waved recv) and does not traverse the
+          // Rust spend_policy choke point — the sidecar reads the
+          // environment-level kill itself so a killed surface refuses to
+          // mint at the HTTP surface too (C2: ALL-VALUE-TOUCHING; a halted
+          // surface creates no new invoices either). The typed code mirrors
+          // the Rust-side SpendHalted shape; only the founder re-enables.
+          if (process.env[SPEND_KILL_ENV] === "1") {
+            throw envelopeError(
+              "SPEND_HALTED",
+              `SPEND_HALTED: the spend kill is set (${SPEND_KILL_ENV}=1); the gateway refuses to mint until the founder re-enables (OMEGA-DELTA-0300)`,
+            );
+          }
           const received = await this.#waved!.client.recvInvoice(amtSat, memo);
           assertInvoiceNetwork(network, received.invoice);
           return {
@@ -344,12 +387,12 @@ export class SidecarCore {
     clearRegisteredSecrets();
   }
 
-  /** Periodic health: re-assert waved's runtime network (SEC-2026-050). */
+  /** Periodic health: re-assert waved's runtime network (SEC-2026-050, 0286). */
   async health(): Promise<HealthProjection> {
     if (this.#waved) {
       try {
         const status = await this.#waved.status();
-        assertNetworkMatches(this.#config.network, status.network);
+        assertNetworkMatches(this.#config.network, status.network, this.#config.allowMainnet);
       } catch (error) {
         if (isMainnetRefused(error)) {
           // The daemon drifted to mainnet at runtime: hard bail.
@@ -578,8 +621,8 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
       paymentHash,
       amountSat: amtSat,
       memo,
-      // Signet invoices use the lntbs HRP (RV-3 verified against a live
-      // daemon at staging; the guard accepts lntbs/lntb/lnbcrt, never lnbc).
+      // The invoice HRP follows the configured network (OMEGA-DELTA-0286):
+      // lntbs on signet, lnbc on mainnet; the guard refuses any mismatch.
       hrp: received.invoice.slice(0, 5),
     };
     this.#idempotency?.store("make-invoice", idempotencyKey, result);
@@ -605,6 +648,12 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
       actualAmountSat: sent.actual_amount_sat,
       expectedFeeSat: prepared.expected_fee_sat,
       feeKnown: prepared.fee_known,
+      // OMEGA-DELTA-0300 (loss rule, SEC-2026-098): the prepared-for total
+      // outflow (invoice amount + expected fee) is reported so the Rust-side
+      // expected-vs-actual settle comparison has the expected bound — a
+      // payment settling for MORE than this auto-sets the spend kill.
+      expectedTotalOutflowSat: prepared.expected_total_outflow_sat,
+      totalOutflowKnown: prepared.total_outflow_known,
       warning: prepared.warning,
       preimage,
     };
@@ -1126,13 +1175,19 @@ export async function runFrameLoop(core: SidecarCore): Promise<void> {
 
 export function parseEnvironment(): SidecarConfig {
   const networkRaw = process.env.OMEGA_SOVEREIGN_WALLET_NETWORK;
-  if (networkRaw === "mainnet") {
-    throw envelopeError("MAINNET_REFUSED", "MAINNET_REFUSED: OMEGA_SOVEREIGN_WALLET_NETWORK=mainnet is refused (D4)");
+  // OMEGA-DELTA-0286: mainnet is accepted ONLY with the explicit opt-in.
+  // Without it: MAINNET_REFUSED exactly as before (D4). An unset network
+  // never defaults to mainnet.
+  if (networkRaw === "mainnet" && process.env[ALLOW_MAINNET_ENV] !== "1") {
+    throw envelopeError(
+      "MAINNET_REFUSED",
+      `MAINNET_REFUSED: OMEGA_SOVEREIGN_WALLET_NETWORK=mainnet requires ${ALLOW_MAINNET_ENV}=1 (OMEGA-DELTA-0286)`,
+    );
   }
-  if (networkRaw !== "signet" && networkRaw !== "regtest") {
+  if (networkRaw !== "signet" && networkRaw !== "regtest" && networkRaw !== "mainnet") {
     throw envelopeError(
       "INVALID_ARGS",
-      "INVALID_ARGS: OMEGA_SOVEREIGN_WALLET_NETWORK must be signet or regtest; an unset network never defaults to mainnet (design §3.2)",
+      `INVALID_ARGS: OMEGA_SOVEREIGN_WALLET_NETWORK must be signet, regtest, or mainnet (mainnet only with ${ALLOW_MAINNET_ENV}=1); an unset network never defaults to mainnet (design §3.2)`,
     );
   }
   const dataRoot = process.env.OMEGA_SOVEREIGN_WALLET_DATA_ROOT;
@@ -1151,6 +1206,7 @@ export function parseEnvironment(): SidecarConfig {
   return {
     dataRoot,
     network: networkRaw as WavelengthNetwork,
+    allowMainnet: networkRaw === "mainnet" && process.env[ALLOW_MAINNET_ENV] === "1",
     loopbackToken,
     wavedBin,
     generation,

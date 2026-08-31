@@ -40,6 +40,13 @@ pub enum ErrorCode {
     /// pinned build serves getinfo gRPC-only, so no observed tip exists. The
     /// escrow timeout gate fails closed on this (never wall-clock).
     WavedHeightUnavailable,
+    /// OMEGA-DELTA-0300 (kill closure): the sidecar's gateway mint path
+    /// reads the environment-level spend kill and refuses with this code.
+    /// The Rust choke point refuses BEFORE forwarding when killed, so this
+    /// code can only arrive across the check/forward race — the variant
+    /// keeps the envelope decodable (additive; the client maps it to a
+    /// Protocol error).
+    SpendHalted,
     IncompatibleVersion,
     Internal,
 }
@@ -193,6 +200,18 @@ pub struct PayResult {
     pub expected_fee_sat: String,
     #[serde(default)]
     pub fee_known: bool,
+    /// OMEGA-DELTA-0300 (loss rule, SEC-2026-098): the prepared-for total
+    /// outflow (invoice amount + expected fee) — the EXPECTED bound of the
+    /// expected-vs-actual settle comparison at `pay_invoice`. Only meaningful
+    /// when `total_outflow_known` is true (the sidecar's prepare-send quote
+    /// answered).
+    #[serde(default)]
+    pub expected_total_outflow_sat: String,
+    /// OMEGA-DELTA-0300: whether the sidecar's prepare-send answered a known
+    /// total outflow. When false, no expected bound exists and the loss rule
+    /// cannot fire (it must not false-trigger on unknown quotes).
+    #[serde(default)]
+    pub total_outflow_known: bool,
     #[serde(default)]
     pub warning: String,
     /// Proof of payment; the sidecar redacts it from every log and never

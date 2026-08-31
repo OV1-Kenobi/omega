@@ -1,4 +1,11 @@
 //! Typed client for the sovereign wallet sidecar loopback protocol (design §2).
+//!
+//! OMEGA-DELTA-0300: `make_invoice`/`pay_invoice` are the supervisor client
+//! choke point every funded flow passes (escrow fee composition, mandate-
+//! gated L-402 pay, wallet payments). Both consult the `spend_policy` (kill +
+//! per-surface daily ceiling) BEFORE forwarding to the sidecar, and
+//! `pay_invoice` runs the loss-rule expected-vs-actual settle comparison
+//! (SEC-2026-098) on the result.
 
 use anyhow::{anyhow, Result};
 use serde_json::{Value, json};
@@ -7,6 +14,7 @@ use crate::protocol::{
     BalanceResult, BlockHeightResult, CreateWalletResult, ErrorCode, ExportNostrSecretResult,
     IdentityStatusResult, InvoiceResult, PayResult, StatusResult,
 };
+use crate::spend_policy::{SURFACE_WALLET_L402, bolt11_amount_sats};
 use crate::supervisor::SovereignWalletSupervisor;
 
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +32,14 @@ pub enum SovereignWalletError {
     },
     #[error("mainnet refused")]
     MainnetRefused,
+    /// OMEGA-DELTA-0300: the spend kill is set (env-level or the persisted
+    /// loss-rule auto-kill) — the named halted state; every funded flow
+    /// refuses until the founder re-enables.
+    #[error("spend halted: {0}")]
+    SpendHalted(String),
+    /// OMEGA-DELTA-0300: the per-surface daily ceiling would be exceeded.
+    #[error("spend policy refused: {0}")]
+    SpendPolicyRefused(String),
 }
 
 impl SovereignWalletError {
@@ -97,6 +113,12 @@ impl SovereignWalletSupervisor {
         memo: &str,
         idempotency_key: &str,
     ) -> Result<InvoiceResult, SovereignWalletError> {
+        // OMEGA-DELTA-0300 (C2, SEC-2026-100): the spend policy gate BEFORE
+        // forwarding — a killed surface creates no new invoices either
+        // (ALL-VALUE-TOUCHING); the daily ceiling counts mints + payments.
+        let now = now_unix();
+        self.spend_policy
+            .check_spend(SURFACE_WALLET_L402, amt_sat, now)?;
         let result = self
             .request(
                 "make-invoice",
@@ -104,10 +126,21 @@ impl SovereignWalletSupervisor {
                 self.generation(),
             )
             .await?;
-        decode(result, "invoice result")
+        let invoice: InvoiceResult = decode(result, "invoice result")?;
+        // Count real mints only (the sidecar confirmed the mint).
+        self.spend_policy.record_spend(SURFACE_WALLET_L402, amt_sat, now)?;
+        Ok(invoice)
     }
 
     pub async fn pay_invoice(&mut self, invoice: &str, idempotency_key: &str) -> Result<PayResult, SovereignWalletError> {
+        // OMEGA-DELTA-0300: the spend policy gate BEFORE forwarding. The
+        // ceiling amount is the invoice's BOLT11 amount (pay-any invoices
+        // have no amount — the kill remains the hard control; recorded in
+        // WP-3 evidence).
+        let now = now_unix();
+        let amount_sats = bolt11_amount_sats(invoice).unwrap_or(0);
+        self.spend_policy
+            .check_spend(SURFACE_WALLET_L402, amount_sats, now)?;
         let result = self
             .request(
                 "pay-invoice",
@@ -115,7 +148,30 @@ impl SovereignWalletSupervisor {
                 self.generation(),
             )
             .await?;
-        decode(result, "pay result")
+        let pay: PayResult = decode(result, "pay result")?;
+        // C3 / SEC-2026-098 — the loss rule: expected-vs-actual settle
+        // comparison. The sidecar reports the prepared-for total outflow
+        // (invoice amount + expected fee) and the actual outflow; a payment
+        // that settles for MORE than the prepared total is an unexpected
+        // loss: auto-set the kill FAIL-CLOSED, report the named halted
+        // state, and refuse the result. The Debug & Incident route is opened
+        // before anything resumes (Decision 4; WP-7 renders the state).
+        if pay.total_outflow_known {
+            let actual = pay.actual_amount_sat.parse::<u64>().unwrap_or(0);
+            let expected = pay.expected_total_outflow_sat.parse::<u64>().unwrap_or(0);
+            if actual > expected {
+                let reason = format!(
+                    "loss-rule: over-settlement (actual {actual} sats > expected {expected} sats)"
+                );
+                self.spend_policy.auto_kill_loss_rule(&reason, now)?;
+                return Err(SovereignWalletError::SpendHalted(
+                    self.spend_policy.halt_message(),
+                ));
+            }
+        }
+        // Count real payments only (the sidecar confirmed the payment).
+        self.spend_policy.record_spend(SURFACE_WALLET_L402, amount_sats, now)?;
+        Ok(pay)
     }
 
     pub async fn activity(&mut self, limit: u32) -> Result<Value, SovereignWalletError> {
@@ -204,4 +260,13 @@ impl SovereignWalletSupervisor {
     pub async fn shutdown(&mut self) -> Result<Value, SovereignWalletError> {
         self.request("shutdown", None, self.generation()).await
     }
+}
+
+/// Current unix time in seconds (the spend policy's clock; UTC-day rollover
+/// is computed from this).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }

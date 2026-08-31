@@ -36,6 +36,7 @@ export type ErrorCode =
   | "WAVED_WALLET_API_UNAVAILABLE"
   | "WAVED_HEIGHT_UNAVAILABLE"
   | "INCOMPATIBLE_VERSION"
+  | "SPEND_HALTED"
   | "INTERNAL";
 
 export interface ErrorEnvelope {

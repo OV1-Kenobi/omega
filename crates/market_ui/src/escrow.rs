@@ -753,9 +753,14 @@ pub async fn pay_arbitration_fee_and_request_arbitration(
     let fee_sats = session.arbitration_fee_flat_sats;
     // The fee is a wallet payment: the sovereign-wallet venue's principal
     // mandate gates it (SEC-2026-043), separately from the escrow mandate.
+    // OMEGA-DELTA-0286: the mandate instruction carries the SESSION's
+    // network, so a mainnet escrow fee is gated by a
+    // (sovereign-wallet, mainnet, principal) mandate; signet behavior is
+    // unchanged.
     match sovereign_wallet::authorize_sovereign_spend(
         mandates,
         fee_sats,
+        session.network,
         Some(escalator_pubkey),
         now_ms,
     )? {

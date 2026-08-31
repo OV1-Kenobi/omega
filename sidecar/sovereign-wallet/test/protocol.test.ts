@@ -370,7 +370,7 @@ describe("protocol round-trip against fake waved", () => {
     }
   });
 
-  it("mainnet env is refused at startup (D4)", async () => {
+  it("OMEGA-DELTA-0286: mainnet env WITHOUT the opt-in is refused at startup (MAINNET_REFUSED)", async () => {
     const sidecar = spawnSidecar({ OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet" });
     const exitCode = await waitForExit(sidecar.child);
     assert.notEqual(exitCode, 0);
@@ -378,15 +378,37 @@ describe("protocol round-trip against fake waved", () => {
     await sidecar.close();
   });
 
+  it("OMEGA-DELTA-0286: mainnet env WITH the opt-in configures mainnet (reported == configured)", async () => {
+    const sidecar = spawnSidecar({
+      OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
+      OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
+      FAKE_WAVED_NETWORK: "mainnet",
+    });
+    try {
+      const initialize = expectOk(await sidecar.request("initialize"));
+      assert.equal(initialize.network, "mainnet");
+      // SEC-2026-050 (0286 revision): the probed runtime network must equal
+      // the configured network — mainnet accepted only when configured
+      // mainnet AND the opt-in is present.
+      assert.equal(initialize.wavedNetwork, "mainnet");
+      assert.equal(initialize.wavedState, "connected");
+      const health = expectOk(await sidecar.request("health"));
+      assert.equal(health.ok, true);
+      assert.equal(health.network, "mainnet");
+    } finally {
+      await sidecar.close();
+    }
+  });
+
   it("an unset network never defaults to mainnet (design §3.2)", async () => {
     const sidecar = spawnSidecar({ OMEGA_SOVEREIGN_WALLET_NETWORK: "" });
     const exitCode = await waitForExit(sidecar.child);
     assert.notEqual(exitCode, 0);
-    assert.match(sidecar.stderrText(), /must be signet or regtest/);
+    assert.match(sidecar.stderrText(), /must be signet, regtest, or mainnet/);
     await sidecar.close();
   });
 
-  it("SEC-2026-050: waved reporting mainnet at runtime is refused (MAINNET_REFUSED)", async () => {
+  it("SEC-2026-050 (OMEGA-DELTA-0286): waved reporting mainnet at runtime is refused when not configured mainnet (MAINNET_REFUSED)", async () => {
     const sidecar = spawnSidecar({ FAKE_WAVED_NETWORK: "mainnet" });
     const exitCode = await waitForExit(sidecar.child);
     assert.notEqual(exitCode, 0);
@@ -448,7 +470,7 @@ describe("protocol round-trip against fake waved", () => {
     }
   });
 
-  it("mainnet invoices are refused on pay (lnbc prefix guard)", async () => {
+  it("OMEGA-DELTA-0286: mainnet invoices are refused on pay on a signet-configured wallet (lnbc prefix guard)", async () => {
     const sidecar = spawnSidecar({});
     try {
       await sidecar.request("initialize");
@@ -467,6 +489,88 @@ describe("protocol round-trip against fake waved", () => {
         }),
       );
       assert.equal(refused.code, "MAINNET_REFUSED");
+    } finally {
+      await sidecar.close();
+    }
+  });
+
+  it("OMEGA-DELTA-0286: a mainnet-configured wallet mints and pays lnbc (never lnbcrt); mismatched HRP refused on mint AND pay", async () => {
+    const sidecar = spawnSidecar({
+      OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
+      OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
+      FAKE_WAVED_NETWORK: "mainnet",
+      FAKE_WAVED_INVOICE_HRP: "lnbc100u",
+    });
+    try {
+      await sidecar.request("initialize");
+      await sidecar.request("create-wallet", {
+        idempotencyKey: "11111111-1111-4111-8111-111111111111",
+        password: "correct horse battery staple",
+      });
+      await sidecar.request("unlock", {
+        idempotencyKey: "22222222-2222-4222-8222-222222222222",
+        password: "correct horse battery staple",
+      });
+
+      // Mint: the fake waved serves an lnbc invoice and the guard accepts it
+      // (the HRP follows the configured network).
+      const minted = expectOk(
+        await sidecar.request("make-invoice", {
+          amtSat: 10_000,
+          memo: "mainnet test",
+          idempotencyKey: "33333333-3333-4333-8333-333333333333",
+        }),
+      );
+      assert.match(String(minted.hrp), /^lnbc/); // mainnet HRP (0286; the 5-char slice carries the first amount digit)
+
+      // Pay: an lnbc invoice is accepted on the mainnet-configured wallet.
+      const paid = expectOk(
+        await sidecar.request("pay-invoice", {
+          invoice: "lnbc10u1p0example",
+          idempotencyKey: "44444444-4444-4444-8444-444444444444",
+        }),
+      );
+      assert.equal(paid.status, "ENTRY_STATUS_PENDING");
+
+      // Mismatched HRP refused on PAY (a signet invoice on mainnet config).
+      const payMismatch = expectError(
+        await sidecar.request("pay-invoice", {
+          invoice: "lntbs10u1p0example",
+          idempotencyKey: "55555555-5555-4555-8555-555555555555",
+        }),
+      );
+      assert.equal(payMismatch.code, "INVALID_ARGS");
+    } finally {
+      await sidecar.close();
+    }
+  });
+
+  it("OMEGA-DELTA-0286: mismatched HRP refused on MINT on a mainnet-configured wallet (signet invoice from the daemon)", async () => {
+    const sidecar = spawnSidecar({
+      OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
+      OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
+      FAKE_WAVED_NETWORK: "mainnet",
+      // The fake waved serves its default signet-shaped invoice — the wallet
+      // engine guard must refuse it (configuration mismatch).
+    });
+    try {
+      await sidecar.request("initialize");
+      await sidecar.request("create-wallet", {
+        idempotencyKey: "11111111-1111-4111-8111-111111111111",
+        password: "correct horse battery staple",
+      });
+      await sidecar.request("unlock", {
+        idempotencyKey: "22222222-2222-4222-8222-222222222222",
+        password: "correct horse battery staple",
+      });
+      const refused = expectError(
+        await sidecar.request("make-invoice", {
+          amtSat: 10_000,
+          memo: "mismatch",
+          idempotencyKey: "33333333-3333-4333-8333-333333333333",
+        }),
+      );
+      assert.equal(refused.code, "INVALID_ARGS");
     } finally {
       await sidecar.close();
     }

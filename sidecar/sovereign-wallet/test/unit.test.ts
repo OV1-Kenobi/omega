@@ -64,8 +64,8 @@ describe("loopback token (SEC-2026-053)", () => {
   });
 });
 
-describe("invoice/network guards (design §3.4, SEC-2026-050)", () => {
-  it("accepts signet/testnet/regtest invoices and refuses mainnet", () => {
+describe("invoice/network guards (design §3.4, SEC-2026-050; OMEGA-DELTA-0286)", () => {
+  it("accepts signet/testnet/regtest invoices and refuses mainnet on non-mainnet configs", () => {
     assert.equal(assertInvoiceNetwork("signet", "lntbs10u1p0example"), undefined);
     assert.equal(assertInvoiceNetwork("signet", "lntb10u1p0example"), undefined);
     assert.equal(assertInvoiceNetwork("regtest", "lnbcrt10u1p0example"), undefined);
@@ -77,14 +77,41 @@ describe("invoice/network guards (design §3.4, SEC-2026-050)", () => {
     });
   });
 
-  it("refuses a mainnet runtime network report (SEC-2026-050)", () => {
-    assert.throws(() => assertNetworkMatches("signet", "mainnet"), (error) => {
+  it("OMEGA-DELTA-0286: a mainnet-configured wallet accepts lnbc (never lnbcrt) and refuses lntbs/lntb", () => {
+    // The guard follows the configured network: mainnet accepts `lnbc`,
+    // still excluding `lnbcrt`, and refuses signet/testnet HRPs as
+    // mismatched (assertion added by 0286; the signet/regtest assertions
+    // above are unchanged).
+    assert.equal(assertInvoiceNetwork("mainnet", "lnbc10u1p0example"), undefined);
+    assert.throws(() => assertInvoiceNetwork("mainnet", "lnbcrt10u1p0example"), (error) => {
+      return error instanceof WavedErrorImpl && error.envelope.code === "INVALID_ARGS";
+    });
+    assert.throws(() => assertInvoiceNetwork("mainnet", "lntbs10u1p0example"), (error) => {
+      return error instanceof WavedErrorImpl && error.envelope.code === "INVALID_ARGS";
+    });
+    assert.throws(() => assertInvoiceNetwork("mainnet", "lntb10u1p0example"), (error) => {
+      return error instanceof WavedErrorImpl && error.envelope.code === "INVALID_ARGS";
+    });
+  });
+
+  it("OMEGA-DELTA-0286: the runtime assertion requires reported == configured; mainnet only when opted in", () => {
+    // SEC-2026-050 revision (0286): mainnet reported is refused UNLESS
+    // configured mainnet AND the allow-mainnet opt-in is present; any other
+    // mismatch is refused too. Assertions on the signet cases are unchanged.
+    assert.throws(() => assertNetworkMatches("signet", "mainnet", false), (error) => {
       return error instanceof WavedErrorImpl && error.envelope.code === "MAINNET_REFUSED";
     });
-    assert.throws(() => assertNetworkMatches("signet", "testnet"), (error) => {
+    assert.throws(() => assertNetworkMatches("mainnet", "mainnet", false), (error) => {
+      return error instanceof WavedErrorImpl && error.envelope.code === "MAINNET_REFUSED";
+    });
+    assert.equal(assertNetworkMatches("mainnet", "mainnet", true), undefined);
+    assert.throws(() => assertNetworkMatches("signet", "testnet", false), (error) => {
       return error instanceof WavedErrorImpl && error.envelope.code === "INTERNAL";
     });
-    assert.equal(assertNetworkMatches("signet", "signet"), undefined);
+    assert.throws(() => assertNetworkMatches("mainnet", "signet", true), (error) => {
+      return error instanceof WavedErrorImpl && error.envelope.code === "INTERNAL";
+    });
+    assert.equal(assertNetworkMatches("signet", "signet", false), undefined);
   });
 });
 

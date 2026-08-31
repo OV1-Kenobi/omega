@@ -9,12 +9,18 @@
 //!   docs/wavewalletrpc_build.md
 //!
 //! Non-negotiables enforced here:
-//! - signet/regtest only; `--allow-mainnet` NEVER passed; `--network=mainnet`
-//!   refused at startup (MAINNET_REFUSED).
+//! - signet/regtest only; `--allow-mainnet` NEVER passed except on the
+//!   explicit mainnet opt-in path (OMEGA-DELTA-0286: configured mainnet AND
+//!   OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1 -> `--network=mainnet
+//!   --allow-mainnet`); un-opted-in mainnet refused at startup
+//!   (MAINNET_REFUSED). signet/regtest never receive `--allow-mainnet`.
 //! - `--rpc.notls` / `--rpc.no-macaroons` NEVER passed outside regtest.
-//! - Runtime network assertion (SEC-2026-050): after waved starts and on every
-//!   health check, the sidecar calls WalletService.Status and asserts the
-//!   REPORTED network equals the configured network; mismatch or an
+//! - Runtime network assertion (SEC-2026-050, revised by OMEGA-DELTA-0286):
+//!   after waved starts and on every health check, the sidecar calls
+//!   WalletService.Status and asserts the REPORTED network equals the
+//!   configured network; `mainnet` reported is refused UNLESS configured
+//!   mainnet AND the allow-mainnet opt-in is present (the assertion never
+//!   trusts the env alone — the gated state is passed in); mismatch or an
 //!   `Unimplemented` wallet-API response kills waved and fails the sidecar.
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -27,7 +33,7 @@ import type { ErrorCode } from "./protocol.js";
 import { errorEnvelope } from "./protocol.js";
 import { redact } from "./redact.js";
 
-export type WavelengthNetwork = "signet" | "regtest";
+export type WavelengthNetwork = "signet" | "regtest" | "mainnet";
 
 export const WAVED_REST_DEFAULT_PORT = 10031;
 
@@ -35,6 +41,12 @@ export interface WavedLaunchConfig {
   binary: string;
   dataRoot: string;
   network: WavelengthNetwork;
+  /**
+   * OMEGA-DELTA-0286: the explicit allow-mainnet launch authority. Only the
+   * sidecar's mainnet-configured + opt-in state sets this (parseEnvironment);
+   * signet/regtest never set it and never receive `--allow-mainnet`.
+   */
+  allowMainnet?: boolean;
   /** REST gateway base URL, default http://127.0.0.1:10031 */
   restBaseUrl?: string;
   restPort?: number;
@@ -405,6 +417,14 @@ export async function startWaved(config: WavedLaunchConfig): Promise<WavedHandle
     `--datadir=${wavedDataDir}`,
     "--rpc.listenaddr=127.0.0.1:10029",
   ];
+  // OMEGA-DELTA-0286: the "NEVER passed" posture (wavelength.ts:12 and
+  // PROTOCOL.md §6) is superseded for the opted-in mainnet case ONLY —
+  // configured mainnet AND the explicit allow-mainnet opt-in launch
+  // `--network=mainnet --allow-mainnet`. signet/regtest never receive
+  // `--allow-mainnet` (unchanged).
+  if (config.network === "mainnet" && config.allowMainnet === true) {
+    args.push("--allow-mainnet");
+  }
   // NOTE: the REST gateway port is the documented default 10031
   // (api/get-started.md) and is NOT overridden here — the flag to move it is
   // not documented in the fetched waved surface, so an override would be an
@@ -444,6 +464,9 @@ export async function startWaved(config: WavedLaunchConfig): Promise<WavedHandle
     }
   });
 
+  // <data>/<network>/admin.macaroon — mainnet resolves by the same pattern.
+  // [REQUIRES VERIFICATION RV-2: whether waved v0.1.2-rc3 serves a mainnet
+  // data dir under this layout; verified at the staged operator step.]
   const macaroonPath = path.join(wavedDataDir, "data", config.network, "admin.macaroon");
   const client = new WavelengthClient(restBaseUrl, macaroonPath);
   const startupTimeoutMs = config.wavedStartupTimeoutMs ?? 30_000;
@@ -461,7 +484,7 @@ export async function startWaved(config: WavedLaunchConfig): Promise<WavedHandle
     try {
       const status = await client.status();
       probed = true;
-      assertNetworkMatches(config.network, status.network);
+      assertNetworkMatches(config.network, status.network, config.network === "mainnet" && config.allowMainnet === true);
       // Wallet-API probe passed: Status answered, so WalletService is live
       // (a wavewalletrpc-only stub answers UNIMPLEMENTED and throws above).
       await writeWavedPid(runDir, child.pid ?? 0);
@@ -490,11 +513,17 @@ export async function startWaved(config: WavedLaunchConfig): Promise<WavedHandle
   );
 }
 
-/** SEC-2026-050: the daemon's REPORTED network must equal the configured network. */
-export function assertNetworkMatches(configured: string, reported: string): void {
-  if (reported === "mainnet") {
+/**
+ * SEC-2026-050 (revised by OMEGA-DELTA-0286): the daemon's REPORTED network
+ * must equal the configured network. `mainnet` is refused UNLESS the wallet
+ * is configured mainnet AND the allow-mainnet opt-in is present — the
+ * assertion never trusts the env alone (the caller passes the gated state).
+ * `MAINNET_REFUSED` and the fail-closed teardown stay.
+ */
+export function assertNetworkMatches(configured: string, reported: string, allowMainnet: boolean): void {
+  if (reported === "mainnet" && !(configured === "mainnet" && allowMainnet)) {
     throw new WavedErrorImpl(
-      errorEnvelope("MAINNET_REFUSED", `MAINNET_REFUSED: waved reported network mainnet; refusing (SEC-2026-050)`),
+      errorEnvelope("MAINNET_REFUSED", `MAINNET_REFUSED: waved reported network mainnet; refusing (SEC-2026-050; OMEGA-DELTA-0286)`),
     );
   }
   if (reported !== configured) {
@@ -502,14 +531,33 @@ export function assertNetworkMatches(configured: string, reported: string): void
       errorEnvelope(
         "INTERNAL",
         `INTERNAL: waved reported network ${reported}, expected ${configured}; refusing to continue (SEC-2026-050)`,
-        { remediation: "wipe or re-point the wavelength data dir; never --allow-mainnet" },
+        { remediation: "wipe or re-point the wavelength data dir; never --allow-mainnet outside the opted-in mainnet config" },
       ),
     );
   }
 }
 
-/** BOLT11 HRP guard (design §3.4): accept signet/testnet/regtest, refuse mainnet. */
+/**
+ * BOLT11 HRP guard (design §3.4; OMEGA-DELTA-0286): the invoice prefix must
+ * match the configured network on mint AND pay. signet/regtest behavior is
+ * unchanged (`lnbc` refused); a mainnet-configured wallet accepts `lnbc`
+ * (still excluding `lnbcrt`) and refuses `lntbs`/`lntb` as mismatched-HRP.
+ * "Mainnet refused on mint AND pay" becomes "mismatched-HRP refused on mint
+ * AND pay" — the guard is still one function, called on both paths.
+ */
 export function assertInvoiceNetwork(configured: string, invoice: string): void {
+  if (configured === "mainnet") {
+    // lnbc = mainnet; lnbcrt = regtest (starts with lnbc too, so exclude it).
+    if (!invoice.startsWith("lnbc") || invoice.startsWith("lnbcrt")) {
+      throw new WavedErrorImpl(
+        errorEnvelope(
+          "INVALID_ARGS",
+          `invoice prefix ${invoice.slice(0, 5)} does not match the configured network ${configured}`,
+        ),
+      );
+    }
+    return;
+  }
   // lnbc = mainnet; lnbcrt = regtest (starts with lnbc too, so exclude it).
   if (invoice.startsWith("lnbc") && !invoice.startsWith("lnbcrt")) {
     throw new WavedErrorImpl(

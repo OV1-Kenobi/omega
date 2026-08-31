@@ -16,7 +16,9 @@
 //! - Mandate-gated pay is Rust-side (crates/sovereign_wallet/src/l402.rs);
 //!   the Node tests drive the pay step over the stdio `pay-invoice` method
 //!   exactly as the mandate-gated Rust path does (see the Rust tests).
-//! - Mainnet refused: the gateway never mints or accepts mainnet invoices.
+//! - Mainnet follows the configured network (OMEGA-DELTA-0287): the
+//!   signet-configured gateway still refuses lnbc; a mainnet-configured
+//!   gateway mints lnbc challenges and refuses mismatched-HRP invoices.
 //! - Concurrency single-winner: parallel redemptions -> exactly one settles.
 //! - Deferred-settlement crash-window recovery (SEC-2026-048): a `checked`
 //!   redemption without a settle is recoverable after a restart; exactly one
@@ -77,7 +79,7 @@ async function makeGateway(opts: {
   store: L402Store;
   wallet?: TestWallet;
   nowMs?: () => number;
-  network?: "signet" | "regtest";
+  network?: "signet" | "regtest" | "mainnet";
   mintInvoiceOverride?: () => Promise<{ invoice: string; entryPaymentHash: string | null }>;
 }): Promise<L402Gateway> {
   const wallet = opts.wallet ?? makeWallet();
@@ -429,7 +431,7 @@ describe("L-402 gateway unit", () => {
     }
   });
 
-  it("mainnet is refused: an lnbc invoice from the wallet never mints a challenge", async () => {
+  it("OMEGA-DELTA-0287: mainnet is refused on a signet-configured gateway — an lnbc invoice from the wallet never mints a challenge", async () => {
     const { vault, dir } = await makeVault();
     const { store } = await makeStore();
     try {
@@ -441,6 +443,61 @@ describe("L-402 gateway unit", () => {
       const result = await issueChallenge(gateway);
       assert.equal(result.status, 500);
       assert.equal((result.body.error as { code: string }).code, "mainnet_refused");
+    } finally {
+      vault.lock();
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("OMEGA-DELTA-0287: a mainnet-configured gateway mints an lnbc challenge and redeems it", async () => {
+    const { vault, dir } = await makeVault();
+    const { store } = await makeStore();
+    try {
+      const gateway = await makeGateway({
+        vault,
+        store,
+        network: "mainnet",
+        mintInvoiceOverride: async () => ({
+          invoice: buildTestBolt11(PAYMENT_HASH, "lnbc100u"),
+          entryPaymentHash: PAYMENT_HASH,
+        }),
+      });
+      const challenge = await issueChallenge(gateway);
+      assert.equal(challenge.status, 402);
+      assert.match(challenge.headers["www-authenticate"] ?? "", /invoice="lnbc/);
+      assert.match(String(challenge.body.invoice), /^lnbc/);
+      assert.equal(challenge.body.paymentHash, PAYMENT_HASH);
+      // Redemption is network-independent (unchanged; proof verification is a
+      // gateway-HMAC property, not a network property).
+      const macaroon = challenge.body.macaroon as string;
+      const redeemed = await redeem(gateway, DEMO_ECHO_PATH, macaroon, PREIMAGE);
+      assert.equal(redeemed.status, 200);
+      assert.match(String((redeemed.body as { message: string }).message), /mainnet demo/);
+    } finally {
+      vault.lock();
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("OMEGA-DELTA-0287: a mainnet-configured gateway refuses a mismatched-HRP invoice from the wallet engine (configuration error)", async () => {
+    const { vault, dir } = await makeVault();
+    const { store } = await makeStore();
+    try {
+      const gateway = await makeGateway({
+        vault,
+        store,
+        network: "mainnet",
+        // The wallet engine mints a SIGNET invoice on the mainnet gateway.
+        mintInvoiceOverride: async () => ({
+          invoice: buildTestBolt11(PAYMENT_HASH, "lntbs100u"),
+          entryPaymentHash: PAYMENT_HASH,
+        }),
+      });
+      const result = await issueChallenge(gateway);
+      assert.equal(result.status, 500);
+      assert.equal((result.body.error as { code: string }).code, "configuration_error");
     } finally {
       vault.lock();
       store.close();
@@ -687,10 +744,12 @@ async function waitForExit(child: ChildProcess, ms = 10_000): Promise<number | n
  * Bring a fresh sidecar to the operator-ready state: identity ceremony
  * (vault unlocked — required for the gateway HMAC key, SEC-2026-044), wallet
  * create + unlock (required for invoice minting, SEC-2026-054). Returns the
- * sidecar plus the data-root path for restart tests.
+ * sidecar plus the data-root path for restart tests. `overrides` are extra
+ * env vars for the spawned sidecar (e.g. OMEGA_SPEND_KILL for the 0300
+ * kill-closure test).
  */
-async function readySidecar(): Promise<{ sidecar: Sidecar; dataRoot: string }> {
-  const sidecar = spawnSidecar({});
+async function readySidecar(overrides: Record<string, string> = {}): Promise<{ sidecar: Sidecar; dataRoot: string }> {
+  const sidecar = spawnSidecar(overrides);
   await sidecar.request("initialize");
   const prepared = expectOk(await sidecar.request("vault-init-prepare"));
   const words = (prepared.mnemonic as string).split(" ");
@@ -815,6 +874,42 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
       assert.equal(retry.status, 200, "redemption while the wallet is locked must stay honored (SEC-2026-054)");
     } finally {
       await sidecar.close();
+    }
+  });
+
+  it("OMEGA-DELTA-0300 (kill closure): OMEGA_SPEND_KILL=1 refuses the gateway mint with the stable spend_halted error; un-killed mints", async () => {
+    // Killed: the sidecar is spawned with the kill set; the gateway mint
+    // path reads the kill itself (it does not traverse the Rust choke
+    // point) and refuses BEFORE contacting waved.
+    const killed = await readySidecar({ OMEGA_SPEND_KILL: "1" });
+    try {
+      const port = await httpPort(killed.sidecar);
+      const base = `http://127.0.0.1:${port}`;
+      const headers = { authorization: `Bearer ${killed.sidecar.token}` };
+      const killedMint = await fetch(`${base}${DEMO_ECHO_PATH}`, { method: "POST", headers, body: "{}" });
+      assert.equal(killedMint.status, 503);
+      const killedBody = (await killedMint.json()) as { error: { code: string; message: string } };
+      assert.equal(killedBody.error.code, "spend_halted");
+      assert.match(killedBody.error.message, /OMEGA_SPEND_KILL=1/);
+      assert.match(killedBody.error.message, /OMEGA-DELTA-0300/);
+    } finally {
+      await killed.sidecar.close();
+    }
+
+    // Un-killed control: the identical mint path proceeds per the existing
+    // fixtures — the kill env is the only difference between the two spawns.
+    const live = await readySidecar();
+    try {
+      const port = await httpPort(live.sidecar);
+      const base = `http://127.0.0.1:${port}`;
+      const headers = { authorization: `Bearer ${live.sidecar.token}` };
+      const challenge = await fetch(`${base}${DEMO_ECHO_PATH}`, { method: "POST", headers, body: "{}" });
+      assert.equal(challenge.status, 402);
+      const body = (await challenge.json()) as { error: { code: string }; invoice: string };
+      assert.equal(body.error.code, "payment_required");
+      assert.match(body.invoice, /^lntbs/);
+    } finally {
+      await live.sidecar.close();
     }
   });
 
