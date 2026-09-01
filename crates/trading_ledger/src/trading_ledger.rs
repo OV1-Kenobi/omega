@@ -23,6 +23,12 @@ const MAX_NETWORK_ASSET_ID_LENGTH: usize = 200;
 pub const LEDGER_SCHEMA_VERSION: i64 = 3;
 pub const COUNTERPARTY_EXPOSURE_DIVERGENCE_THRESHOLD_BPS: u32 = 500;
 
+/// OMEGA-DELTA-0292 (SEC-2026-094 closure): the escrow lane's ledger
+/// metadata schema marker. The digest-only metadata guard scopes by this
+/// marker (or the presence of `fee_payment_digest`) instead of kind
+/// identity, so the escrow-related `Fee` entry is covered too.
+pub const ESCROW_LEDGER_METADATA_SCHEMA: &str = "omega.escrow.v1";
+
 /// A validated asset identifier. Amounts in this ledger are integers in the
 /// asset's smallest venue-native unit (satoshis for `sats`, micro-USDC style
 /// integer units for `usdc`, and so on); the ledger never converts between
@@ -428,23 +434,81 @@ impl LedgerEntryDraft {
                 bail!("reconciliation alert carries an invalid balance difference");
             }
         }
-        // OMEGA-DELTA-0285 (SEC-2026-088): the escrow kinds carry digests and
-        // references only. The HTLC preimage never enters this ledger — it
-        // lives in the external HTLC holder — and neither do private keys or
-        // payment secrets, so any metadata key naming a preimage is refused
-        // at validation instead of being persisted.
-        if matches!(
-            self.kind,
-            LedgerEntryKind::EscrowCreated
-                | LedgerEntryKind::ArbitrationRequested
-                | LedgerEntryKind::ArbitrationReleased
-                | LedgerEntryKind::ArbitrationRefunded
-        ) && self.metadata.as_object().is_some_and(|object| {
-            object
-                .keys()
-                .any(|key| key.to_ascii_lowercase().contains("preimage"))
-        }) {
+        // OMEGA-DELTA-0285 (SEC-2026-088) / OMEGA-DELTA-0292 (SEC-2026-094
+        // closure): the escrow lane's entries carry digests and references
+        // only. The HTLC preimage never enters this ledger — it lives in the
+        // external HTLC holder — and neither do private keys or payment
+        // secrets, so any metadata key naming a preimage is refused at
+        // validation instead of being persisted. OMEGA-DELTA-0292: the guard
+        // matches on the escrow schema marker (or the presence of the escrow
+        // fee-digest carrier) INSTEAD of kind identity, so the escrow-related
+        // `Fee` entry is covered too.
+        let escrow_scoped = self.metadata.get("schema").and_then(|value| value.as_str())
+            == Some(ESCROW_LEDGER_METADATA_SCHEMA)
+            || self.metadata.get("fee_payment_digest").is_some();
+        if escrow_scoped
+            && self.metadata.as_object().is_some_and(|object| {
+                object
+                    .keys()
+                    .any(|key| key.to_ascii_lowercase().contains("preimage"))
+            })
+        {
             bail!("escrow ledger metadata must stay digest-only (no preimage field)");
+        }
+        // OMEGA-DELTA-0291 (SEC-2026-096 closure): an AUTO-released
+        // `ArbitrationReleased` entry carries its receipt linkage INSIDE the
+        // hash chain — `receipt_digest` + `receipt_event_id`, both
+        // well-formed digests. The human door (`reason_code:
+        // "human_decision"`) is decided by the arbitrator, not by a receipt,
+        // and is exempt; every other released entry — including one with a
+        // missing or unknown door marker — requires the linkage (fail-closed
+        // default).
+        if matches!(self.kind, LedgerEntryKind::ArbitrationReleased) {
+            let automated = self.metadata.get("reason_code").and_then(|value| value.as_str())
+                != Some("human_decision");
+            if automated {
+                let linkage = [
+                    ("receipt_digest", self.metadata.get("receipt_digest")),
+                    ("receipt_event_id", self.metadata.get("receipt_event_id")),
+                ];
+                let (missing, malformed): (Vec<_>, Vec<_>) = linkage
+                    .into_iter()
+                    .map(|(field, value)| {
+                        let text = value.and_then(|value| value.as_str());
+                        let well_formed = text.is_some_and(|text| {
+                            text.len() == 64
+                                && text
+                                    .bytes()
+                                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                        });
+                        (field, text, well_formed)
+                    })
+                    .fold(
+                        (Vec::new(), Vec::new()),
+                        |(mut missing, mut malformed), (field, text, well_formed)| {
+                            if text.is_none() {
+                                missing.push(field);
+                            } else if !well_formed {
+                                malformed.push(field);
+                            }
+                            (missing, malformed)
+                        },
+                    );
+                if !missing.is_empty() {
+                    bail!(
+                        "an auto-released ArbitrationReleased entry must carry its \
+                         receipt linkage ({missing:?}) inside the hash chain \
+                         (OMEGA-DELTA-0291)"
+                    );
+                }
+                if !malformed.is_empty() {
+                    bail!(
+                        "an auto-released ArbitrationReleased entry carries a \
+                         malformed receipt linkage ({malformed:?}); both fields \
+                         must be 64-char lowercase hex digests (OMEGA-DELTA-0291)"
+                    );
+                }
+            }
         }
         if self.kind.requires_postings() && self.postings.is_empty() {
             bail!(
@@ -2721,6 +2785,11 @@ mod tests {
             "decision": "released",
             "decided_by_pubkey": escrow_participant("33"),
             "fee_rerouted_sats": 1_000_i64,
+            // OMEGA-DELTA-0291 (updated-with-citation): this fixture's fee
+            // reroute is the HUMAN door's shape (the automated door reroutes
+            // zero), and an auto-released entry must carry the receipt
+            // linkage — the door marker keeps the human fixture honest.
+            "reason_code": "human_decision",
         });
         draft
     }
@@ -2929,5 +2998,170 @@ mod tests {
                 "escrow metadata must stay digest-only: {keys:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // OMEGA-DELTA-0291/0292: the receipt-linkage rule on auto-released
+    // entries and the marker-scoped digest-only guard (SEC-2026-094/096
+    // closures). The named negative tests are the minimum evidence the
+    // design note (§6.2.1) and 09-wp7b §10 require.
+    // -----------------------------------------------------------------------
+
+    fn escrow_fee_draft() -> LedgerEntryDraft {
+        let mut draft = LedgerEntryDraft::new(
+            format!("escrow:{ESCROW_ID}:arbitration-fee"),
+            3,
+            ESCROW_STRATEGY,
+            LedgerEntryKind::Fee,
+        );
+        draft.postings = vec![
+            participant_posting("requester", &escrow_participant("11"), -1_000),
+            participant_posting("provider", &escrow_participant("33"), 1_000),
+        ];
+        draft.metadata = json!({
+            "schema": ESCROW_LEDGER_METADATA_SCHEMA,
+            "escrow_id": ESCROW_ID,
+            "purpose": "arbitration_fee",
+            "fee_payment_digest": FEE_PAYMENT_DIGEST,
+            "fee_amount_sats": 1_000_i64,
+            "paid_by_pubkey": escrow_participant("11"),
+        });
+        draft
+    }
+
+    fn auto_released_linkage() -> serde_json::Value {
+        json!({
+            "receipt_digest": HASH_LOCK_DIGEST,
+            "receipt_event_id": FEE_PAYMENT_DIGEST,
+        })
+    }
+
+    #[test]
+    fn an_auto_released_entry_without_receipt_linkage_fails_validate() {
+        // OMEGA-DELTA-0291 negative test 1: a released entry lacking the
+        // linkage fails `LedgerEntryDraft::validate`. Fail-closed default: a
+        // missing (or unknown) door marker is treated as automated.
+        let mut draft = arbitration_released_draft(2);
+        draft.metadata.as_object_mut().expect("object").remove("reason_code");
+        let error = draft
+            .validate()
+            .expect_err("missing linkage on an auto-released entry");
+        assert!(error.to_string().contains("OMEGA-DELTA-0291"));
+
+        // The automated door with an explicit marker is refused the same way.
+        let mut draft = arbitration_released_draft(2);
+        draft.metadata["reason_code"] = json!("automated_pass");
+        assert!(draft.validate().is_err(), "automated door requires linkage");
+
+        // The human door is exempt (no receipt decides a human release).
+        let human = arbitration_released_draft(2);
+        assert!(human.validate().is_ok(), "human door needs no linkage");
+    }
+
+    #[test]
+    fn an_auto_released_entry_with_an_unknown_receipt_digest_fails_validate() {
+        // OMEGA-DELTA-0291 negative test 2: linkage that does not carry a
+        // well-formed receipt digest (an unknown/malformed value) fails
+        // validation — both fields must be 64-char lowercase hex digests.
+        for unknown in ["unknown-digest", "", "ABCD", &"ab".repeat(31), &"AB".repeat(32)] {
+            let mut draft = arbitration_released_draft(2);
+            draft.metadata["reason_code"] = json!("automated_pass");
+            draft.metadata["receipt_digest"] = json!(unknown);
+            draft.metadata["receipt_event_id"] = json!(FEE_PAYMENT_DIGEST);
+            let error = draft
+                .validate()
+                .expect_err("unknown/malformed receipt digest refused");
+            assert!(error.to_string().contains("OMEGA-DELTA-0291"));
+        }
+        let mut draft = arbitration_released_draft(2);
+        draft.metadata["reason_code"] = json!("automated_pass");
+        draft.metadata["receipt_digest"] = json!(HASH_LOCK_DIGEST);
+        draft.metadata["receipt_event_id"] = json!("unknown-event");
+        assert!(
+            draft.validate().is_err(),
+            "a malformed event id is refused the same way"
+        );
+    }
+
+    #[test]
+    fn an_auto_released_entry_with_well_formed_linkage_validates_and_chains() {
+        // OMEGA-DELTA-0291 negative test 3 (honest control): the automated
+        // door with well-formed linkage validates and the linkage lands
+        // inside the hash chain.
+        let mut draft = arbitration_released_draft(2);
+        draft.metadata["reason_code"] = json!("automated_pass");
+        let linkage = auto_released_linkage();
+        draft
+            .metadata
+            .as_object_mut()
+            .expect("object")
+            .extend(linkage.as_object().expect("object").clone());
+        draft.validate().expect("well-formed linkage validates");
+        let store = LedgerStore::in_memory().expect("store");
+        store.append(escrow_created_draft()).expect("created");
+        let entry = store.append(draft).expect("auto-released entry appended");
+        assert_eq!(
+            entry.metadata["receipt_digest"], HASH_LOCK_DIGEST,
+            "the linkage rides inside the hash chain"
+        );
+        assert_eq!(entry.metadata["receipt_event_id"], FEE_PAYMENT_DIGEST);
+        store.verify().expect("hash chain covers the linkage");
+    }
+
+    #[test]
+    fn a_fee_kind_entry_with_a_preimage_key_is_refused() {
+        // OMEGA-DELTA-0292 negative test 1: the escrow-related `Fee` entry
+        // (schema marker + fee_payment_digest carrier) refuses preimage keys
+        // — the guard is no longer scoped to the four escrow kinds.
+        let mut leaked = escrow_fee_draft();
+        leaked.metadata["preimage"] = json!("synthetic-refusal-fixture");
+        let error = leaked
+            .validate()
+            .expect_err("a Fee-kind entry with a preimage key is refused");
+        assert!(error.to_string().contains("digest-only"));
+
+        let mut smuggled = escrow_fee_draft();
+        smuggled.metadata["paymentPreimage"] = json!("also-refused");
+        assert!(smuggled.validate().is_err());
+
+        // A Fee entry that merely carries the digest carrier key (without
+        // the schema marker) is covered by the marker-or-carrier rule.
+        let mut carrier_only = escrow_fee_draft();
+        carrier_only
+            .metadata
+            .as_object_mut()
+            .expect("object")
+            .remove("schema");
+        let mut smuggled = carrier_only;
+        smuggled.metadata["preimage"] = json!("still-refused");
+        assert!(smuggled.validate().is_err(), "the carrier key scopes the guard");
+    }
+
+    #[test]
+    fn honest_escrow_and_fee_entries_still_validate_under_the_marker_guard() {
+        // OMEGA-DELTA-0292 negative tests 2+3 (regression + honest control):
+        // the four escrow kinds still refuse preimage keys, and the honest
+        // escrow + fee entries still validate.
+        for mut draft in [
+            escrow_created_draft(),
+            arbitration_requested_draft(),
+            arbitration_released_draft(2),
+            arbitration_refunded_draft(3),
+        ] {
+            draft.metadata["preimage"] = json!("still-refused");
+            assert!(
+                draft.validate().is_err(),
+                "the escrow kinds still refuse preimage keys"
+            );
+        }
+        escrow_fee_draft().validate().expect("honest fee entry validates");
+        escrow_created_draft()
+            .validate()
+            .expect("honest escrow intent validates");
+        let store = LedgerStore::in_memory().expect("store");
+        store
+            .append(escrow_fee_draft())
+            .expect("the honest fee entry appends");
+        store.verify().expect("hash chain holds");
     }
 }

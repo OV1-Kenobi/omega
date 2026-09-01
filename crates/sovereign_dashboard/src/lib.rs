@@ -2993,11 +2993,18 @@ impl SovereignDashboardPanel {
             .child(body)
             // Honesty label (amendment 02b §3): the demo HTLC is external and
             // simulated — the dashboard never claims on-chain settlement.
+            // OMEGA-DELTA-0294: the label is network-aware — it names the
+            // wallet's configured network (the same reported == configured
+            // network the escrow lane inherits; the "signet" fallback is the
+            // wallet section's existing honest-default posture).
             .child(
-                Label::new(
-                    "external signet LN HTLC — simulated limbo in demo; settlement authority \
-                     stays with Bitcoin/Lightning",
-                )
+                Label::new(escrow_honesty_footer(
+                    self.wallet
+                        .status
+                        .as_ref()
+                        .map(|status| status.network.as_str())
+                        .unwrap_or("signet"),
+                ))
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
             )
@@ -3426,8 +3433,9 @@ fn load_escrow_sessions() -> Vec<market_ui::EscrowSession> {
 }
 
 /// WP-5b: the honest escrow state-pill label. The HTLC is always labeled as
-/// the external signet LN HTLC — the demo simulates the limbo and never
-/// claims on-chain settlement (amendment 02b §3 honesty rule).
+/// the external LN HTLC — the demo simulates the limbo and never
+/// claims on-chain settlement (amendment 02b §3 honesty rule; OMEGA-DELTA-
+/// 0294 makes the section footer name the configured network).
 fn escrow_state_label(state: market_ui::EscrowState) -> (&'static str, Color) {
     use market_ui::EscrowState as S;
     match state {
@@ -3446,6 +3454,17 @@ fn escrow_state_label(state: market_ui::EscrowState) -> (&'static str, Color) {
 /// A public Nostr pubkey is exactly 64 hex chars (never key material).
 fn is_valid_pubkey_hex(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// OMEGA-DELTA-0294: the escrow section's honesty footer is network-aware —
+/// "external {network} LN HTLC — simulated limbo in demo; settlement
+/// authority stays with Bitcoin/Lightning". The simulated-limbo wording is
+/// kept (Decision 3 step 1: no on-chain broadcast this step).
+fn escrow_honesty_footer(network: &str) -> String {
+    format!(
+        "external {network} LN HTLC — simulated limbo in demo; settlement authority \
+         stays with Bitcoin/Lightning"
+    )
 }
 
 // ---------------------------------------------------------------------------

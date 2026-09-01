@@ -11100,3 +11100,73 @@ Omega now installs the spend policy at the sovereign-wallet supervisor client ch
 Why: founder Decision 4 (2026-08-31) - 1,000-sat initial funding, pause-and-debug on any lost funds, environment-level kill that refuses further spend until the founder re-enables.
 
 - **Enforced by:** `spend_kill_switch_and_budgets_are_enforced` in `omega_deltas`.
+
+### OMEGA-DELTA-0288 - Escrow SEC-2026-092 closure: request_arbitration refuses unless a committed Fee entry with matching digest AND escrow_id exists in the ledger
+
+Upstream Zed has no escrow arbitration state machine. Omega-before-this enforced the pay-first invariant only at the composition and the dashboard seam: `EscrowSession::request_arbitration` validated the `fee_payment_digest` as 64-hex format only and never queried the ledger for a committed `Fee` entry (latent-seam gap SEC-2026-092, 09-wp7b §8).
+
+Omega now enforces pay-first at the state machine: `request_arbitration` refuses unless the ledger contains a `Fee`-kind entry whose `metadata.fee_payment_digest` equals the supplied digest AND whose `metadata.escrow_id` binds it to this escrow. A well-formed fabricated digest admits nothing, and a real `Fee` entry paid for a different escrow can never gate this one. Named negative tests: fabricated digest refused; forged escrow_id binding refused; the honest composition still passes. The live-fee gate posture is unchanged (OMEGA_ARBITRATION_LIVE_FEES stays the real-invoice opt-in).
+
+Why: the security re-verification conditions the human queue and any second caller of `request_arbitration` on closing SEC-2026-092 (09-wp7b §10 item 2; WP-2 condition C4).
+
+- **Enforced by:** `escrow_pay_first_is_enforced_at_the_state_machine` in `omega_deltas`.
+
+### OMEGA-DELTA-0289 - Escrow SEC-2026-093 closure: decided_by_pubkey bound to the session's arbitrator/principal per door; timeout-door reason_code fixed set
+
+Upstream Zed has no escrow decision doors. Omega-before-this validated `decided_by_pubkey` as 64-hex format only — a well-formed stranger key could decide a release or refund — and the timeout door's `reason_code` was caller-controlled free text within the identifier grammar (latent-seam gap SEC-2026-093, 09-wp7b §8).
+
+Omega now binds `decided_by_pubkey` per door: on `release`, the automated door (from `VerifiedPass`) must be decided by `session.principal_pubkey` and the human door (from `ArbitrationRequested`) by `session.arbitrator_pubkey`; on `refund`, the human door by the arbitrator and the timeout door by the principal. The timeout door's `reason_code` must come from the fixed set `TIMEOUT_REFUND_REASON_CODES` (currently `["htlc_timeout"]`) — no caller free text. Named negative tests: stranger pubkey refused on the human door; arbitrator pubkey refused on the automated door; caller-invented timeout reason refused; all honest doors pass with their bound parties.
+
+Why: the security re-verification conditions the human queue on binding the deciding party (09-wp7b §10 item 2; WP-2 condition C4).
+
+- **Enforced by:** `escrow_decided_by_is_bound_per_door` in `omega_deltas`.
+
+### OMEGA-DELTA-0290 - Escrow SEC-2026-095 closure: receipt gate verifies the provider event signature (receipt verifier family); digest re-derivation stays as the projection step
+
+Upstream Zed has no escrow receipt gate. Omega-before-this re-derived the receipt digest but never verified the event signature: `verify_receipt_claim` trusted the caller's recomputed digest and `ReceiptEventProjection.validate` was shape-only, so a forged event signed by an attacker could drive `VerifiedPass` (latent-seam gap SEC-2026-095, 09-wp7b §8).
+
+Omega now verifies the provider event signature BEFORE the digest transition, reusing the receipt-verifier family (the `immortal_client::domain::Event` seam the receipt ledger projects from): the canonical event id is re-derived from the NIP-01 serialization and the BIP-340 Schnorr signature is verified against the event pubkey. The signer must be the escrow's provider (`counterparty_pubkey`): a validly signed event by a non-provider is refused outright (hard error, session untouched), and a validly-shaped event whose signature does not verify is a failed verification — the session lands in the `VerifiedFail` limbo, never `VerifiedPass`. The digest re-derivation stays as the projection step afterwards, and the digest binding still gates the pass. Named negative tests: wrong signature -> VerifiedFail limbo; non-provider pubkey refused; honest signed event passes with the digest bound.
+
+Why: the security re-verification conditions receipt submission wiring on closing SEC-2026-095 (09-wp7b §10 item 3; WP-2 condition C4).
+
+- **Enforced by:** `escrow_receipt_gate_verifies_the_provider_signature` in `omega_deltas`.
+
+### OMEGA-DELTA-0291 - Escrow SEC-2026-096 closure: auto-released ArbitrationReleased entries carry receipt_digest/receipt_event_id linkage inside the hash chain
+
+Upstream Zed has no escrow settlement linkage. Omega-before-this kept the receipt linkage only in the mutable session JSON, outside the hash chain — the auto-released `ArbitrationReleased` entry carried no `receipt_digest`/`receipt_event_id` metadata (latent-seam gap SEC-2026-096, 09-wp7b §8; amendment 02b §6 required the linkage on any auto-released entry).
+
+Omega now binds the linkage inside the hash chain at two levels. The session: `verify_receipt_claim` records the verified provider event id when a claim passes (additive nullable `receipt_event_id` on the session schema — no version bump), and `release` from `VerifiedPass` refuses unless the verified linkage exists, then writes `receipt_digest` + `receipt_event_id` into the `ArbitrationReleased` metadata. The ledger: `LedgerEntryDraft::validate` refuses any `ArbitrationReleased` entry whose door is not the human decision (`reason_code: "human_decision"`) — including entries with a missing or unknown door marker (fail-closed default) — unless both linkage fields are present and well-formed 64-char lowercase hex digests. Named negative tests: released entry lacking the linkage fails validate; linkage with an unknown/malformed receipt digest fails; the honest path appends both fields and the chain verifies.
+
+Why: the security re-verification conditions receipt submission wiring on persisting the linkage (09-wp7b §10 item 3; WP-2 condition C4).
+
+- **Enforced by:** `escrow_released_entries_carry_receipt_linkage` in `omega_deltas`.
+
+### OMEGA-DELTA-0292 - Escrow SEC-2026-094 closure: digest-only metadata guard widened from the four escrow kinds to the omega.escrow.v1 schema marker (covers the Fee-kind entry)
+
+Upstream Zed has no escrow digest-only guard. Omega-before-this scoped the preimage-refusing metadata guard to the four escrow kinds only, so the escrow-related `Fee`-kind entry (the `fee_payment_digest` carrier) was not covered — a backstop-width gap (latent-seam gap SEC-2026-094, 09-wp7b §8).
+
+Omega now scopes the guard by metadata instead of kind identity: any entry whose metadata carries the `schema: "omega.escrow.v1"` marker (the single-source `ESCROW_LEDGER_METADATA_SCHEMA` constant in trading_ledger) OR the `fee_payment_digest` carrier key refuses any metadata key naming a preimage. Named negative tests: a `Fee`-kind entry with a `preimage` metadata key refused (also with the carrier key alone); the four escrow kinds still refuse preimage keys (regression); honest escrow + fee entries still validate.
+
+Why: the security re-verification conditions mainnet-adjacent hardening on closing SEC-2026-094 (09-wp7b §10 item 5; WP-2 condition C4).
+
+- **Enforced by:** `escrow_digest_guard_covers_the_fee_entry` in `omega_deltas`.
+
+### OMEGA-DELTA-0293 - Escrow timeout window is an operator-configurable session value; bounds 36..=432 blocks; default 144; wording network-agnostic
+
+Upstream Zed has no escrow timeout window. Omega-before-this required the session timeout at escrow open with fixed 36..=432 bounds and "signet blocks" wording (OMEGA-DELTA-0285's mandate-fixed default posture; founder Decision 6 supersedes it).
+
+Omega now makes the session's `timeout_blocks` an operator-configurable value at escrow open (`EscrowOpenParams.timeout_blocks: Option<u32>`): any value in `trading_mandate::MIN_ESCROW_TIMEOUT_BLOCKS..=MAX_ESCROW_TIMEOUT_BLOCKS` (36..=432) is accepted; when unspecified, `DEFAULT_ESCROW_TIMEOUT_BLOCKS` (144 blocks, ~24h) applies at the session creation site. The bounds message is network-agnostic ("blocks", never "signet blocks"). The mandate's `escrow_timeout_blocks` field and its bounds are unchanged. Named negative tests: out-of-range session overrides (0/35/433) refused with network-agnostic wording; 36/432 accepted; the default applied when unspecified.
+
+Why: founder Decision 6 (2026-08-31) — configurable with the 144 default (WP-2 condition C4).
+
+- **Enforced by:** `escrow_timeout_is_operator_configurable_with_default` in `omega_deltas`.
+
+### OMEGA-DELTA-0294 - Escrow live-fee default is 100 sats for real-sats testing (configurable); honesty footer network-aware
+
+Upstream Zed has no escrow arbitration fee. Omega-before-this carried the pending 1,000-sat fee default in the test constants and had a signet-labeled dashboard honesty footer (founder Decision 5 supersedes the 1,000-sat pending default; it also satisfies the 09-wp7b founder-confirmation condition at 100 sats).
+
+Omega now applies the 100-sat default at the operator-created escrow mandate/session creation site: `DEFAULT_ARBITRATION_FEE_FLAT_SATS = 100` resolves when the session fee is unspecified (`EscrowOpenParams.arbitration_fee_flat_sats: Option<u64>`); an explicit mandate/session value still overrides it (the mandate field `arbitration_fee_flat_sats` remains configurable; an explicit zero fee is refused). The inherited test constants are updated-with-citation (the escrow test `FEE` references the default constant; the trading_mandate escrow fixture carries `Some(100)`). The dashboard escrow honesty footer becomes network-aware ("external {network} LN HTLC — simulated limbo in demo; settlement authority stays with Bitcoin/Lightning") from the wallet's configured network, keeping the simulated-limbo wording (Decision 3 step 1 — no on-chain broadcast this step). The escalation button already rendered the session's actual fee and is unchanged. Named tests: the 100-sat default applied when unspecified; an explicit zero fee still refused.
+
+Why: founder Decision 5 (2026-08-31) — 100 sats for real-sats testing (WP-2 condition C4; 09-wp7b §10 item 4 founder-confirmation satisfied).
+
+- **Enforced by:** `escrow_fee_default_is_100_sats_and_labels_network_aware` in `omega_deltas`.

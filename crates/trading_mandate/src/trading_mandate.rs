@@ -2365,7 +2365,12 @@ mod tests {
             allow_escrow: Some(true),
             max_escrow_sats: Some(50_000),
             escrow_timeout_blocks: Some(144),
-            arbitration_fee_flat_sats: Some(1_000),
+            // OMEGA-DELTA-0294: the 1,000-sat test fee is superseded by the
+            // founder's 100-sat decision (Decision 5); the field remains
+            // configurable and the production default is
+            // market_ui's DEFAULT_ARBITRATION_FEE_FLAT_SATS (100) applied at
+            // the escrow mandate/session creation site.
+            arbitration_fee_flat_sats: Some(100),
         }
     }
 

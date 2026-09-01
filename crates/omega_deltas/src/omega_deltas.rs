@@ -256,10 +256,17 @@ pub const ENFORCED_DELTAS: &[&str] = &[
     "OMEGA-DELTA-0283",
     "OMEGA-DELTA-0284",
     "OMEGA-DELTA-0285",
-    "OMEGA-DELTA-0286",
-    "OMEGA-DELTA-0287",
-    "OMEGA-DELTA-0300",
-    "OMEGA-DELTA-0301",
+"OMEGA-DELTA-0286",
+"OMEGA-DELTA-0287",
+"OMEGA-DELTA-0288",
+"OMEGA-DELTA-0289",
+"OMEGA-DELTA-0290",
+"OMEGA-DELTA-0291",
+"OMEGA-DELTA-0292",
+"OMEGA-DELTA-0293",
+"OMEGA-DELTA-0294",
+"OMEGA-DELTA-0300",
+"OMEGA-DELTA-0301",
 ];
 
 /// OMEGA-DELTA-0284. The sidecar identity keygen module — the sidecar's
@@ -3805,6 +3812,17 @@ pub const SOVEREIGN_L402_CLIENT_PATH: &str = "crates/sovereign_wallet/src/l402.r
 /// OMEGA-DELTA-0286. The sidecar network-guard tests (invoice/network
 /// assertions, updated-with-citation).
 pub const SOVEREIGN_SIDECAR_UNIT_TEST_PATH: &str = "sidecar/sovereign-wallet/test/unit.test.ts";
+/// OMEGA-DELTA-0288..0294. The escrow lane's state machine (pay-first gate,
+/// per-door bindings, receipt signature gate, linkage, timeout/fee defaults).
+pub const MARKET_UI_ESCROW_PATH: &str = "crates/market_ui/src/escrow.rs";
+/// OMEGA-DELTA-0291/0292. The trading ledger (linkage rule + digest-only
+/// guard widening).
+pub const TRADING_LEDGER_SOURCE_PATH: &str = "crates/trading_ledger/src/trading_ledger.rs";
+/// OMEGA-DELTA-0293/0294. The trading mandate (escrow fields the session
+/// values resolve against; the 0294 test-fee citation).
+pub const TRADING_MANDATE_SOURCE_PATH: &str = "crates/trading_mandate/src/trading_mandate.rs";
+/// OMEGA-DELTA-0294. The sovereign dashboard (network-aware honesty footer).
+pub const SOVEREIGN_DASHBOARD_LIB_PATH: &str = "crates/sovereign_dashboard/src/lib.rs";
 
 #[cfg(test)]
 mod tests {
@@ -32807,6 +32825,410 @@ mod tests {
         assert!(
             ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0300"),
             "OMEGA-DELTA-0300: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // OMEGA-DELTA-0288..0294 (WP-4, escrow real-funds readiness): the five
+    // SEC-2026-092..096 closures plus the operator-configurable timeout and
+    // the 100-sat fee default. Each check inspects REAL repository state
+    // (never comment-only), binds the refusal branch where the posture has
+    // one, names the owning finding in the registry row, and requires the
+    // delta's own behavior tests to exist.
+    // -----------------------------------------------------------------------
+
+    /// The registry row segment for one of the WP-4 deltas (the rows are
+    /// appended contiguously in numeric order; the last row runs to the end
+    /// of the registry).
+    fn wp4_registry_row(id: &str) -> String {
+        let registry = read_repository_file(DELTA_REGISTRY_PATH);
+        let after = registry
+            .split(&format!("### {id}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("the {id} registry row must exist"));
+        let number: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+        let next_number = number.parse::<u64>().expect("numeric delta id") + 1;
+        let next = format!("### OMEGA-DELTA-{next_number:04}");
+        after
+            .split(&next)
+            .next()
+            .expect("split always yields a first segment")
+            .to_owned()
+    }
+
+    /// OMEGA-DELTA-0288. Pay-first is enforced AT THE STATE MACHINE:
+    /// `request_arbitration` refuses unless the ledger holds a committed
+    /// `Fee` entry whose `fee_payment_digest` matches AND whose `escrow_id`
+    /// binds it to this escrow (SEC-2026-092 closure).
+    ///
+    /// Negative branch: the refusal names the missing committed Fee entry,
+    /// and the two named negative tests (fabricated digest; forged
+    /// escrow_id binding) exist in the owning crate.
+    #[test]
+    fn escrow_pay_first_is_enforced_at_the_state_machine() {
+        let escrow_source_raw = read_repository_file(MARKET_UI_ESCROW_PATH);
+        let escrow_source = outside_the_tests(&escrow_source_raw);
+        for required in [
+            "OMEGA-DELTA-0288",
+            "matches!(entry.kind, LedgerEntryKind::Fee)",
+            ".get(\"fee_payment_digest\")",
+            ".get(\"escrow_id\")",
+            "no committed Fee entry",
+        ] {
+            assert!(
+                escrow_source.contains(required),
+                "OMEGA-DELTA-0288: the escrow state machine lost `{required}`; \
+                 pay-first must stay ledger-verified at the primitive, not \
+                 only at the composition"
+            );
+        }
+        for test_name in [
+            "fn arbitration_refuses_a_well_formed_digest_without_a_committed_fee_entry",
+            "fn arbitration_refuses_a_fee_entry_bound_to_a_different_escrow",
+        ] {
+            assert!(
+                escrow_source_raw.contains(test_name),
+                "OMEGA-DELTA-0288: the owning crate lost the named negative \
+                 test `{test_name}`"
+            );
+        }
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0288").contains("SEC-2026-092"),
+            "OMEGA-DELTA-0288: the registry row must name the finding it closes"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0288"),
+            "OMEGA-DELTA-0288: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0289. `decided_by_pubkey` is BOUND per door — release:
+    /// automated door -> principal, human door -> arbitrator; refund: human
+    /// door -> arbitrator, timeout door -> principal — and the timeout
+    /// door's `reason_code` comes from a fixed set, no caller free text
+    /// (SEC-2026-093 closure).
+    #[test]
+    fn escrow_decided_by_is_bound_per_door() {
+        let escrow_source_raw = read_repository_file(MARKET_UI_ESCROW_PATH);
+        let escrow_source = outside_the_tests(&escrow_source_raw);
+        for required in [
+            "OMEGA-DELTA-0289",
+            "TIMEOUT_REFUND_REASON_CODES",
+            "door's bound party",
+            "no caller free",
+        ] {
+            assert!(
+                escrow_source.contains(required),
+                "OMEGA-DELTA-0289: the escrow state machine lost `{required}`; \
+                 the per-door decided_by binding and the fixed timeout reason \
+                 set must stay enforced"
+            );
+        }
+        for test_name in [
+            "fn release_refuses_a_stranger_pubkey_on_the_human_door",
+            "fn release_refuses_the_arbitrator_on_the_automated_door",
+            "fn timeout_refund_refuses_a_caller_invented_reason_code",
+            "fn refund_doors_bind_decided_by_and_the_honest_doors_pass",
+        ] {
+            assert!(
+                escrow_source_raw.contains(test_name),
+                "OMEGA-DELTA-0289: the owning crate lost the named test \
+                 `{test_name}`"
+            );
+        }
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0289").contains("SEC-2026-093"),
+            "OMEGA-DELTA-0289: the registry row must name the finding it closes"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0289"),
+            "OMEGA-DELTA-0289: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0290. The receipt gate verifies the PROVIDER event
+    /// signature through the receipt-verifier family (the
+    /// `immortal_client::domain::Event` canonical-id re-derivation + BIP-340
+    /// Schnorr check) BEFORE driving the verification transition; a
+    /// non-provider signer is refused outright and a wrong signature lands
+    /// the session in the `VerifiedFail` limbo, never `VerifiedPass`
+    /// (SEC-2026-095 closure). Digest re-derivation stays as the projection
+    /// step.
+    #[test]
+    fn escrow_receipt_gate_verifies_the_provider_signature() {
+        let escrow_source_raw = read_repository_file(MARKET_UI_ESCROW_PATH);
+        let escrow_source = outside_the_tests(&escrow_source_raw);
+        for required in [
+            "OMEGA-DELTA-0290",
+            "immortal_client::domain::Event",
+            "validate_crypto",
+            "not the escrow provider",
+            "refuse_verification",
+        ] {
+            assert!(
+                escrow_source.contains(required),
+                "OMEGA-DELTA-0290: the receipt gate lost `{required}`; the \
+                 provider-signature verification must stay in front of the \
+                 digest transition"
+            );
+        }
+        for test_name in [
+            "fn verify_receipt_claim_refuses_a_wrong_signature_into_verified_fail_limbo",
+            "fn verify_receipt_claim_refuses_a_non_provider_signer",
+            "fn verify_receipt_claim_passes_an_honest_signed_event_and_binds_the_digest",
+        ] {
+            assert!(
+                escrow_source_raw.contains(test_name),
+                "OMEGA-DELTA-0290: the owning crate lost the named negative \
+                 test `{test_name}`"
+            );
+        }
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0290").contains("SEC-2026-095"),
+            "OMEGA-DELTA-0290: the registry row must name the finding it closes"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0290"),
+            "OMEGA-DELTA-0290: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0291. An AUTO-released `ArbitrationReleased` entry carries
+    /// `receipt_digest` + `receipt_event_id` linkage INSIDE the hash chain:
+    /// the ledger's `LedgerEntryDraft::validate` refuses an auto-released
+    /// entry without well-formed linkage (fail-closed on a missing or
+    /// unknown door marker; the human door is exempt), and the session's
+    /// automated release derives the linkage from the verified event
+    /// (SEC-2026-096 closure).
+    #[test]
+    fn escrow_released_entries_carry_receipt_linkage() {
+        let ledger_source_raw = read_repository_file(TRADING_LEDGER_SOURCE_PATH);
+        let ledger_source = outside_the_tests(&ledger_source_raw);
+        for required in [
+            "OMEGA-DELTA-0291",
+            "receipt_digest",
+            "receipt_event_id",
+            "auto-released ArbitrationReleased entry must carry",
+        ] {
+            assert!(
+                ledger_source.contains(required),
+                "OMEGA-DELTA-0291: the ledger validate rule lost `{required}`; \
+                 the hash-chained receipt linkage must stay enforced"
+            );
+        }
+        let escrow_source = read_repository_file(MARKET_UI_ESCROW_PATH);
+        assert!(
+            escrow_source.contains("OMEGA-DELTA-0291"),
+            "OMEGA-DELTA-0291: the escrow lane lost the delta citation; the \
+             automated release must carry the verified linkage"
+        );
+        for test_name in [
+            "fn an_auto_released_entry_without_receipt_linkage_fails_validate",
+            "fn an_auto_released_entry_with_an_unknown_receipt_digest_fails_validate",
+            "fn an_auto_released_entry_with_well_formed_linkage_validates_and_chains",
+            "fn automated_release_refuses_without_the_verified_receipt_linkage",
+        ] {
+            assert!(
+                ledger_source_raw.contains(test_name) || escrow_source.contains(test_name),
+                "OMEGA-DELTA-0291: the owning crates lost the named test \
+                 `{test_name}`"
+            );
+        }
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0291").contains("SEC-2026-096"),
+            "OMEGA-DELTA-0291: the registry row must name the finding it closes"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0291"),
+            "OMEGA-DELTA-0291: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0292. The digest-only metadata guard matches on the
+    /// `omega.escrow.v1` schema marker (or the presence of the escrow
+    /// `fee_payment_digest` carrier) INSTEAD of kind identity, so the
+    /// escrow-related `Fee` entry is covered too (SEC-2026-094 closure).
+    ///
+    /// Negative branch: the guard must NOT have regressed to kind identity.
+    #[test]
+    fn escrow_digest_guard_covers_the_fee_entry() {
+        let ledger_source_raw = read_repository_file(TRADING_LEDGER_SOURCE_PATH);
+        let ledger_source = outside_the_tests(&ledger_source_raw);
+        for required in [
+            "OMEGA-DELTA-0292",
+            "pub const ESCROW_LEDGER_METADATA_SCHEMA: &str = \"omega.escrow.v1\"",
+            "== Some(ESCROW_LEDGER_METADATA_SCHEMA)",
+            ".get(\"fee_payment_digest\").is_some()",
+            "digest-only",
+        ] {
+            assert!(
+                ledger_source.contains(required),
+                "OMEGA-DELTA-0292: the ledger guard lost `{required}`; the \
+                 digest-only rule must stay scoped by the escrow schema marker \
+                 (or the fee-digest carrier)"
+            );
+        }
+        // Negative branch: the four-escrow-kind guard must not return — the
+        // validate region's guard (from the draft validate rule up to the
+        // requires-postings gate) must not re-introduce the kind-identity
+        // match for EscrowCreated.
+        let guard_region = ledger_source
+            .split("pub fn validate(&self) -> Result<()> {")
+            .nth(1)
+            .expect("the draft validate rule must exist")
+            .split("if self.kind.requires_postings()")
+            .next()
+            .expect("the requires-postings gate must exist")
+            .to_owned();
+        assert!(
+            !guard_region.contains("LedgerEntryKind::EscrowCreated"),
+            "OMEGA-DELTA-0292: the digest-only guard regressed to kind \
+             identity; it must stay scoped by the schema marker"
+        );
+        for test_name in [
+            "fn a_fee_kind_entry_with_a_preimage_key_is_refused",
+            "fn honest_escrow_and_fee_entries_still_validate_under_the_marker_guard",
+        ] {
+            assert!(
+                ledger_source_raw.contains(test_name),
+                "OMEGA-DELTA-0292: the owning crate lost the named test \
+                 `{test_name}`"
+            );
+        }
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0292").contains("SEC-2026-094"),
+            "OMEGA-DELTA-0292: the registry row must name the finding it closes"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0292"),
+            "OMEGA-DELTA-0292: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0293. The escrow timeout window is an
+    /// operator-configurable session value at escrow open — any value in
+    /// 36..=432 blocks, 144 default when unspecified — with network-agnostic
+    /// wording ("blocks", never "signet blocks"); the mandate's
+    /// `escrow_timeout_blocks` field stays unchanged.
+    #[test]
+    fn escrow_timeout_is_operator_configurable_with_default() {
+        let escrow_source_raw = read_repository_file(MARKET_UI_ESCROW_PATH);
+        let escrow_source = outside_the_tests(&escrow_source_raw);
+        for required in [
+            "OMEGA-DELTA-0293",
+            "pub const DEFAULT_ESCROW_TIMEOUT_BLOCKS: u32 = 144",
+            "MIN_ESCROW_TIMEOUT_BLOCKS",
+            "MAX_ESCROW_TIMEOUT_BLOCKS",
+        ] {
+            assert!(
+                escrow_source.contains(required),
+                "OMEGA-DELTA-0293: the escrow open path lost `{required}`; the \
+                 operator-configurable session timeout and its 144 default \
+                 must stay present"
+            );
+        }
+        // Negative branch: the bounds message must be network-agnostic — the
+        // new interpolation present, the old "signet blocks" literal gone.
+        assert!(
+            escrow_source.contains("escrow timeout must be {}..={} blocks"),
+            "OMEGA-DELTA-0293: the timeout bounds message must use the \
+             network-agnostic \"blocks\" wording"
+        );
+        assert!(
+            !escrow_source.contains("36..=432 signet blocks"),
+            "OMEGA-DELTA-0293: the timeout wording regressed to \
+             network-specific text (\"signet blocks\")"
+        );
+        // The mandate field stays unchanged (it still bounds its own path).
+        let mandate_source_raw = read_repository_file(TRADING_MANDATE_SOURCE_PATH);
+        let mandate_source = outside_the_tests(&mandate_source_raw);
+        assert!(
+            mandate_source.contains("escrow_timeout_blocks")
+                && mandate_source.contains("MIN_ESCROW_TIMEOUT_BLOCKS..=MAX_ESCROW_TIMEOUT_BLOCKS"),
+            "OMEGA-DELTA-0293: the mandate's escrow_timeout_blocks field or \
+             its bounds were disturbed"
+        );
+        for test_name in [
+            "fn escrow_open_applies_the_default_timeout_when_unspecified",
+            "fn escrow_open_refuses_out_of_range_timeout_overrides_and_names_blocks",
+        ] {
+            assert!(
+                escrow_source_raw.contains(test_name),
+                "OMEGA-DELTA-0293: the owning crate lost the named test \
+                 `{test_name}`"
+            );
+        }
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0293").contains("operator"),
+            "OMEGA-DELTA-0293: the registry row must record the operator- \
+             configurable posture"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0293"),
+            "OMEGA-DELTA-0293: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0294. The escrow arbitration-fee default for real-sats
+    /// testing is 100 sats (Decision 5), applied at the session creation
+    /// site with the field remaining configurable; the inherited test
+    /// constants are updated-with-citation; the dashboard honesty footer is
+    /// network-aware while keeping the simulated-limbo wording.
+    #[test]
+    fn escrow_fee_default_is_100_sats_and_labels_network_aware() {
+        let escrow_source_raw = read_repository_file(MARKET_UI_ESCROW_PATH);
+        let escrow_source = outside_the_tests(&escrow_source_raw);
+        for required in [
+            "OMEGA-DELTA-0294",
+            "pub const DEFAULT_ARBITRATION_FEE_FLAT_SATS: u64 = 100",
+        ] {
+            assert!(
+                escrow_source.contains(required),
+                "OMEGA-DELTA-0294: the escrow creation site lost `{required}`; \
+                 the 100-sat default (Decision 5) must stay applied where the \
+                 operator has not configured a fee"
+            );
+        }
+        // The test constants carry the updated-with-citation bindings.
+        assert!(
+            escrow_source_raw.contains("const FEE: u64 = DEFAULT_ARBITRATION_FEE_FLAT_SATS"),
+            "OMEGA-DELTA-0294: the escrow test fee constant must reference the \
+             100-sat default"
+        );
+        let mandate_source_raw = read_repository_file(TRADING_MANDATE_SOURCE_PATH);
+        assert!(
+            mandate_source_raw.contains("arbitration_fee_flat_sats: Some(100),"),
+            "OMEGA-DELTA-0294: the mandate test fixture must carry the \
+             100-sat fee (updated-with-citation)"
+        );
+        assert!(
+            !mandate_source_raw.contains("arbitration_fee_flat_sats: Some(1_000)"),
+            "OMEGA-DELTA-0294: a 1,000-sat test fee default is still present"
+        );
+        let dashboard = read_repository_file(SOVEREIGN_DASHBOARD_LIB_PATH);
+        for required in [
+            "fn escrow_honesty_footer",
+            "external {network} LN HTLC",
+            "simulated limbo in demo",
+        ] {
+            assert!(
+                dashboard.contains(required),
+                "OMEGA-DELTA-0294: the dashboard lost `{required}`; the honesty \
+                 footer must stay network-aware with the simulated-limbo wording"
+            );
+        }
+        assert!(
+            escrow_source_raw.contains("fn escrow_open_applies_the_100_sat_fee_default_when_unspecified"),
+            "OMEGA-DELTA-0294: the owning crate lost the named default test"
+        );
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0294").contains("Decision 5"),
+            "OMEGA-DELTA-0294: the registry row must record the founder \
+             decision it applies"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0294"),
+            "OMEGA-DELTA-0294: the delta is no longer listed in ENFORCED_DELTAS"
         );
     }
 }
