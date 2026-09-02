@@ -138,6 +138,49 @@ impl SovereignWalletSupervisor {
         &self.options.network
     }
 
+    // -------------------------------------------------------------------
+    // WP-7 operator surface seams: the read-only spend-policy projection
+    // the dashboard renders (real state only — C7) and the operator-gated
+    // kill/ceiling controls. The controls mutate the LOCAL policy store
+    // (single Rust writer); every set/clear event is logged (redacted) by
+    // the policy, and the clear semantics are enforced there (operator-set
+    // only; loss-rule auto-kills follow the C3 halted-state rule).
+    // -------------------------------------------------------------------
+
+    /// The read-only spend-policy projection for the operator surface.
+    /// `now_unix` is the current unix time in seconds (the projection
+    /// normalizes stale-day counters to zero spent).
+    pub fn spend_policy_snapshot(
+        &self,
+        now_unix: i64,
+    ) -> crate::spend_policy::SpendPolicySnapshot {
+        self.spend_policy.snapshot(now_unix)
+    }
+
+    /// SET the persisted spend kill (operator reason recorded, event
+    /// logged redacted). Refuses to overwrite a loss-rule auto-kill (C3).
+    pub fn set_operator_kill(&mut self, reason: &str) -> Result<()> {
+        self.spend_policy.set_operator_kill(reason)
+    }
+
+    /// CLEAR a persisted kill the operator set. Refuses honestly for a
+    /// loss-rule auto-kill (C3 halted-state rule) and when no persisted
+    /// operator kill exists.
+    pub fn clear_operator_kill(&mut self) -> Result<(), String> {
+        self.spend_policy.clear_operator_kill()
+    }
+
+    /// Configure the per-surface daily ceiling (configuration, not a
+    /// posture change — OMEGA-DELTA-0300). Zero is refused.
+    pub fn set_surface_ceiling(&mut self, surface: &str, ceiling_sats: u64) -> Result<()> {
+        self.spend_policy.set_surface_ceiling(surface, ceiling_sats)
+    }
+
+    /// Remove a per-surface ceiling override (falls back to the default).
+    pub fn clear_surface_ceiling(&mut self, surface: &str) -> Result<()> {
+        self.spend_policy.clear_surface_ceiling(surface)
+    }
+
     pub async fn start(&mut self) -> Result<InitializeResult> {
         if self.child.is_some() {
             bail!("sovereign wallet sidecar is already running");

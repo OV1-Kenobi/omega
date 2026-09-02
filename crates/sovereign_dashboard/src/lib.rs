@@ -44,17 +44,25 @@
 
 use std::time::Duration;
 
+use credentials_provider::CredentialsProvider;
 use editor::Editor;
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    IntoElement, ParentElement, PromptLevel, Render, SharedString, Styled, Task, WeakEntity,
-    Window, actions, px,
+    App, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, IntoElement, ParentElement, PromptLevel, Render, SharedString, Styled, Task,
+    WeakEntity, Window, actions, px,
+};
+use lnmarkets_client::{CREDENTIAL_STORAGE_URL, Network as LnMarketsNetwork, StoredCredentials};
+use nautilus_sidecar::{
+    ENABLE_ENVIRONMENT_VARIABLE as NAUTILUS_ENABLE_ENVIRONMENT_VARIABLE,
+    NETWORK_ENVIRONMENT_VARIABLE as NAUTILUS_NETWORK_ENVIRONMENT_VARIABLE,
+    Network as NautilusNetwork, credential_key as nautilus_credential_key,
 };
 use project::project_settings::ProjectSettings;
 use settings::Settings as _;
 use sovereign_wallet::{
-    BalanceResult, IdentityStatusResult, InvoiceResult, SharedSovereignWalletSupervisor,
-    StatusResult,
+    BalanceResult, DAILY_CEILING_SATS, IdentityStatusResult, InvoiceResult,
+    SharedSovereignWalletSupervisor, SpendPolicySnapshot, StatusResult, SURFACE_WALLET_L402,
+    SurfaceSpendSnapshot,
 };
 use trading_ledger::LedgerStore;
 use trading_mandate::{MandateSnapshot, MandateStore, TradingMandate, TradingNetwork};
@@ -96,6 +104,12 @@ const LINK_FIRST_WAVE_LIFETIME_SECONDS: u64 = 60 * 60 * 24 * 7;
 /// WP-10: per-step relay exchange timeout (account_ui `NIP46_EXCHANGE_TIMEOUT_SECONDS`).
 const LINK_EXCHANGE_TIMEOUT_SECONDS: u64 = 30;
 
+/// WP-7: the NIP-AC projection flag name (per the WP-11 flag plan, design
+/// note §11). WP-12 implements the projection; until then this surface
+/// displays the flag's absence honestly — it is a display of real flag
+/// state, never a claim of a feature.
+const NIPAC_PROJECTION_ENVIRONMENT_VARIABLE: &str = "OMEGA_NIPAC_PROJECTION";
+
 /// The widening application is delta-bound this WP: OMEGA-DELTA-0245 restricts
 /// the widening-door callers to the settings-UI files, and this WP cannot
 /// extend that allowlist (crates/omega_deltas is out of scope). The dashboard
@@ -130,6 +144,9 @@ enum InputRequest {
     PluginId,
     /// WP-10: the `bunker://` NIP-46 URI from the remote machine's signer.
     LinkBunkerUri,
+    /// WP-7: the per-surface daily ceiling input (sats) for the enforced
+    /// `wallet-l402` surface (the spend-policy choke point surface).
+    SpendCeilingSats,
 }
 
 impl InputRequest {
@@ -146,6 +163,7 @@ impl InputRequest {
             Self::McpPrincipalPubkey => "input-mcp-principal-pubkey",
             Self::PluginId => "input-plugin-id",
             Self::LinkBunkerUri => "input-link-bunker-uri",
+            Self::SpendCeilingSats => "input-spend-ceiling-sats",
         }
     }
 }
@@ -277,6 +295,39 @@ struct LinkReportedSigner {
     expires_at: u64,
 }
 
+/// WP-7: the credential-slot presence state — a REAL read of the platform
+/// credential stores (presence only; never secret material). `Unreadable`
+/// carries the honest reason a presence check could not complete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CredentialSlotState {
+    Present,
+    Absent,
+    Unreadable(String),
+}
+
+/// WP-7: the operator view for the mainnet transition — the spend-policy
+/// snapshot (kill + budgets) and the per-network credential-slot presence.
+/// Every rendered value is real state (the policy store, the platform
+/// credential stores, the process env); nothing self-enables and no
+/// authority is claimed without backing (C7 honesty law).
+#[derive(Clone, Debug, Default)]
+struct OperatorView {
+    /// The read-only spend-policy projection (kill sources + per-surface
+    /// counters + ceilings). `None` while the wallet lane is off — the
+    /// policy store exists only with the supervisor.
+    spend: Option<SpendPolicySnapshot>,
+    /// A real outcome of the last operator control (set/clear/ceiling).
+    control_message: Option<SharedString>,
+    /// A real refusal of the last operator control (the honest message the
+    /// policy produced — env kill / loss-rule C3 route / invalid input).
+    control_error: Option<SharedString>,
+    /// Hyperliquid mainnet agent-wallet slot presence.
+    nautilus_mainnet_wallet: Option<CredentialSlotState>,
+    /// LN Markets mainnet Trade-key slot presence (the stored record's
+    /// network field — the single stored LN Markets record carries it).
+    lnmarkets_mainnet_key: Option<CredentialSlotState>,
+}
+
 pub struct SovereignDashboardPanel {
     focus_handle: FocusHandle,
     stub_notice: Option<&'static str>,
@@ -313,6 +364,9 @@ pub struct SovereignDashboardPanel {
     /// WP-5b: the ledger of record for escrow entries (same store the
     /// trading surfaces use — no second ledger).
     ledger_store: Option<LedgerStore>,
+    /// WP-7: the mainnet-transition operator view (spend policy + credential
+    /// slots) — real state only.
+    operator: OperatorView,
 }
 
 impl SovereignDashboardPanel {
@@ -353,6 +407,7 @@ impl SovereignDashboardPanel {
             ledger_store: LedgerStore::open_default()
                 .map_err(|error| log::error!("sovereign dashboard: {error:#}"))
                 .ok(),
+            operator: OperatorView::default(),
         };
         panel.refresh(cx);
         panel
@@ -370,9 +425,33 @@ impl SovereignDashboardPanel {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.refreshed_at_ms = command_center_ui::unix_now_ms();
         let Some(supervisor) = self.supervisor.clone() else {
+            // WP-7: the credential-slot reads do not need the wallet lane —
+            // run them so the operator surface renders real state even with
+            // the lane off. The spend policy has no state without the
+            // supervisor (the honest `None` is rendered as "lane off").
+            let zed_provider = zed_credentials_provider::global(cx);
+            let agent_wallet_provider = zed_credentials_provider::agent_wallet_credentials(cx);
+            self.refresh_task = Some(cx.spawn(async move |this, cx| {
+                let nautilus_mainnet_wallet =
+                    read_nautilus_mainnet_wallet_presence(&agent_wallet_provider, cx).await;
+                let lnmarkets_mainnet_key =
+                    read_lnmarkets_mainnet_key_slot(&zed_provider, cx).await;
+                this.update(cx, |this, cx| {
+                    this.operator.nautilus_mainnet_wallet = Some(nautilus_mainnet_wallet);
+                    this.operator.lnmarkets_mainnet_key = Some(lnmarkets_mainnet_key);
+                    this.operator.spend = None;
+                    cx.notify();
+                })
+                .log_err();
+            }));
             return;
         };
         let store = self.mandate_store.clone();
+        // WP-7: the credential stores for the per-network slot presence reads
+        // (the global provider holds the LN Markets credentials; the platform
+        // agent-wallet store holds the Nautilus agent wallets).
+        let zed_provider = zed_credentials_provider::global(cx);
+        let agent_wallet_provider = zed_credentials_provider::agent_wallet_credentials(cx);
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let mut guard = supervisor.lock().await;
             let started = guard.ensure_started().await;
@@ -443,6 +522,18 @@ impl SovereignDashboardPanel {
             } else {
                 None
             };
+            // WP-7: the REAL spend-policy state (kill + budgets) — read
+            // directly from the supervisor's policy store; the projection
+            // normalizes stale-day counters to zero spent.
+            let spend_snapshot = guard.spend_policy_snapshot(unix_now_seconds() as i64);
+            // WP-7: the per-network credential-slot presence (REAL reads of
+            // the platform credential stores; presence only — the Nautilus
+            // record is never decoded on this surface, and the LN Markets
+            // record is opened only for its public `network` field).
+            let nautilus_mainnet_wallet =
+                read_nautilus_mainnet_wallet_presence(&agent_wallet_provider, cx).await;
+            let lnmarkets_mainnet_key =
+                read_lnmarkets_mainnet_key_slot(&zed_provider, cx).await;
             this.update(cx, |this, cx| {
                 this.wallet.status = status;
                 this.wallet.balance = balance;
@@ -451,6 +542,9 @@ impl SovereignDashboardPanel {
                 this.identity.identity_error = identity_error;
                 this.mcp_identity_map = mcp_identity_map;
                 this.escrow_height = escrow_height;
+                this.operator.spend = Some(spend_snapshot);
+                this.operator.nautilus_mainnet_wallet = Some(nautilus_mainnet_wallet);
+                this.operator.lnmarkets_mainnet_key = Some(lnmarkets_mainnet_key);
                 // WP-5b: reload the persisted escrow sessions (digest-only).
                 this.escrow_sessions = load_escrow_sessions();
                 if let Some(snapshot) = snapshot {
@@ -559,12 +653,23 @@ impl SovereignDashboardPanel {
             cx.notify();
             return;
         }
+        // WP-7: the network wording follows the REAL configured network (the
+        // 0286 grammar makes mainnet a real configured state) — never a
+        // hardcoded claim.
+        let network = self
+            .wallet
+            .status
+            .as_ref()
+            .map(|status| status.network.clone())
+            .unwrap_or_else(|| "signet".to_string());
         self.pending_input = Some(PendingInput {
             request: InputRequest::FundAmount,
             label: "Amount (sats)".into(),
-            detail: "Mint a real signet receive invoice for this amount. Test coins only — \
-                     never mainnet."
-                .into(),
+            detail: format!(
+                "Mint a real {network} receive invoice for this amount. {}",
+                wallet_network_note(&network)
+            )
+            .into(),
         });
         cx.notify();
     }
@@ -1750,6 +1855,46 @@ impl SovereignDashboardPanel {
             InputRequest::LinkBunkerUri => {
                 // WP-10: real Link — begin the NIP-46 bunker pairing ceremony.
                 self.begin_link_bunker_ceremony(value, cx);
+            }
+            InputRequest::SpendCeilingSats => {
+                // WP-7: apply the operator ceiling for the enforced surface.
+                let Ok(ceiling_sats) = value.trim().parse::<u64>() else {
+                    self.operator.control_error =
+                        Some("the ceiling must be a positive integer (sats)".into());
+                    cx.notify();
+                    return;
+                };
+                let Some(supervisor) = self.supervisor.clone() else {
+                    self.stub_notice = Some("Spend controls unavailable — the sovereign wallet lane is off (OMEGA_SOVEREIGN_WALLET=1 not set).");
+                    cx.notify();
+                    return;
+                };
+                let task = cx.spawn(async move |this, cx| {
+                    let mut guard = supervisor.lock().await;
+                    let result = guard.set_surface_ceiling(SURFACE_WALLET_L402, ceiling_sats);
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(()) => {
+                                this.operator.control_error = None;
+                                this.operator.control_message = Some(SharedString::from(
+                                    format!(
+                                        "daily ceiling for {SURFACE_WALLET_L402} set to \
+                                         {ceiling_sats} sats (override; event logged)"
+                                    ),
+                                ));
+                                this.refresh(cx);
+                            }
+                            Err(error) => {
+                                this.operator.control_error =
+                                    Some(SharedString::from(format!("set refused: {error:#}")));
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .log_err();
+                });
+                self.refresh_task = Some(task);
+                cx.notify();
             }
         }
     }
@@ -3220,6 +3365,384 @@ impl SovereignDashboardPanel {
         task.detach();
     }
 
+    /// WP-7: the mainnet-transition operator surface — network gates, the
+    /// spend policy (kill + budgets), the per-network credential slots, and
+    /// the NIP-AC projection flag state. Every rendered value is REAL state:
+    /// the supervisor's policy store, the platform credential stores (presence
+    /// only), and the process env. Nothing self-enables; no authority claim
+    /// without backing (C7 honesty law).
+    fn operator_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let configured_network = std::env::var(sovereign_wallet::NETWORK_ENVIRONMENT_VARIABLE)
+            .unwrap_or_else(|_| "signet".to_string());
+        let reported_network = self
+            .wallet
+            .status
+            .as_ref()
+            .map(|status| status.network.clone());
+        let allow_mainnet = std::env::var(sovereign_wallet::ALLOW_MAINNET_ENVIRONMENT_VARIABLE)
+            .as_deref()
+            == Ok("1");
+        let wallet_line = wallet_network_gate_line(
+            self.supervisor
+                .is_some()
+                .then_some(configured_network.as_str()),
+            reported_network.as_deref(),
+            allow_mainnet,
+        );
+        let nautilus_line = nautilus_gate_line(
+            std::env::var(NAUTILUS_ENABLE_ENVIRONMENT_VARIABLE).as_deref() == Ok("1"),
+            std::env::var(NAUTILUS_NETWORK_ENVIRONMENT_VARIABLE).ok().as_deref(),
+        );
+        let lnmarkets_line = lnmarkets_admission_line(
+            std::env::var("OMEGA_LNMARKETS_MAINNET").ok().as_deref(),
+        );
+        let nipac_line = nipac_projection_line(
+            std::env::var(NIPAC_PROJECTION_ENVIRONMENT_VARIABLE)
+                .ok()
+                .as_deref(),
+        );
+
+        let network_labels: Vec<AnyElement> = vec![
+            Label::new(wallet_line).size(LabelSize::XSmall).color(Color::Muted).into_any_element(),
+            Label::new(nautilus_line).size(LabelSize::XSmall).color(Color::Muted).into_any_element(),
+            Label::new(lnmarkets_line).size(LabelSize::XSmall).color(Color::Muted).into_any_element(),
+            Label::new(nipac_line).size(LabelSize::XSmall).color(Color::Muted).into_any_element(),
+        ];
+
+        // The spend-policy block (real snapshot or the honest lane-off state).
+        let spend_block: AnyElement = match &self.operator.spend {
+            Some(snapshot) => {
+                let killed = snapshot.env_killed || snapshot.persisted_killed;
+                let (kill_line, kill_color) = (
+                    spend_kill_state_line(snapshot),
+                    if killed { Color::Error } else { Color::Muted },
+                );
+                let budget_rows: Vec<AnyElement> = snapshot
+                    .surfaces
+                    .iter()
+                    .map(|row| {
+                        Label::new(surface_budget_line(row))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .into_any_element()
+                    })
+                    .collect();
+                let budget_empty = snapshot.surfaces.is_empty();
+                let ceiling_override_present = snapshot
+                    .surfaces
+                    .iter()
+                    .any(|row| row.ceiling_is_override);
+                let halt_labels: Vec<AnyElement> = if killed {
+                    vec![
+                        // The C3 halted-state rule: the exact named halted
+                        // state the funded flows produce, plus the route.
+                        Label::new(snapshot.halt_message.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Error)
+                            .into_any_element(),
+                        Label::new(
+                            "route: Debug & Incident before anything resumes; only the \
+                             founder re-enables (Decision 4 / OMEGA-DELTA-0300)",
+                        )
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning)
+                        .into_any_element(),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        Label::new(kill_line)
+                            .size(LabelSize::XSmall)
+                            .color(kill_color),
+                    )
+                    .children(halt_labels)
+                    .when(budget_rows.is_empty() && budget_empty, |this| {
+                        this.child(
+                            Label::new(
+                                "no spend recorded today (counters reset on the UTC day \
+                                 rollover)",
+                            )
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                    })
+                    .children(budget_rows)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("sw-kill-set", "Set kill")
+                                    .style(ButtonStyle::Subtle)
+                                    .tooltip(ui::Tooltip::text(
+                                        "Persist the spend kill (all-value-touching; logged)",
+                                    ))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_spend_kill_flow(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("sw-kill-clear", "Clear kill")
+                                    .style(ButtonStyle::Subtle)
+                                    .tooltip(ui::Tooltip::text(
+                                        "Clear an operator-set kill (loss-rule kills follow the C3 route)",
+                                    ))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.clear_spend_kill_flow(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("sw-ceiling-set", "Set daily ceiling (wallet-l402)")
+                                    .style(ButtonStyle::Subtle)
+                                    .tooltip(ui::Tooltip::text(
+                                        "Configure the enforced surface's daily ceiling (logged)",
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_ceiling_flow(cx);
+                                    })),
+                            )
+                            .when(ceiling_override_present, |this| {
+                                this.child(
+                                    Button::new("sw-ceiling-clear", "Reset ceiling to default")
+                                        .style(ButtonStyle::Subtle)
+                                        .tooltip(ui::Tooltip::text(
+                                            "Remove the operator ceiling override (logged)",
+                                        ))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.clear_ceiling_flow(window, cx);
+                                        })),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }
+            None => v_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    Label::new(
+                        "spend policy unavailable — the sovereign wallet lane is off \
+                         (OMEGA_SOVEREIGN_WALLET=1 not set)",
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .into_any_element(),
+        };
+
+        // The per-network credential slots (presence only, never secret
+        // material; provisioning is founder-held).
+        let slot_labels: Vec<AnyElement> = vec![
+            Label::new(credential_slot_line(
+                "Hyperliquid mainnet agent wallet",
+                "slot omega://nautilus/hyperliquid/mainnet/agent-wallet-v1 (platform \
+                 agent-wallet store); provisioning is founder-held; the WP-5 graduation \
+                 gate consumes it",
+                self.operator.nautilus_mainnet_wallet.as_ref(),
+            ))
+            .size(LabelSize::XSmall)
+            .color(Color::Muted)
+            .into_any_element(),
+            Label::new(credential_slot_line(
+                "LN Markets mainnet Trade key",
+                "slot https://lnmarkets.com/api/v3 (the stored record's network field); \
+                 provisioning is founder-held; the WP-6 admission consumes it",
+                self.operator.lnmarkets_mainnet_key.as_ref(),
+            ))
+            .size(LabelSize::XSmall)
+            .color(Color::Muted)
+            .into_any_element(),
+        ];
+
+        v_flex()
+            .w_full()
+            .gap_2()
+            .children(network_labels)
+            .child(spend_block)
+            .children(slot_labels)
+            .children(self.operator.control_message.clone().map(|message| {
+                Label::new(message)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Created)
+                    .into_any_element()
+            }))
+            .children(self.operator.control_error.clone().map(|error| {
+                Label::new(error)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
+                    .into_any_element()
+            }))
+            .into_any_element()
+    }
+
+    // -----------------------------------------------------------------------
+    // Mainnet transition operator controls (WP-7) — the kill switch, the
+    // per-surface ceiling, and the credential-slot display. Operator-gated:
+    // every mutation passes an explicit warning confirmation (the panel's
+    // operator-gate pattern), runs through the supervisor's policy seam (the
+    // loopback-token sidecar channel's owner — the policy store is the
+    // single Rust writer), and every set/clear event is logged (redacted)
+    // by the policy store itself.
+    // -----------------------------------------------------------------------
+
+    fn set_spend_kill_flow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(supervisor) = self.supervisor.clone() else {
+            self.stub_notice = Some("Spend controls unavailable — the sovereign wallet lane is off (OMEGA_SOVEREIGN_WALLET=1 not set).");
+            cx.notify();
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "SET the spend kill (halt every funded flow)?",
+            Some(
+                "All-value-touching (OMEGA-DELTA-0300): mint AND pay are refused at the \
+                 choke point until the kill is cleared, and the kill persists across \
+                 restarts. The set event is logged. The clear control works only for an \
+                 operator-set kill; a loss-rule auto-kill needs the Debug & Incident \
+                 route first (C3).",
+            ),
+            &["Set kill", "Cancel"],
+            cx,
+        );
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let mut message = None;
+            let mut error = None;
+            if answer.await == Ok(0) {
+                let mut guard = supervisor.lock().await;
+                match guard.set_operator_kill("set from the operator surface (WP-7)") {
+                    Ok(()) => {
+                        message =
+                            Some("spend kill SET (persisted; every funded flow refuses; event logged)".to_string())
+                    }
+                    Err(set_error) => error = Some(format!("set refused: {set_error:#}")),
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.operator.control_message = message.map(SharedString::from);
+                this.operator.control_error = error.map(SharedString::from);
+                this.refresh(cx);
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn clear_spend_kill_flow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(supervisor) = self.supervisor.clone() else {
+            self.stub_notice = Some("Spend controls unavailable — the sovereign wallet lane is off (OMEGA_SOVEREIGN_WALLET=1 not set).");
+            cx.notify();
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "CLEAR the persisted spend kill?",
+            Some(
+                "This clears only an OPERATOR-set kill (founder re-enable, OMEGA-DELTA-0300). \
+                 A loss-rule auto-kill is refused here: the C3 halted-state rule applies — \
+                 run the Debug & Incident route before anything resumes. The environment \
+                 kill (OMEGA_SPEND_KILL=1) is separate: it is cleared only by unsetting the \
+                 env and restarting. The clear event is logged.",
+            ),
+            &["Clear kill", "Cancel"],
+            cx,
+        );
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let mut message = None;
+            let mut error = None;
+            if answer.await == Ok(0) {
+                let mut guard = supervisor.lock().await;
+                match guard.clear_operator_kill() {
+                    Ok(()) => {
+                        message =
+                            Some("spend kill CLEARED (the persisted operator kill was removed; event logged)".to_string())
+                    }
+                    Err(clear_error) => error = Some(clear_error),
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.operator.control_message = message.map(SharedString::from);
+                this.operator.control_error = error.map(SharedString::from);
+                this.refresh(cx);
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn set_ceiling_flow(&mut self, cx: &mut Context<Self>) {
+        if self.supervisor.is_none() {
+            self.stub_notice = Some("Spend controls unavailable — the sovereign wallet lane is off (OMEGA_SOVEREIGN_WALLET=1 not set).");
+            cx.notify();
+            return;
+        }
+        let current = self
+            .operator
+            .spend
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .surfaces
+                    .iter()
+                    .find(|row| row.surface == SURFACE_WALLET_L402)
+                    .map(|row| row.ceiling_sats)
+                    .unwrap_or(snapshot.default_ceiling_sats)
+            })
+            .unwrap_or(DAILY_CEILING_SATS);
+        self.pending_input = Some(PendingInput {
+            request: InputRequest::SpendCeilingSats,
+            label: format!("Daily ceiling for {SURFACE_WALLET_L402} (sats)").into(),
+            detail: format!(
+                "The per-surface daily spend ceiling (configuration, OMEGA-DELTA-0300; \
+                 first-phase default {DAILY_CEILING_SATS} sats — a labeled reversible \
+                 assumption). Current effective ceiling: {current} sats. The event is \
+                 logged. wallet-l402 is the surface enforced at the supervisor choke \
+                 point; zero is refused (the kill switch blocks all spend)."
+            )
+            .into(),
+        });
+        cx.notify();
+    }
+
+    fn clear_ceiling_flow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(supervisor) = self.supervisor.clone() else {
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Reset the wallet-l402 daily ceiling to the default?",
+            Some("Removes the operator override; the surface falls back to the first-phase default ceiling. The event is logged."),
+            &["Reset to default", "Cancel"],
+            cx,
+        );
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let mut message = None;
+            let mut error = None;
+            if answer.await == Ok(0) {
+                let mut guard = supervisor.lock().await;
+                match guard.clear_surface_ceiling(SURFACE_WALLET_L402) {
+                    Ok(()) => {
+                        message =
+                            Some(format!("ceiling override removed for {SURFACE_WALLET_L402} (default applies; event logged)"))
+                    }
+                    Err(clear_error) => error = Some(format!("reset refused: {clear_error:#}")),
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.operator.control_message = message.map(SharedString::from);
+                this.operator.control_error = error.map(SharedString::from);
+                this.refresh(cx);
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
     fn section_header(&self, title: &'static str) -> AnyElement {
         Label::new(title)
             .size(LabelSize::Small)
@@ -3261,9 +3784,12 @@ impl Render for SovereignDashboardPanel {
                 v_flex()
                     .child(Label::new("Sovereign Agents"))
                     .child(
-                        Label::new("plugins · MCP · wallet · spending authorizations · escrow")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        Label::new(
+                            "plugins · MCP · wallet · spending authorizations · escrow · \
+                             mainnet transition",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     ),
             )
             // Agent Nostr identity (real)
@@ -3286,6 +3812,11 @@ impl Render for SovereignDashboardPanel {
             // Escrow (WP-5b — real persisted sessions, honest limbo labels)
             .child(self.section_header("Escrow"))
             .child(self.escrow_section(cx))
+            // Mainnet transition operator surface (WP-7 — network gates,
+            // spend policy, credential slots, projection state; real state
+            // only, C7 honesty law)
+            .child(self.section_header("Mainnet Transition"))
+            .child(self.operator_section(cx))
             // Stub notice
             .children(self.stub_notice.map(|notice| {
                 div()
@@ -3465,6 +3996,261 @@ fn escrow_honesty_footer(network: &str) -> String {
         "external {network} LN HTLC — simulated limbo in demo; settlement authority \
          stays with Bitcoin/Lightning"
     )
+}
+
+// ---------------------------------------------------------------------------
+// WP-7 operator-surface helpers (mainnet transition): the network-gate lines,
+// the spend-policy lines, the credential-slot presence projection, and the
+// NIP-AC projection flag line. Every line renders REAL state only (C7
+// honesty law): the process env, the supervisor's policy store, and the
+// platform credential stores (presence only — never secret material). No
+// line claims an authority, gate, or feature that does not exist in this
+// build; surfaces whose owning WP has not landed on this branch say so.
+// ---------------------------------------------------------------------------
+
+/// WP-7: the honest network note for the Fund flow's detail line — the REAL
+/// configured network's caution. Signet/regtest keep the long-standing
+/// "test coins only" wording; a mainnet-configured wallet (reachable only
+/// through the 0286 gate: explicit network env AND the allow-mainnet opt-in)
+/// is labeled as the real-funds network it is.
+fn wallet_network_note(network: &str) -> String {
+    if network == "mainnet" {
+        "Mainnet is a real-funds network: this invoice moves real sats \
+         (OMEGA-DELTA-0286 gate: explicit network + allow-mainnet opt-in)."
+            .to_string()
+    } else {
+        "Test coins only — never mainnet.".to_string()
+    }
+}
+
+/// WP-7: the sovereign wallet's network line — the REAL 0286 gate state.
+/// `configured` is `Some` only while the wallet lane is on (the supervisor
+/// exists; its sidecar refused to start without the network env), `reported`
+/// is the sidecar's probed network (the SEC-2026-050 revised assertion
+/// compares it against the configuration), and `allow_mainnet` is the
+/// `OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET` opt-in's actual state. Mainnet is
+/// never rendered as selectable without the opt-in — the line names the
+/// gate exactly as the sidecar enforces it.
+fn wallet_network_gate_line(
+    configured: Option<&str>,
+    reported: Option<&str>,
+    allow_mainnet: bool,
+) -> String {
+    let Some(configured) = configured else {
+        return "wallet network: lane off (OMEGA_SOVEREIGN_WALLET_NETWORK unset; the \
+                sidecar refuses to start unconfigured) · mainnet requires the \
+                explicit network env AND the allow-mainnet opt-in (0286)"
+            .to_string();
+    };
+    let opt_in = if allow_mainnet {
+        "opt-in present"
+    } else {
+        "opt-in absent (mainnet refused)"
+    };
+    match reported {
+        Some(reported) => format!(
+            "wallet network: configured {configured} · reported {reported} · \
+             allow-mainnet {opt_in}"
+        ),
+        None => format!(
+            "wallet network: configured {configured} · sidecar not reporting yet · \
+             allow-mainnet {opt_in}"
+        ),
+    }
+}
+
+/// WP-7: the Nautilus gate-status line. The WP-5 mainnet graduation gate is
+/// NOT landed on this branch's base — the current build hard-refuses Nautilus
+/// mainnet (the pre-0295 posture) — so the line renders that lock honestly
+/// and names the sequencing; it never claims a graduation gate that does not
+/// exist here. An explicitly configured mainnet env is rendered as what it
+/// really is in this build: refused.
+fn nautilus_gate_line(enabled: bool, network: Option<&str>) -> String {
+    let lane = if enabled {
+        "enabled".to_string()
+    } else {
+        "off (OMEGA_NAUTILUS_SIDECAR unset)".to_string()
+    };
+    let network = match network {
+        // The sidecar's documented default when the env is unset.
+        None => "testnet (OMEGA_NAUTILUS_NETWORK unset)".to_string(),
+        Some(network) => network.to_string(),
+    };
+    if network == "mainnet" {
+        format!(
+            "Nautilus: {lane} · network mainnet configured — REFUSED by the current \
+             build (the WP-5 mainnet graduation gate is not landed on this branch; \
+             sequencing recorded)"
+        )
+    } else {
+        format!(
+            "Nautilus: {lane} · network {network} · mainnet locked (the WP-5 \
+             graduation gate is not landed on this branch; sequencing recorded)"
+        )
+    }
+}
+
+/// WP-7: the LN Markets admission display line — DISPLAY-ONLY, rendering the
+/// CURRENT posture honestly: the executors are signet-only in this build
+/// (OMEGA-DELTA-0249/0250/0255/0256) and the WP-6 admission is not landed on
+/// this branch, so mainnet is not admitted. If the WP-6 env happens to be
+/// set, the line says honestly that nothing consumes it yet.
+fn lnmarkets_admission_line(env: Option<&str>) -> String {
+    match env {
+        Some(value) => format!(
+            "LN Markets admission: signet-only in the current build · \
+             OMEGA_LNMARKETS_MAINNET={value} is set but nothing consumes it yet (the \
+             WP-6 admission is not landed on this branch; display-only)"
+        ),
+        None => format!(
+            "LN Markets admission: signet-only in the current build · \
+             OMEGA_LNMARKETS_MAINNET unset (the WP-6 admission is not landed on this \
+             branch; display-only)"
+        ),
+    }
+}
+
+/// WP-7: the NIP-AC projection status line — a display of the REAL flag
+/// state, never a feature claim. WP-12 implements the projection; while the
+/// flag is unset the line reads "projection disabled" (the honest absence).
+/// Even an enabled flag is rendered honestly: nothing in this build emits a
+/// projection, so the line says exactly that.
+fn nipac_projection_line(flag: Option<&str>) -> String {
+    match flag {
+        Some("1") => format!(
+            "NIP-AC projection: OMEGA_NIPAC_PROJECTION=1 is set, but the projection \
+             is NOT implemented in the current build (WP-12 is not landed on this \
+             branch) — nothing emits; displayed honestly"
+        ),
+        Some(value) => format!(
+            "NIP-AC projection: disabled — OMEGA_NIPAC_PROJECTION={value} is not the \
+             enabled value, and the projection is not implemented (WP-12 is not \
+             landed on this branch)"
+        ),
+        None => format!(
+            "NIP-AC projection: disabled — OMEGA_NIPAC_PROJECTION unset (WP-12 is not \
+             landed on this branch; this line displays the flag's absence, not a \
+             feature)"
+        ),
+    }
+}
+
+/// WP-7: the kill-state line rendered from the REAL policy snapshot. The two
+/// kill sources are named separately because they have separate clear
+/// semantics (the env kill clears only by unsetting the env and restarting;
+/// the persisted kill clears only per the operator/loss-rule rules). Reasons
+/// are policy-store text (redacted at write time; no secret material).
+fn spend_kill_state_line(snapshot: &SpendPolicySnapshot) -> String {
+    let env = if snapshot.env_killed {
+        "SET (OMEGA_SPEND_KILL=1)"
+    } else {
+        "not set"
+    };
+    let persisted = if snapshot.persisted_killed {
+        match &snapshot.kill_reason {
+            Some(reason) => format!("SET ({reason})"),
+            None => "SET".to_string(),
+        }
+    } else {
+        "not set".to_string()
+    };
+    format!(
+        "spend kill: env {env} · persisted {persisted} · founder-only re-enable \
+         (OMEGA-DELTA-0300)"
+    )
+}
+
+/// WP-7: one per-surface budget row — the REAL counter for the surface's
+/// persisted UTC day and the effective ceiling, stating whether the ceiling
+/// is the operator override or the first-phase default (the labeled
+/// reversible assumption).
+fn surface_budget_line(row: &SurfaceSpendSnapshot) -> String {
+    let ceiling_source = if row.ceiling_is_override {
+        "operator override"
+    } else {
+        "first-phase default"
+    };
+    format!(
+        "surface {}: spent {} sats on {} of {} sats ceiling ({})",
+        row.surface, row.spent_sats, row.utc_day, row.ceiling_sats, ceiling_source
+    )
+}
+
+/// WP-7: one credential-slot line — presence/absence ONLY. The state is a
+/// REAL read outcome of the platform credential store; the helper never
+/// receives and never renders secret material (C7 + secret hygiene).
+/// Provisioning is founder-held; the line says so via the slot detail.
+fn credential_slot_line(
+    name: &str,
+    slot_detail: &str,
+    state: Option<&CredentialSlotState>,
+) -> String {
+    let presence = match state {
+        Some(CredentialSlotState::Present) => "PROVISIONED (credential present)",
+        Some(CredentialSlotState::Absent) => "empty (no credential)",
+        Some(CredentialSlotState::Unreadable(reason)) => {
+            return format!("{name}: UNREADABLE — {reason} · {slot_detail}");
+        }
+        None => "not read yet",
+    };
+    format!("{name}: {presence} · {slot_detail}")
+}
+
+/// WP-7 (pure, tested): map the LN Markets stored record's network to the
+/// mainnet-slot state. `Some(Ok(..))` is a decoded record's network field
+/// (the ONLY field this surface opens), `None` is no stored record, and
+/// `Some(Err(..))` is a record that could not be decoded.
+fn lnmarkets_mainnet_slot_state(network: Option<Result<LnMarketsNetwork, String>>) -> CredentialSlotState {
+    match network {
+        Some(Ok(LnMarketsNetwork::Mainnet)) => CredentialSlotState::Present,
+        Some(Ok(_)) => CredentialSlotState::Absent,
+        Some(Err(error)) => CredentialSlotState::Unreadable(format!(
+            "the stored LN Markets credential record could not be read: {error}"
+        )),
+        None => CredentialSlotState::Absent,
+    }
+}
+
+/// WP-7: a REAL presence read of the Nautilus mainnet agent-wallet slot
+/// (`omega://nautilus/hyperliquid/mainnet/agent-wallet-v1`, the platform
+/// agent-wallet store). Presence only: the record is NEVER decoded on this
+/// surface and no byte of it is rendered or logged (C7 + secret hygiene).
+async fn read_nautilus_mainnet_wallet_presence(
+    provider: &std::sync::Arc<dyn CredentialsProvider>,
+    cx: &AsyncApp,
+) -> CredentialSlotState {
+    let slot = nautilus_credential_key(NautilusNetwork::Mainnet);
+    match provider.read_credentials(slot, cx).await {
+        Ok(Some(_)) => CredentialSlotState::Present,
+        Ok(None) => CredentialSlotState::Absent,
+        Err(error) => CredentialSlotState::Unreadable(format!(
+            "the platform agent-wallet store could not be read: {error:#}"
+        )),
+    }
+}
+
+/// WP-7: a REAL presence read of the LN Markets mainnet Trade-key slot. The
+/// stored record lives at [`lnmarkets_client::CREDENTIAL_STORAGE_URL`]; it is
+/// opened ONLY for its public `network` field (never rendered, never logged)
+/// — a record whose network is Mainnet means the mainnet slot is provisioned.
+/// No secret material is decoded into any display (C7 + secret hygiene; the
+/// decoded record zeroizes on drop).
+async fn read_lnmarkets_mainnet_key_slot(
+    provider: &std::sync::Arc<dyn CredentialsProvider>,
+    cx: &AsyncApp,
+) -> CredentialSlotState {
+    match provider.read_credentials(CREDENTIAL_STORAGE_URL, cx).await {
+        Ok(Some((_username, encoded))) => {
+            let network = StoredCredentials::decode(&encoded)
+                .map(|stored| stored.network)
+                .map_err(|error| format!("{error:#}"));
+            lnmarkets_mainnet_slot_state(Some(network))
+        }
+        Ok(None) => lnmarkets_mainnet_slot_state(None),
+        Err(error) => CredentialSlotState::Unreadable(format!(
+            "the platform credential store could not be read: {error:#}"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4218,5 +5004,221 @@ mod tests {
         .expect("sign response")
         .try_as_json()
         .expect("response json")
+    }
+
+    // -------------------------------------------------------------------
+    // WP-7 operator-surface helpers: the honesty wording of every rendered
+    // line is pinned here (real state only; no authority claim without
+    // backing; un-landed WPs named).
+    // -------------------------------------------------------------------
+
+    fn wp7_snapshot(
+        env_killed: bool,
+        persisted_killed: bool,
+        kill_reason: Option<&str>,
+    ) -> SpendPolicySnapshot {
+        SpendPolicySnapshot {
+            env_killed,
+            persisted_killed,
+            kill_reason: kill_reason.map(|reason| reason.to_string()),
+            killed_at_unix: None,
+            halt_message: if env_killed || persisted_killed {
+                "SPEND_HALTED: …".to_string()
+            } else {
+                String::new()
+            },
+            default_ceiling_sats: DAILY_CEILING_SATS,
+            budget_path: "C:\\data\\run\\spend-budget.json".to_string(),
+            surfaces: vec![SurfaceSpendSnapshot {
+                surface: SURFACE_WALLET_L402.to_string(),
+                utc_day: "2026-09-01".to_string(),
+                spent_sats: 250,
+                ceiling_sats: 2_000,
+                ceiling_is_override: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn wallet_network_gate_line_renders_the_real_0286_gate_state() {
+        // Lane off: the honest unconfigured posture — never a "signet" claim.
+        let line = wallet_network_gate_line(None, None, false);
+        assert!(line.contains("lane off"), "{line}");
+        assert!(line.contains("unset"), "{line}");
+        assert!(line.contains("allow-mainnet opt-in"), "{line}");
+        // Configured signet, sidecar reporting: the opt-in state is named.
+        let line = wallet_network_gate_line(Some("signet"), Some("signet"), false);
+        assert!(line.contains("configured signet"), "{line}");
+        assert!(line.contains("reported signet"), "{line}");
+        assert!(line.contains("opt-in absent (mainnet refused)"), "{line}");
+        // Opted-in mainnet (the only way mainnet renders as configured).
+        let line = wallet_network_gate_line(Some("mainnet"), Some("mainnet"), true);
+        assert!(line.contains("configured mainnet"), "{line}");
+        assert!(line.contains("opt-in present"), "{line}");
+        // Sidecar not reporting yet is stated, never fabricated.
+        let line = wallet_network_gate_line(Some("signet"), None, false);
+        assert!(line.contains("sidecar not reporting yet"), "{line}");
+    }
+
+    #[test]
+    fn wallet_network_note_matches_the_real_network() {
+        assert_eq!(
+            wallet_network_note("signet"),
+            "Test coins only — never mainnet."
+        );
+        assert_eq!(wallet_network_note("regtest"), "Test coins only — never mainnet.");
+        let mainnet = wallet_network_note("mainnet");
+        assert!(mainnet.contains("real-funds"), "{mainnet}");
+        assert!(mainnet.contains("0286"), "{mainnet}");
+    }
+
+    #[test]
+    fn nautilus_gate_line_renders_the_current_lock_honestly() {
+        // Off + unset env: the sidecar default and the honest lock.
+        let line = nautilus_gate_line(false, None);
+        assert!(line.contains("off (OMEGA_NAUTILUS_SIDECAR unset)"), "{line}");
+        assert!(line.contains("testnet"), "{line}");
+        assert!(line.contains("mainnet locked"), "{line}");
+        assert!(line.contains("not landed on this branch"), "{line}");
+        // Enabled on testnet: still locked for mainnet (WP-5 not landed).
+        let line = nautilus_gate_line(true, Some("testnet"));
+        assert!(line.contains("enabled"), "{line}");
+        assert!(line.contains("mainnet locked"), "{line}");
+        // A configured mainnet env is REFUSED in this build — the line says
+        // exactly that (no graduation gate exists here to pass).
+        let line = nautilus_gate_line(true, Some("mainnet"));
+        assert!(line.contains("REFUSED by the current build"), "{line}");
+        assert!(line.contains("not landed on this branch"), "{line}");
+    }
+
+    #[test]
+    fn lnmarkets_admission_line_is_display_only_and_honest() {
+        // Unset: the current signet-only posture, named as display-only.
+        let line = lnmarkets_admission_line(None);
+        assert!(line.contains("signet-only"), "{line}");
+        assert!(line.contains("unset"), "{line}");
+        assert!(line.contains("display-only"), "{line}");
+        assert!(line.contains("not landed on this branch"), "{line}");
+        // Even a set env is honest: nothing consumes it in this build.
+        let line = lnmarkets_admission_line(Some("1"));
+        assert!(line.contains("nothing consumes it yet"), "{line}");
+        assert!(line.contains("signet-only"), "{line}");
+    }
+
+    #[test]
+    fn nipac_projection_line_renders_the_honest_flag_absence() {
+        // The brief's requirement: the honest disabled state while the flag
+        // is unset — a display of the flag's absence, not a feature.
+        let line = nipac_projection_line(None);
+        assert!(line.contains("NIP-AC projection: disabled"), "{line}");
+        assert!(line.contains("unset"), "{line}");
+        assert!(line.contains("the flag's absence, not a feature"), "{line}");
+        // A non-enabled value: still disabled, honestly.
+        let line = nipac_projection_line(Some("0"));
+        assert!(line.contains("NIP-AC projection: disabled"), "{line}");
+        // An enabled flag does NOT claim a feature: WP-12 is not landed, so
+        // nothing emits and the line says so.
+        let line = nipac_projection_line(Some("1"));
+        assert!(line.contains("NOT implemented"), "{line}");
+        assert!(line.contains("nothing emits"), "{line}");
+    }
+
+    #[test]
+    fn spend_kill_state_line_names_both_kill_sources() {
+        // Both sources clear.
+        let line = spend_kill_state_line(&wp7_snapshot(false, false, None));
+        assert!(line.contains("env not set"), "{line}");
+        assert!(line.contains("persisted not set"), "{line}");
+        // The env kill latched: named with its env, separately from the
+        // persisted kill.
+        let line = spend_kill_state_line(&wp7_snapshot(true, false, None));
+        assert!(line.contains("env SET (OMEGA_SPEND_KILL=1)"), "{line}");
+        assert!(line.contains("persisted not set"), "{line}");
+        // The persisted loss-rule kill: the reason is shown as stored.
+        let line = spend_kill_state_line(&wp7_snapshot(
+            false,
+            true,
+            Some("loss-rule: over-settlement"),
+        ));
+        assert!(line.contains("env not set"), "{line}");
+        assert!(line.contains("persisted SET (loss-rule: over-settlement)"), "{line}");
+        // Founder-only re-enable is always named (no self-clear authority).
+        assert!(line.contains("founder-only re-enable"), "{line}");
+    }
+
+    #[test]
+    fn surface_budget_line_states_the_ceiling_source() {
+        let row = SurfaceSpendSnapshot {
+            surface: SURFACE_WALLET_L402.to_string(),
+            utc_day: "2026-09-01".to_string(),
+            spent_sats: 250,
+            ceiling_sats: 2_000,
+            ceiling_is_override: true,
+        };
+        let line = surface_budget_line(&row);
+        assert!(line.contains("wallet-l402"), "{line}");
+        assert!(line.contains("250 sats"), "{line}");
+        assert!(line.contains("2_000") || line.contains("2000") || line.contains("2,000"), "{line}");
+        assert!(line.contains("operator override"), "{line}");
+        let default_row = SurfaceSpendSnapshot {
+            ceiling_is_override: false,
+            ceiling_sats: DAILY_CEILING_SATS,
+            ..row
+        };
+        let line = surface_budget_line(&default_row);
+        assert!(line.contains("first-phase default"), "{line}");
+    }
+
+    #[test]
+    fn credential_slot_line_renders_presence_only_and_never_material() {
+        let detail = "slot omega://…; provisioning is founder-held";
+        // Present / Absent / Unreadable / not-read-yet — presence wording
+        // only; no secret material ever enters the line (the helper has no
+        // material parameter by construction).
+        let line = credential_slot_line(
+            "Hyperliquid mainnet agent wallet",
+            detail,
+            Some(&CredentialSlotState::Present),
+        );
+        assert!(line.contains("PROVISIONED"), "{line}");
+        assert!(line.contains("founder-held"), "{line}");
+        let line = credential_slot_line(
+            "LN Markets mainnet Trade key",
+            detail,
+            Some(&CredentialSlotState::Absent),
+        );
+        assert!(line.contains("empty (no credential)"), "{line}");
+        let line = credential_slot_line(
+            "Hyperliquid mainnet agent wallet",
+            detail,
+            Some(&CredentialSlotState::Unreadable("store error".to_string())),
+        );
+        assert!(line.contains("UNREADABLE"), "{line}");
+        assert!(line.contains("store error"), "{line}");
+        let line = credential_slot_line("LN Markets mainnet Trade key", detail, None);
+        assert!(line.contains("not read yet"), "{line}");
+    }
+
+    #[test]
+    fn lnmarkets_mainnet_slot_state_maps_the_record_network() {
+        // A mainnet record = the mainnet slot is provisioned.
+        assert_eq!(
+            lnmarkets_mainnet_slot_state(Some(Ok(LnMarketsNetwork::Mainnet))),
+            CredentialSlotState::Present
+        );
+        // The single stored record holding a signet network = the mainnet
+        // slot is empty (honest absence, not a fabricated present).
+        assert_eq!(
+            lnmarkets_mainnet_slot_state(Some(Ok(LnMarketsNetwork::Signet))),
+            CredentialSlotState::Absent
+        );
+        assert_eq!(lnmarkets_mainnet_slot_state(None), CredentialSlotState::Absent);
+        // A record that cannot be decoded is UNREADABLE with the reason.
+        match lnmarkets_mainnet_slot_state(Some(Err("decode failed".to_string()))) {
+            CredentialSlotState::Unreadable(reason) => {
+                assert!(reason.contains("decode failed"), "{reason}");
+            }
+            state => panic!("expected Unreadable, got {state:?}"),
+        }
     }
 }

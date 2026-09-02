@@ -33,6 +33,11 @@ pub use protocol::{
     HealthResult, IdentityStatusResult, InitializeResult, InvoiceResult, PayResult,
     PROTOCOL_SCHEMA, PROTOCOL_VERSION, SERVICE_VERSION, StatusResult, WalletState,
 };
+/// WP-7: the spend-policy projection types + the enforced-surface name and
+/// the default ceiling, consumed by the operator surface (sovereign_dashboard).
+pub use spend_policy::{
+    DAILY_CEILING_SATS, SURFACE_WALLET_L402, SpendPolicySnapshot, SurfaceSpendSnapshot,
+};
 pub use supervisor::{
     SovereignWalletCommand, SovereignWalletSupervisor, SovereignWalletSupervisorOptions,
     default_options, fixture_command, fixture_command_with_network, fixture_node,

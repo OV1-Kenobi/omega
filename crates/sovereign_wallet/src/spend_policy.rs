@@ -15,20 +15,31 @@
 //!   wallet choke point (L-402 client pay, escrow fee composition mint+pay,
 //!   mandate-gated payments). Ceiling accounting counts real mints + payments
 //!   (the design's "invoice mints + payments"); the escrow `amount_sats`
-//!   bookkeeping never counts (simulated limbo — no broadcast).
+//!   bookkeeping never counts (simulated limbo — no broadcast). The ceilings
+//!   are CONFIGURATION: the operator surface (WP-7) can set a per-surface
+//!   override; a missing override falls back to [`DAILY_CEILING_SATS`].
 //! - **Persistence** — `spend-budget.json` at `<data_root>/run/` (the
 //!   SEC-2026-045 owner-only root the sidecar already uses; the Rust module
 //!   is the single writer — the sidecar is not involved). Atomic
 //!   write-then-rename; UTC-day rollover resets the counters.
 //! - **Founder-only re-enable** — no agent or surface self-clears the kill;
 //!   the founder unsets the env / flips the WP-7 operator control
-//!   (SEC-2026-104: procedural, recorded in the registry row).
+//!   (SEC-2026-104: procedural, recorded in the registry row). The WP-7
+//!   operator control clears only what the operator set: the env kill is
+//!   cleared only by unsetting the env and restarting, and a loss-rule
+//!   auto-kill is clearable only per the C3 halted-state rule (Debug &
+//!   Incident route; founder re-enable).
 //! - **Loss rule (C3 / SEC-2026-098)** — expected-vs-actual settle
 //!   comparison at `pay_invoice`: the sidecar reports the prepared-for total
 //!   outflow (invoice amount + expected fee) and the actual outflow; a
 //!   payment settling for MORE than the prepared total auto-sets the kill
 //!   fail-closed, reports the named halted state, and opens the Debug &
 //!   Incident route before anything resumes (Decision 4).
+//! - **Operator surface (WP-7)** — every set/clear event (operator kill,
+//!   ceiling override, loss-rule auto-kill) is LOGGED (redacted via
+//!   `util::redact`), and [`SpendPolicy::snapshot`] is the read-only
+//!   projection the dashboard renders (real state only — C7; the policy
+//!   store holds no secret material).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -54,6 +65,11 @@ pub const DAILY_CEILING_SATS: u64 = 1_000;
 pub const SPEND_BUDGET_FILE_NAME: &str = "spend-budget.json";
 const SPEND_BUDGET_SCHEMA: &str = "omega.spend-budget.v1";
 
+/// WP-7: the reason prefix marking a kill the OPERATOR set (clearable via
+/// the operator control). Loss-rule auto-kills never carry this prefix, so
+/// the control cannot clear or launder them (C3 / SEC-2026-098).
+pub const OPERATOR_KILL_REASON_PREFIX: &str = "operator: ";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SurfaceBudget {
     /// UTC calendar day (YYYY-MM-DD) the counter belongs to; a different day
@@ -65,16 +81,24 @@ struct SurfaceBudget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SpendBudgetState {
     schema: String,
-    /// Persisted kill: set by the loss rule (fail-closed auto-kill). The env
-    /// kill lives on `SpendPolicy.env_killed` (process-level, founder-set).
+    /// Persisted kill: set by the loss rule (fail-closed auto-kill) or by the
+    /// WP-7 operator control. The env kill lives on `SpendPolicy.env_killed`
+    /// (process-level, founder-set).
     killed: bool,
-    /// Named reason for the persisted kill (e.g. the loss-rule trigger).
+    /// Named reason for the persisted kill (the loss-rule trigger, or an
+    /// operator kill prefixed with [`OPERATOR_KILL_REASON_PREFIX`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kill_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     killed_at_unix: Option<i64>,
     /// Per-surface counters.
+    #[serde(default)]
     surfaces: BTreeMap<String, SurfaceBudget>,
+    /// OMEGA-DELTA-0300 (WP-7): per-surface daily-ceiling overrides — the
+    /// ceilings are configuration (settable from the operator surface), not
+    /// constants; a missing override falls back to [`DAILY_CEILING_SATS`].
+    #[serde(default)]
+    ceiling_overrides: BTreeMap<String, u64>,
 }
 
 impl Default for SpendBudgetState {
@@ -85,8 +109,45 @@ impl Default for SpendBudgetState {
             kill_reason: None,
             killed_at_unix: None,
             surfaces: BTreeMap::new(),
+            ceiling_overrides: BTreeMap::new(),
         }
     }
+}
+
+/// WP-7: one per-surface row of the read-only operator-surface projection —
+/// the REAL counter for the current UTC day and the effective ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceSpendSnapshot {
+    pub surface: String,
+    /// The UTC day the persisted counter belongs to (a stale day reads as
+    /// zero spent — the rollover already happened or is pending on the next
+    /// recorded spend).
+    pub utc_day: String,
+    pub spent_sats: u64,
+    /// The effective ceiling: the override when configured, else the
+    /// [`DAILY_CEILING_SATS`] default.
+    pub ceiling_sats: u64,
+    pub ceiling_is_override: bool,
+}
+
+/// WP-7: the read-only projection of the policy state the operator surface
+/// renders. Real state only (C7 honesty law) — the policy store holds no
+/// secret material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendPolicySnapshot {
+    /// The env-level kill latched at supervisor construction
+    /// (`OMEGA_SPEND_KILL=1`).
+    pub env_killed: bool,
+    /// The persisted kill (loss-rule auto-set or operator-set).
+    pub persisted_killed: bool,
+    pub kill_reason: Option<String>,
+    pub killed_at_unix: Option<i64>,
+    /// The exact named halted state the funded flows produce while killed.
+    pub halt_message: String,
+    /// The first-phase default ceiling (the labeled reversible assumption).
+    pub default_ceiling_sats: u64,
+    pub budget_path: String,
+    pub surfaces: Vec<SurfaceSpendSnapshot>,
 }
 
 /// The spend policy owned by the supervisor: kill (env + persisted) and the
@@ -171,14 +232,161 @@ impl SpendPolicy {
             .filter(|budget| budget.utc_day == day)
             .map(|budget| budget.spent_sats)
             .unwrap_or(0);
-        if spent.saturating_add(amount_sats) > DAILY_CEILING_SATS {
+        let ceiling = self.surface_ceiling(surface);
+        if spent.saturating_add(amount_sats) > ceiling {
             return Err(SovereignWalletError::SpendPolicyRefused(format!(
                 "the daily spend ceiling for surface {surface} would be exceeded: \
-                 {spent} + {amount_sats} > {DAILY_CEILING_SATS} sats (first-phase reversible \
-                 assumption, OMEGA-DELTA-0300)"
+                 {spent} + {amount_sats} > {ceiling} sats (first-phase default \
+                 {DAILY_CEILING_SATS}, OMEGA-DELTA-0300)"
             )));
         }
         Ok(())
+    }
+
+    /// The effective per-surface daily ceiling: the operator override when
+    /// one is configured, otherwise the first-phase default (Decision 4's
+    /// 1,000 sats — a labeled reversible assumption; configuration, not a
+    /// constant baked into a check).
+    pub fn surface_ceiling(&self, surface: &str) -> u64 {
+        self.state
+            .ceiling_overrides
+            .get(surface)
+            .copied()
+            .unwrap_or(DAILY_CEILING_SATS)
+    }
+
+    /// WP-7 operator surface: configure the per-surface daily ceiling (sats).
+    /// Configuration, not a posture change (the 0300 registry row records the
+    /// first-phase 1,000-sat reversible assumption). Zero is refused — the
+    /// kill switch, not a zero ceiling, is the "block all spend" control.
+    /// The event is logged (redacted).
+    pub fn set_surface_ceiling(&mut self, surface: &str, ceiling_sats: u64) -> Result<()> {
+        if ceiling_sats == 0 {
+            anyhow::bail!(
+                "a zero daily ceiling is refused; use the spend kill ({}) to block all \
+                 spend (OMEGA-DELTA-0300)",
+                SPEND_KILL_ENVIRONMENT_VARIABLE
+            );
+        }
+        self.state
+            .ceiling_overrides
+            .insert(surface.to_string(), ceiling_sats);
+        log::warn!(
+            "OMEGA-DELTA-0300 spend-policy event: ceiling SET surface={surface} \
+             ceiling_sats={ceiling_sats} (operator surface; logged redacted)"
+        );
+        self.persist()
+    }
+
+    /// WP-7 operator surface: remove a per-surface ceiling override (the
+    /// surface falls back to the default). The event is logged (redacted).
+    pub fn clear_surface_ceiling(&mut self, surface: &str) -> Result<()> {
+        if self.state.ceiling_overrides.remove(surface).is_none() {
+            anyhow::bail!("no ceiling override is configured for surface {surface}");
+        }
+        log::warn!(
+            "OMEGA-DELTA-0300 spend-policy event: ceiling CLEARED surface={surface} \
+             (operator surface; logged redacted)"
+        );
+        self.persist()
+    }
+
+    /// WP-7 operator surface: SET the persisted kill with an operator reason.
+    /// Fail-closed directions preserved: a loss-rule auto-kill (C3 /
+    /// SEC-2026-098) can NOT be overwritten or laundered into an operator
+    /// kill — the control refuses while one is active. The event is logged
+    /// (redacted).
+    pub fn set_operator_kill(&mut self, reason: &str) -> Result<()> {
+        if let Some(existing) = &self.state.kill_reason {
+            if self.state.killed && !existing.starts_with(OPERATOR_KILL_REASON_PREFIX) {
+                anyhow::bail!(
+                    "a loss-rule kill is active ({existing}); the operator control cannot \
+                     overwrite it — the C3 halted-state rule applies (Debug & Incident \
+                     route before anything resumes; OMEGA-DELTA-0300)"
+                );
+            }
+        }
+        self.state.killed = true;
+        self.state.kill_reason = Some(format!("{OPERATOR_KILL_REASON_PREFIX}{reason}"));
+        self.state.killed_at_unix = Some(now_unix());
+        log::warn!(
+            "OMEGA-DELTA-0300 spend-kill event: SET (operator surface); reason: {}; \
+             logged redacted",
+            util::redact::redact_command(reason)
+        );
+        self.persist()
+    }
+
+    /// WP-7 operator surface: CLEAR a persisted kill the operator set. The
+    /// control clears only what the operator set: a loss-rule auto-kill is
+    /// clearable only per the C3 halted-state rule (Debug & Incident;
+    /// founder re-enable) and is refused here; the environment-level kill is
+    /// a separate source (cleared only by unsetting `OMEGA_SPEND_KILL` and
+    /// restarting) and is displayed independently. The event is logged
+    /// (redacted).
+    pub fn clear_operator_kill(&mut self) -> Result<(), String> {
+        let refusal = match &self.state.kill_reason {
+            Some(reason) if reason.starts_with(OPERATOR_KILL_REASON_PREFIX) => None,
+            Some(reason) => Some(format!(
+                "the persisted kill was auto-set by the loss rule ({reason}); the C3 \
+                 halted-state rule applies — the Debug & Incident route must run before \
+                 anything resumes and only the founder re-enables; the operator control \
+                 cannot clear a loss-rule kill (OMEGA-DELTA-0300)"
+            )),
+            None => Some(
+                "no persisted operator kill is set (nothing to clear; \
+                 OMEGA-DELTA-0300)"
+                    .to_string(),
+            ),
+        };
+        if let Some(message) = refusal {
+            log::warn!(
+                "OMEGA-DELTA-0300 spend-kill event: CLEAR refused (operator surface); \
+                 {message}"
+            );
+            return Err(message);
+        }
+        self.state.killed = false;
+        self.state.kill_reason = None;
+        self.state.killed_at_unix = None;
+        log::warn!(
+            "OMEGA-DELTA-0300 spend-kill event: CLEARED (operator surface); logged redacted"
+        );
+        self.persist().map_err(|error| error.to_string())
+    }
+
+    /// WP-7: the read-only operator-surface projection of the policy state —
+    /// the REAL persisted/env state for the dashboard to render (C7). A
+    /// counter whose persisted day differs from `now_unix`'s day reads as
+    /// zero spent (the rollover semantics of [`Self::check_spend`]).
+    pub fn snapshot(&self, now_unix: i64) -> SpendPolicySnapshot {
+        let day = utc_day(now_unix);
+        let surfaces = self
+            .state
+            .surfaces
+            .iter()
+            .map(|(surface, budget)| SurfaceSpendSnapshot {
+                surface: surface.clone(),
+                utc_day: budget.utc_day.clone(),
+                spent_sats: if budget.utc_day == day {
+                    budget.spent_sats
+                } else {
+                    0
+                },
+                ceiling_sats: self.surface_ceiling(surface),
+                ceiling_is_override: self.state.ceiling_overrides.contains_key(surface),
+            })
+            .collect();
+        SpendPolicySnapshot {
+            env_killed: self.env_killed,
+            persisted_killed: self.state.killed,
+            kill_reason: self.state.kill_reason.clone(),
+            killed_at_unix: self.state.killed_at_unix,
+            halt_message: self.halt_message(),
+            default_ceiling_sats: DAILY_CEILING_SATS,
+            budget_path: self.budget_path.display().to_string(),
+            surfaces,
+        }
     }
 
     /// Record a REAL mint or pay on `surface` after the sidecar confirmed it,
@@ -204,12 +412,18 @@ impl SpendPolicy {
 
     /// C3 / SEC-2026-098: auto-set the kill fail-closed (loss rule) and
     /// PERSIST it so a restart cannot silently un-halt the surface. Only the
-    /// founder re-enables (env unset / WP-7 operator control); nothing here
-    /// self-clears.
+    /// founder re-enables (env unset / WP-7 operator control per the C3
+    /// halted-state rule); nothing here self-clears. The event is logged
+    /// (redacted).
     pub fn auto_kill_loss_rule(&mut self, reason: &str, now_unix: i64) -> Result<()> {
         self.state.killed = true;
         self.state.kill_reason = Some(reason.to_string());
         self.state.killed_at_unix = Some(now_unix);
+        log::warn!(
+            "OMEGA-DELTA-0300 spend-kill event: SET (loss-rule auto-kill, fail-closed); \
+             reason: {}; logged redacted",
+            util::redact::redact_command(reason)
+        );
         self.persist()
     }
 
@@ -228,6 +442,16 @@ impl SpendPolicy {
             .with_context(|| format!("rename {} over {}", tmp.display(), self.budget_path.display()))?;
         Ok(())
     }
+}
+
+/// Current unix time in seconds (the policy's clock for the operator-set
+/// kill timestamps; the UTC-day rollover is computed from explicit `now`
+/// arguments).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// UTC calendar day (YYYY-MM-DD) for a unix timestamp — the rollover key.
@@ -388,5 +612,166 @@ mod tests {
         fs::write(&path, b"{not json").expect("write");
         let err = SpendPolicy::new(dir.path(), false).expect_err("corrupted file must refuse");
         assert!(err.to_string().contains("spend-budget.json"), "{err}");
+    }
+
+    // -------------------------------------------------------------------
+    // WP-7 operator surface: kill set/clear + ceiling configuration +
+    // the read-only snapshot projection.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn the_operator_kill_sets_clears_and_is_refused_for_a_loss_rule_kill() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("run").join(SPEND_BUDGET_FILE_NAME);
+        let mut policy = SpendPolicy::new(dir.path(), false).expect("policy");
+        // Operator set -> killed, persisted with the operator prefix.
+        policy
+            .set_operator_kill("operator surface set (test)")
+            .expect("set");
+        assert!(policy.killed());
+        assert!(
+            policy
+                .budget_state()
+                .kill_reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with(OPERATOR_KILL_REASON_PREFIX),
+            "the operator reason must carry the operator prefix"
+        );
+        drop(policy);
+        // Reload: the operator kill survives (a restart cannot silently
+        // un-halt the surface).
+        let mut policy = SpendPolicy::new(dir.path(), false).expect("reload");
+        assert!(policy.killed());
+        // The operator clear succeeds for an operator-set kill.
+        policy.clear_operator_kill().expect("clear");
+        assert!(!policy.killed());
+        // A loss-rule auto-kill: the operator control can NOT set over it
+        // (no laundering into a clearable operator kill)...
+        policy
+            .auto_kill_loss_rule("loss-rule: over-settlement (test)", NOW)
+            .expect("auto kill");
+        let err = policy
+            .set_operator_kill("again")
+            .expect_err("set over a loss-rule kill must refuse");
+        assert!(err.to_string().contains("C3"), "{err}");
+        // ...and the clear is refused with the C3 route named.
+        let err = policy
+            .clear_operator_kill()
+            .expect_err("clearing a loss-rule kill must refuse");
+        assert!(err.contains("Debug & Incident"), "{err}");
+        assert!(err.contains("loss-rule"), "{err}");
+        assert!(policy.killed(), "the loss-rule kill stays active");
+    }
+
+    #[test]
+    fn the_env_kill_is_independent_of_the_persisted_operator_kill() {
+        let dir = tempdir().expect("tempdir");
+        let mut policy = SpendPolicy::new(dir.path(), true).expect("policy (env killed)");
+        assert!(policy.killed());
+        // No persisted kill yet: the clear is refused honestly.
+        let err = policy
+            .clear_operator_kill()
+            .expect_err("no persisted kill");
+        assert!(err.contains("no persisted operator kill"), "{err}");
+        // The operator can still set and clear a persisted kill while the
+        // env kill is latched; killed() stays true (the env source remains).
+        policy
+            .set_operator_kill("operator surface set (test)")
+            .expect("set");
+        policy.clear_operator_kill().expect("clear");
+        assert!(policy.killed(), "the env kill remains latched");
+    }
+
+    #[test]
+    fn the_operator_surface_configures_the_per_surface_ceiling() {
+        let dir = tempdir().expect("tempdir");
+        let mut policy = SpendPolicy::new(dir.path(), false).expect("policy");
+        // Default ceiling applies without an override.
+        assert_eq!(
+            policy.surface_ceiling(SURFACE_WALLET_L402),
+            DAILY_CEILING_SATS
+        );
+        // Zero is refused (the kill is the block-all control).
+        assert!(
+            policy
+                .set_surface_ceiling(SURFACE_WALLET_L402, 0)
+                .is_err()
+        );
+        // The override is applied to the check.
+        policy
+            .set_surface_ceiling(SURFACE_WALLET_L402, 500)
+            .expect("set override");
+        assert!(
+            policy.check_spend(SURFACE_WALLET_L402, 501, NOW).is_err()
+        );
+        assert!(policy.check_spend(SURFACE_WALLET_L402, 500, NOW).is_ok());
+        // Another surface keeps the default.
+        assert_eq!(policy.surface_ceiling("escrow"), DAILY_CEILING_SATS);
+        // The override persists across a reload; clearing falls back to the
+        // default and a second clear is refused.
+        drop(policy);
+        let mut policy = SpendPolicy::new(dir.path(), false).expect("reload");
+        assert_eq!(policy.surface_ceiling(SURFACE_WALLET_L402), 500);
+        policy
+            .clear_surface_ceiling(SURFACE_WALLET_L402)
+            .expect("clear override");
+        assert_eq!(
+            policy.surface_ceiling(SURFACE_WALLET_L402),
+            DAILY_CEILING_SATS
+        );
+        assert!(
+            policy
+                .clear_surface_ceiling(SURFACE_WALLET_L402)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_snapshot_renders_the_real_policy_state() {
+        let dir = tempdir().expect("tempdir");
+        let mut policy = SpendPolicy::new(dir.path(), false).expect("policy");
+        policy
+            .record_spend(SURFACE_WALLET_L402, 250, NOW)
+            .expect("record");
+        policy
+            .set_surface_ceiling(SURFACE_WALLET_L402, 2_000)
+            .expect("set override");
+        let snapshot = policy.snapshot(NOW);
+        assert!(!snapshot.env_killed);
+        assert!(!snapshot.persisted_killed);
+        assert_eq!(snapshot.default_ceiling_sats, DAILY_CEILING_SATS);
+        assert!(snapshot.budget_path.ends_with(SPEND_BUDGET_FILE_NAME));
+        let row = snapshot
+            .surfaces
+            .iter()
+            .find(|row| row.surface == SURFACE_WALLET_L402)
+            .expect("the wallet-l402 row");
+        assert_eq!(row.spent_sats, 250);
+        assert_eq!(row.ceiling_sats, 2_000);
+        assert!(row.ceiling_is_override);
+        // The loss rule: the snapshot carries the persisted kill + the exact
+        // halt message the funded flows produce.
+        policy
+            .auto_kill_loss_rule("loss-rule: over-settlement (test)", NOW)
+            .expect("kill");
+        let snapshot = policy.snapshot(NOW);
+        assert!(snapshot.persisted_killed);
+        assert_eq!(
+            snapshot.kill_reason.as_deref(),
+            Some("loss-rule: over-settlement (test)")
+        );
+        assert!(snapshot.halt_message.contains("SPEND_HALTED"));
+        // Rollover: a stale-day counter reads zero spent (never the old
+        // day's total), while the persisted day is still shown honestly.
+        let next_day = NOW + 86_400;
+        let snapshot = policy.snapshot(next_day);
+        let row = snapshot
+            .surfaces
+            .iter()
+            .find(|row| row.surface == SURFACE_WALLET_L402)
+            .expect("the wallet-l402 row");
+        assert_eq!(row.spent_sats, 0);
+        assert_eq!(row.utc_day, utc_day(NOW));
     }
 }

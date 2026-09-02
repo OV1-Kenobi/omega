@@ -16460,11 +16460,14 @@ dependencies = [
  "anyhow",
  "app_identity",
  "command_center_ui",
+ "credentials_provider",
  "editor",
  "extension_host",
  "gpui",
+ "lnmarkets_client",
  "log",
  "market_ui",
+ "nautilus_sidecar",
  "nostr",
  "omega_identity",
  "omega_signer_broker",
@@ -16480,6 +16483,7 @@ dependencies = [
  "url",
  "util",
  "workspace",
+ "zed_credentials_provider",
 ]
 
 [[package]]
