@@ -22,6 +22,12 @@ pub use agent_wallet::{
 
 pub const ENABLE_ENVIRONMENT_VARIABLE: &str = "OMEGA_NAUTILUS_SIDECAR";
 pub const NETWORK_ENVIRONMENT_VARIABLE: &str = "OMEGA_NAUTILUS_NETWORK";
+/// OMEGA-DELTA-0295 — the founder-configured mainnet funded-envelope cap
+/// (design §6.3 item 6; a six-decimal USDC amount). The value itself is
+/// founder-set at ACTIVATION — placeholder-only here; the construction
+/// gate refuses mainnet while it is unset or malformed (fail-closed).
+pub const MAINNET_FUNDED_ENVELOPE_ENVIRONMENT_VARIABLE: &str =
+    "OMEGA_NAUTILUS_MAINNET_FUNDED_ENVELOPE_USDC";
 const EVENT_PREFIX: &str = "OMEGA_NAUTILUS_EVENT ";
 const EVENT_SCHEMA: &str = "omega.nautilus.lifecycle.v1";
 const STREAM_PREFIX: &str = "OMEGA_NAUTILUS_STREAM ";
@@ -80,7 +86,12 @@ impl NautilusConfig {
         let network = Network::parse(
             &std::env::var(NETWORK_ENVIRONMENT_VARIABLE).unwrap_or_else(|_| "testnet".into()),
         )?;
-        if network == Network::Mainnet {
+        // OMEGA-DELTA-0295 — the env graduation gate (design §6.3 item 1):
+        // mainnet requires the explicit network config AND the opt-in env
+        // pair (`OMEGA_NAUTILUS_NETWORK=mainnet` +
+        // `OMEGA_NAUTILUS_MAINNET_GRADUATION=1`); without both, the exact
+        // legacy bail text remains and unset still means testnet.
+        if network == Network::Mainnet && !agent_wallet::mainnet_graduation_gate_open() {
             bail!("Nautilus mainnet is disabled until the mainnet graduation gate passes");
         }
         let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -339,7 +350,10 @@ pub enum StreamEvent {
 }
 
 impl StreamEvent {
-    fn validate(&self, expected_generation: u64) -> Result<()> {
+    // OMEGA-DELTA-0295 — the wire validation is "must equal the configured
+    // network" (design §6.3 item 5); testnet behavior is unchanged and a
+    // mismatched network is still refused.
+    fn validate(&self, expected_generation: u64, expected_network: Network) -> Result<()> {
         let (schema, generation, network) = match self {
             Self::Quote {
                 schema,
@@ -408,8 +422,8 @@ impl StreamEvent {
         if *generation != expected_generation {
             bail!("Nautilus stream event has a stale generation");
         }
-        if *network != Network::Testnet {
-            bail!("Nautilus stream event is not testnet");
+        if *network != expected_network {
+            bail!("Nautilus stream event does not match the configured network");
         }
         Ok(())
     }
@@ -550,7 +564,11 @@ impl NautilusCommand {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    // OMEGA-DELTA-0295 — the bounded quote-strategy envelope validates
+    // identically on every configured network: the same bounds (no
+    // widening in this WP) with a network-labeled message (design §6.3
+    // item 4).
+    fn validate(&self, network: Network) -> Result<()> {
         match self {
             Self::PlaceOrder {
                 client_order_id,
@@ -614,7 +632,10 @@ impl NautilusCommand {
                 || parameters.quote_offset_bps < parameters.admission_floor_bps
                 || !digest_is_lower_hex
             {
-                bail!("bounded quote strategy parameters exceed the testnet envelope");
+                bail!(
+                    "bounded quote strategy parameters exceed the {} envelope",
+                    network.label().to_ascii_lowercase()
+                );
             }
         }
         Ok(())
@@ -630,9 +651,9 @@ pub struct CommandRequest {
 }
 
 impl CommandRequest {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, network: Network) -> Result<()> {
         validate_identifier("command ID", &self.command_id)?;
-        self.command.validate()
+        self.command.validate(network)
     }
 }
 
@@ -1064,7 +1085,10 @@ impl CommandEvent {
         }
     }
 
-    fn validate(&self, expected_generation: u64) -> Result<()> {
+    // OMEGA-DELTA-0295 — the command wire validation is "must equal the
+    // configured network" (design §6.3 item 5); testnet behavior is
+    // unchanged and a mismatched network is still refused.
+    fn validate(&self, expected_generation: u64, expected_network: Network) -> Result<()> {
         let (schema, generation, network, _, _) = self.metadata();
         if schema != COMMAND_SCHEMA {
             bail!("Nautilus command schema is not supported");
@@ -1072,8 +1096,8 @@ impl CommandEvent {
         if generation != expected_generation {
             bail!("Nautilus command event has a stale generation");
         }
-        if network != Network::Testnet {
-            bail!("Nautilus command event is not testnet");
+        if network != expected_network {
+            bail!("Nautilus command event does not match the configured network");
         }
         Ok(())
     }
@@ -1115,6 +1139,12 @@ pub struct NautilusSupervisor {
     config: NautilusConfig,
     private_key: PrivateKey,
     agent_wallet: Option<AgentWalletSummary>,
+    /// OMEGA-DELTA-0295 — the founder-configured mainnet funded-envelope
+    /// cap (six-decimal USDC), validated at construction; `None` on
+    /// testnet. The engine-start path refuses mainnet when the probed
+    /// account value exceeds it (design §6.3 item 6; values founder-set
+    /// at activation — placeholder-only here).
+    mainnet_funded_envelope_usdc: Option<String>,
     child: Option<Child>,
     child_stdin: Option<ChildStdin>,
     events: Option<mpsc::Receiver<Result<SidecarEvent>>>,
@@ -1125,13 +1155,34 @@ pub struct NautilusSupervisor {
 
 impl NautilusSupervisor {
     pub fn new(config: NautilusConfig, private_key: PrivateKey) -> Result<Self> {
-        if config.network != Network::Testnet {
+        // OMEGA-DELTA-0295 — the construction graduation gate (design
+        // §6.3 items 1-2 and 6): mainnet constructs only when the gate
+        // env pair is present; the funded-envelope cap must be
+        // configured for mainnet (values are founder-set at activation,
+        // so an un-gated refusal keeps the exact legacy text below).
+        if config.network == Network::Mainnet && !agent_wallet::mainnet_graduation_gate_open() {
             bail!("Nautilus mainnet is disabled; only testnet is permitted");
         }
+        let mainnet_funded_envelope_usdc = if config.network == Network::Mainnet {
+            match std::env::var(MAINNET_FUNDED_ENVELOPE_ENVIRONMENT_VARIABLE) {
+                Ok(cap) => {
+                    agent_wallet::six_decimal_usdc_micros(&cap).context(
+                        "the Nautilus mainnet funded envelope cap is malformed",
+                    )?;
+                    Some(cap)
+                }
+                Err(_) => bail!(
+                    "the Nautilus mainnet funded envelope is not configured ({MAINNET_FUNDED_ENVELOPE_ENVIRONMENT_VARIABLE}); values are founder-set at activation"
+                ),
+            }
+        } else {
+            None
+        };
         Ok(Self {
             config,
             private_key,
             agent_wallet: None,
+            mainnet_funded_envelope_usdc,
             child: None,
             child_stdin: None,
             events: None,
@@ -1190,11 +1241,13 @@ impl NautilusSupervisor {
             bail!("Nautilus sidecar is already running");
         }
         self.generation = self.generation.saturating_add(1).max(1);
+        // OMEGA-DELTA-0295 — the launch arg follows the configured network
+        // (design §6.3 item 5); testnet behavior is unchanged.
         let mut command = Command::new(&self.config.python);
         command
             .arg(&self.config.engine)
             .arg("--network")
-            .arg("testnet")
+            .arg(self.config.network.label().to_ascii_lowercase())
             .arg("--generation")
             .arg(self.generation.to_string())
             .arg("--reconciliation-lookback-minutes")
@@ -1205,7 +1258,8 @@ impl NautilusSupervisor {
             .stderr(Stdio::piped());
         let mut child = command.spawn().with_context(|| {
             format!(
-                "start Nautilus testnet sidecar with {}",
+                "start Nautilus {} sidecar with {}",
+                self.config.network.label().to_ascii_lowercase(),
                 self.config.python.display()
             )
         })?;
@@ -1247,6 +1301,7 @@ impl NautilusSupervisor {
         let (sender, receiver) = mpsc::channel();
         let stream = self.stream.clone();
         let expected_generation = self.generation;
+        let expected_network = self.config.network;
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let line = match line {
@@ -1267,7 +1322,7 @@ impl NautilusSupervisor {
                     let event = serde_json::from_str::<StreamEvent>(payload)
                         .context("decode Nautilus stream event")
                         .and_then(|event| {
-                            event.validate(expected_generation)?;
+                            event.validate(expected_generation, expected_network)?;
                             Ok(event)
                         });
                     match event {
@@ -1366,12 +1421,14 @@ impl NautilusSupervisor {
     }
 
     pub fn send_command(&mut self, request: CommandRequest) -> Result<CommandReceipt> {
-        request.validate()?;
+        request.validate(self.config.network)?;
         let command_type = request.command.command_type();
+        // OMEGA-DELTA-0295 — the command envelope carries the configured
+        // network (design §6.3 item 5).
         let envelope = CommandEnvelope {
             schema: COMMAND_SCHEMA,
             generation: self.generation,
-            network: Network::Testnet,
+            network: self.config.network,
             command_id: &request.command_id,
             command: &request.command,
         };
@@ -1436,7 +1493,7 @@ impl NautilusSupervisor {
             let SidecarEvent::Command(event) = event else {
                 continue;
             };
-            if event.validate(self.generation).is_err() {
+            if event.validate(self.generation, self.config.network).is_err() {
                 return Ok(unknown_receipt(
                     request.command_id,
                     command_type,
@@ -1906,7 +1963,10 @@ pub fn init(cx: &mut App) {
             return Ok::<(), anyhow::Error>(());
         }
         let refreshed = refresh_agent_wallet_approval(
-            http_client,
+            // OMEGA-DELTA-0295 — the mainnet engine-start preconditions
+            // below re-probe the official venue state, so the client is
+            // cloned here and kept for that probe.
+            http_client.clone(),
             &credentials,
             selected_network,
             now_ms()?,
@@ -1941,6 +2001,32 @@ pub fn init(cx: &mut App) {
             .await?
             .ok_or_else(|| anyhow!("Hyperliquid agent wallet disappeared after approval probe"))?;
         let sidecar = NautilusSupervisor::with_agent_wallet(config, selected_wallet)?;
+        // OMEGA-DELTA-0295 — the mainnet engine-start preconditions
+        // (design §6.3 items 4 and 6): the official venue state probed on
+        // the configured network must be zero-exposure (zero open orders
+        // AND zero positions) and the probed account value must stay
+        // within the founder-configured funded envelope, before the
+        // engine starts. Testnet behavior is unchanged.
+        if selected_network == Network::Mainnet {
+            let official = probe_official_venue_state(
+                http_client.clone(),
+                selected_network,
+                &sidecar.bootstrap_owner_address()?,
+            )
+            .await?;
+            if !official.is_zero_exposure() {
+                bail!("Nautilus mainnet engine start requires zero open orders and zero positions");
+            }
+            if agent_wallet::account_value_exceeds_funded_envelope(
+                sidecar
+                    .mainnet_funded_envelope_usdc
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("the Nautilus mainnet funded envelope is unavailable"))?,
+                official.account_value_usdc.as_deref(),
+            )? {
+                bail!("the Nautilus mainnet funded envelope is exceeded; the engine refuses to start");
+            }
+        }
         let stream = sidecar.stream();
         {
             let supervisor = supervisor.clone();
@@ -1987,6 +2073,96 @@ pub fn init(cx: &mut App) {
     .detach_and_log_err(cx);
 }
 
+/// OMEGA-DELTA-0295: test support shared by the crate's test modules. The
+/// graduation-gate envs are process-global, so tests that set them (the
+/// gated-mainnet paths) and tests that assert their absence (the inherited
+/// refusal paths) are serialized on one lock — a parallel race would make
+/// either side flaky. Mirrors the sovereign-wallet crate's 0286 pattern.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static GRADUATION_GATE_ENV_LOCK: std::sync::Mutex<()> =
+        std::sync::Mutex::new(());
+
+    /// Run `run` with the graduation gate env pair set
+    /// (`OMEGA_NAUTILUS_NETWORK=mainnet` +
+    /// `OMEGA_NAUTILUS_MAINNET_GRADUATION=1`) (serialized), then remove
+    /// both. The unsafe env mutation matches the workspace's edition-2024
+    /// test style.
+    pub(crate) fn with_graduation_gate_open<T>(run: impl FnOnce() -> T) -> T {
+        let _guard = GRADUATION_GATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::set_var(crate::NETWORK_ENVIRONMENT_VARIABLE, "mainnet");
+        }
+        unsafe {
+            std::env::set_var(
+                crate::agent_wallet::MAINNET_GRADUATION_ENVIRONMENT_VARIABLE,
+                "1",
+            );
+        }
+        let result = run();
+        unsafe {
+            std::env::remove_var(crate::NETWORK_ENVIRONMENT_VARIABLE);
+        }
+        unsafe {
+            std::env::remove_var(crate::agent_wallet::MAINNET_GRADUATION_ENVIRONMENT_VARIABLE);
+        }
+        result
+    }
+
+    /// Run `run` with the graduation-gate env pair guaranteed ABSENT
+    /// (serialized) — the inherited un-gated refusal paths use this so a
+    /// concurrently-running gated test cannot make them flaky.
+    pub(crate) fn assert_graduation_gate_closed<T>(run: impl FnOnce() -> T) -> T {
+        let _guard = GRADUATION_GATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::remove_var(crate::NETWORK_ENVIRONMENT_VARIABLE);
+        }
+        unsafe {
+            std::env::remove_var(crate::agent_wallet::MAINNET_GRADUATION_ENVIRONMENT_VARIABLE);
+        }
+        run()
+    }
+
+    /// Run `run` with the graduation gate env pair AND the founder
+    /// funded-envelope cap set (serialized), then remove both — the gated
+    /// mainnet construction path.
+    pub(crate) fn with_graduated_mainnet_envelope<T>(
+        cap: &str,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = GRADUATION_GATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::set_var(crate::NETWORK_ENVIRONMENT_VARIABLE, "mainnet");
+        }
+        unsafe {
+            std::env::set_var(
+                crate::agent_wallet::MAINNET_GRADUATION_ENVIRONMENT_VARIABLE,
+                "1",
+            );
+        }
+        unsafe {
+            std::env::set_var(crate::MAINNET_FUNDED_ENVELOPE_ENVIRONMENT_VARIABLE, cap);
+        }
+        let result = run();
+        unsafe {
+            std::env::remove_var(crate::NETWORK_ENVIRONMENT_VARIABLE);
+        }
+        unsafe {
+            std::env::remove_var(crate::agent_wallet::MAINNET_GRADUATION_ENVIRONMENT_VARIABLE);
+        }
+        unsafe {
+            std::env::remove_var(crate::MAINNET_FUNDED_ENVELOPE_ENVIRONMENT_VARIABLE);
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2023,43 +2199,89 @@ mod tests {
             strategy_id: "OMEGA-BOUNDED-QUOTE-001".into(),
             parameters,
         };
-        assert!(command(measured_strategy_parameters()).validate().is_ok());
+        assert!(command(measured_strategy_parameters()).validate(Network::Testnet).is_ok());
 
         let mut below_floor = measured_strategy_parameters();
         below_floor.quote_offset_bps = 8;
-        assert!(command(below_floor).validate().is_err());
+        assert!(command(below_floor).validate(Network::Testnet).is_err());
 
         let mut fee_schedule_substitute = measured_strategy_parameters();
         fee_schedule_substitute.measured_round_trip_cost_micros_bps = 0;
-        assert!(command(fee_schedule_substitute).validate().is_err());
+        assert!(command(fee_schedule_substitute).validate(Network::Testnet).is_err());
 
         let mut unbound = measured_strategy_parameters();
         unbound.cost_evidence_sha256 = "0".repeat(63);
-        assert!(command(unbound).validate().is_err());
+        assert!(command(unbound).validate(Network::Testnet).is_err());
 
         let start = |cost_evidence_sha256| NautilusCommand::StartStrategy {
             strategy_id: "OMEGA-BOUNDED-QUOTE-001".into(),
             cost_evidence_sha256,
         };
-        assert!(start("a".repeat(64)).validate().is_ok());
-        assert!(start("a".repeat(63)).validate().is_err());
+        assert!(start("a".repeat(64)).validate(Network::Testnet).is_ok());
+        assert!(start("a".repeat(63)).validate(Network::Testnet).is_err());
     }
 
     #[test]
     fn mainnet_is_hard_refused() {
+        // Updated-with-citation to OMEGA-DELTA-0295 (2026-08-31): the
+        // un-gated mainnet refusal is RETAINED (exact legacy text); the
+        // gated mainnet construction path is covered by
+        // `mainnet_constructs_only_when_the_graduation_gate_passes`.
         assert_eq!(
             Network::parse("mainnet").expect("named mainnet"),
             Network::Mainnet
         );
         assert!(Network::parse("testnet").is_ok());
-        let config = NautilusConfig {
+        crate::test_support::assert_graduation_gate_closed(|| {
+            let config = NautilusConfig {
+                network: Network::Mainnet,
+                python: PathBuf::from("python"),
+                engine: PathBuf::from("engine.py"),
+                reconciliation_lookback_minutes: 60,
+                health_timeout: Duration::from_secs(5),
+            };
+            // `err().expect` rather than `expect_err`: NautilusSupervisor
+            // does not implement Debug (child-process and channel handles).
+            let error = NautilusSupervisor::new(config, private_key())
+                .err()
+                .expect("the un-gated mainnet construction is refused");
+            assert_eq!(
+                error.to_string(),
+                "Nautilus mainnet is disabled; only testnet is permitted"
+            );
+        });
+    }
+
+    #[test]
+    fn mainnet_constructs_only_when_the_graduation_gate_passes() {
+        // OMEGA-DELTA-0295 — the gated mainnet construction path (design
+        // §6.3 items 1-2 and 6): the env pair AND the founder-configured
+        // funded-envelope cap are both required; either missing is
+        // refused (fail-closed).
+        let config = || NautilusConfig {
             network: Network::Mainnet,
             python: PathBuf::from("python"),
             engine: PathBuf::from("engine.py"),
             reconciliation_lookback_minutes: 60,
             health_timeout: Duration::from_secs(5),
         };
-        assert!(NautilusSupervisor::new(config, private_key()).is_err());
+        crate::test_support::with_graduated_mainnet_envelope("1000.000000", || {
+            let supervisor =
+                NautilusSupervisor::new(config(), private_key()).expect("gated mainnet supervisor");
+            assert_eq!(
+                supervisor.mainnet_funded_envelope_usdc.as_deref(),
+                Some("1000.000000")
+            );
+        });
+        // The env pair without the founder-funded-envelope cap is refused.
+        // (`err().expect` rather than `expect_err`: NautilusSupervisor does
+        // not implement Debug — it holds child-process and channel handles.)
+        crate::test_support::with_graduation_gate_open(|| {
+            let error = NautilusSupervisor::new(config(), private_key())
+                .err()
+                .expect("mainnet without the funded envelope is refused");
+            assert!(error.to_string().contains("funded envelope is not configured"));
+        });
     }
 
     #[test]
@@ -2159,10 +2381,15 @@ mod tests {
     }
 
     #[test]
-    fn stream_events_are_versioned_generation_fenced_and_testnet_only() {
+    fn stream_events_are_versioned_generation_fenced_and_network_matched() {
+        // Updated-with-citation to OMEGA-DELTA-0295 (2026-08-31): the
+        // inherited `…_and_testnet_only` asserted the testnet-only wire;
+        // the validation is now "must equal the configured network" —
+        // testnet behavior is unchanged (mismatches still refused) and
+        // the matched-mainnet case is valid only behind the gate.
         let event = quote(1, "65000.0");
-        assert!(event.validate(3).is_ok());
-        assert!(event.validate(2).is_err());
+        assert!(event.validate(3, Network::Testnet).is_ok());
+        assert!(event.validate(2, Network::Testnet).is_err());
 
         let mainnet = serde_json::json!({
             "type": "quote",
@@ -2180,7 +2407,8 @@ mod tests {
         });
         let mainnet = serde_json::from_value::<StreamEvent>(mainnet)
             .expect("mainnet remains a named network for strict mismatch diagnostics");
-        assert!(mainnet.validate(3).is_err());
+        assert!(mainnet.validate(3, Network::Testnet).is_err());
+        assert!(mainnet.validate(3, Network::Mainnet).is_ok());
     }
 
     #[test]
@@ -2221,7 +2449,7 @@ mod tests {
             "ts_init": 99,
         }))
         .expect("valid strategy state");
-        assert!(event.validate(3).is_ok());
+        assert!(event.validate(3, Network::Testnet).is_ok());
         let mut stream = StreamBuffer::default();
         stream.ingest(event);
         assert!(matches!(
@@ -2312,7 +2540,11 @@ mod tests {
     }
 
     #[test]
-    fn command_envelope_is_typed_versioned_and_testnet_only() {
+    fn command_envelope_is_typed_versioned_and_network_matched() {
+        // Updated-with-citation to OMEGA-DELTA-0295 (2026-08-31): the
+        // inherited `…_and_testnet_only` asserted the testnet-pinned
+        // envelope; the envelope and the command validation now follow the
+        // configured network (testnet unchanged, mismatched refused).
         let request = CommandRequest {
             command_id: "place-1".into(),
             command: NautilusCommand::PlaceOrder {
@@ -2326,7 +2558,8 @@ mod tests {
                 reduce_only: false,
             },
         };
-        request.validate().expect("valid command");
+        request.validate(Network::Testnet).expect("valid command");
+        request.validate(Network::Mainnet).expect("valid command");
         let encoded = serde_json::to_value(CommandEnvelope {
             schema: COMMAND_SCHEMA,
             generation: 3,

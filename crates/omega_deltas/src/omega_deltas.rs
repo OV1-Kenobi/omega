@@ -267,6 +267,7 @@ pub const ENFORCED_DELTAS: &[&str] = &[
 "OMEGA-DELTA-0294",
 "OMEGA-DELTA-0300",
 "OMEGA-DELTA-0301",
+"OMEGA-DELTA-0295",
 ];
 
 /// OMEGA-DELTA-0284. The sidecar identity keygen module — the sidecar's
@@ -31178,9 +31179,19 @@ mod tests {
         }
     }
 
-    /// Omega owns one versioned testnet sidecar lifecycle. Mainnet remains a
-    /// named configuration so mismatches are explicit, but is refused before
-    /// the execution engine or an approval request can start.
+    /// Omega owns one versioned sidecar lifecycle. Mainnet remains a named
+    /// configuration so mismatches are explicit, but the un-gated refusal is
+    /// retained: without the explicit network config the lifecycle is
+    /// testnet-only, and mainnet is refused before the execution engine or an
+    /// approval request can start.
+    ///
+    /// Updated-with-citation to OMEGA-DELTA-0295 (2026-08-31, WP-5): the
+    /// inherited check pinned `if config.network != Network::Testnet` — a
+    /// testnet literal that the mainnet graduation gate supersedes. The pin
+    /// now requires the gate seam (`agent_wallet::mainnet_graduation_gate_open`)
+    /// consulted by the env gate and the supervisor construction gate; the
+    /// exact un-gated bail text is still required below. The 0268 registry row
+    /// is NOT edited.
     #[test]
     fn nautilus_lifecycle_is_app_owned_versioned_and_testnet_only() {
         let lifecycle = without_comments(&read_repository_file(
@@ -31191,7 +31202,9 @@ mod tests {
             "Testnet",
             "Mainnet",
             "mainnet is disabled; only testnet is permitted",
-            "if config.network != Network::Testnet",
+            // OMEGA-DELTA-0295 (updated-with-citation): the gate seam replaces
+            // the former `if config.network != Network::Testnet` literal.
+            "agent_wallet::mainnet_graduation_gate_open()",
             "EVENT_SCHEMA",
             "ensure_healthy(",
             "pub fn stop(",
@@ -31299,14 +31312,22 @@ mod tests {
                 "OMEGA-DELTA-0270: command channel lost `{required}`"
             );
         }
+        // Updated-with-citation to OMEGA-DELTA-0295 (2026-08-31, WP-5): the
+        // inherited pins `network: Network::Testnet` (the command envelope)
+        // and `if config.network != Network::Testnet` (the supervisor gate)
+        // were testnet literals superseded by the graduation gate — the
+        // envelope and the launch arg follow the CONFIGURED network, and the
+        // gate seam is required instead. The exact un-gated bail text is
+        // still required below. The 0270 registry row is NOT edited.
         for required in [
-            "network: Network::Testnet",
-            "if config.network != Network::Testnet",
+            "network: self.config.network",
+            "agent_wallet::mainnet_graduation_gate_open()",
             "Nautilus mainnet is disabled; only testnet is permitted",
         ] {
             assert!(
                 channel.contains(required),
-                "OMEGA-DELTA-0270: command channel lost mainnet refusal `{required}`"
+                "OMEGA-DELTA-0270: command channel lost the graduation-gate \
+                 network binding `{required}`"
             );
         }
 
@@ -31675,7 +31696,16 @@ mod tests {
             "omega-mainnet",
             "extraAgents",
             "validUntil",
-            "Network::Mainnet => bail!",
+            // Updated-with-citation to OMEGA-DELTA-0295 (2026-08-31, WP-5;
+            // design §4.3): the inherited pin `Network::Mainnet => bail!`
+            // required the hard-bail posture that the mainnet graduation gate
+            // replaces. The pin now requires the graduation-gate function and
+            // the gate opt-in env name in the wallet custody module instead.
+            // The custody assertions above (credential keys, agent names,
+            // extraAgents probe, halt types, authority copy, redaction,
+            // zeroize) are unchanged. The 0276 registry row is NOT edited.
+            "fn mainnet_graduation_gate_open",
+            "OMEGA_NAUTILUS_MAINNET_GRADUATION",
             "AgentWalletHaltReason::NetworkMismatch",
             "Omega can trade on this account; Omega cannot withdraw.",
             "[REDACTED]",
@@ -33229,6 +33259,164 @@ mod tests {
         assert!(
             ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0294"),
             "OMEGA-DELTA-0294: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0295. The Nautilus mainnet graduation gate: mainnet is
+    /// reachable only when the process explicitly configures
+    /// `OMEGA_NAUTILUS_NETWORK=mainnet` AND sets the opt-in
+    /// `OMEGA_NAUTILUS_MAINNET_GRADUATION=1`; a mainnet agent-wallet record
+    /// must exist at `omega://nautilus/hyperliquid/mainnet/agent-wallet-v1`
+    /// and decode approved; the Hyperliquid mainnet info endpoint stays
+    /// fail-closed until RV-3 is verified against Hyperliquid's docs (never
+    /// invented); the stream/command wire validation and the command envelope
+    /// must equal the CONFIGURED network (the testnet-only literals are
+    /// superseded, the un-gated bail texts are retained); the
+    /// founder-configured funded-envelope cap plus the zero-exposure gate
+    /// hold at mainnet engine start; the UI renders the gate status with the
+    /// mainnet credential slots still disabled until activation.
+    #[test]
+    fn nautilus_mainnet_graduation_gate_is_env_gated_and_fail_closed() {
+        // The wallet custody module carries the gate seam, the opt-in env
+        // name, the mainnet credential record key, and the RV-3 fail-closed
+        // endpoint (None until verified; the legacy bail text is retained).
+        let wallet_raw =
+            read_repository_file("crates/nautilus_sidecar/src/agent_wallet.rs");
+        let wallet = outside_the_tests(&wallet_raw);
+        for required in [
+            "OMEGA-DELTA-0295",
+            "OMEGA_NAUTILUS_MAINNET_GRADUATION",
+            "fn mainnet_graduation_gate_open",
+            "omega://nautilus/hyperliquid/mainnet/agent-wallet-v1",
+            "const MAINNET_INFO_URL: Option<&str> = None;",
+            "Hyperliquid mainnet connections are disabled until the mainnet \
+             graduation gate passes",
+        ] {
+            assert!(
+                wallet.contains(required),
+                "OMEGA-DELTA-0295: the agent-wallet graduation-gate seam lost \
+                 `{required}`; mainnet is reachable only behind the explicit \
+                 env pair with an approved credential record, and the RV-3 \
+                 endpoint stays fail-closed"
+            );
+        }
+        // Negative branch (RV-3, fail-closed): the Hyperliquid mainnet info
+        // endpoint is never invented. While RV-3 is unverified no mainnet
+        // endpoint literal may exist; when it is verified the value is wired
+        // into MAINNET_INFO_URL and this check is updated-with-citation to
+        // the recorded value.
+        assert!(
+            !wallet.contains("api.hyperliquid.xyz"),
+            "OMEGA-DELTA-0295: a Hyperliquid mainnet endpoint literal is \
+             present while RV-3 is unverified — endpoints are never invented"
+        );
+
+        // The supervisor consults the gate at the env gate and the
+        // construction gate, binds the wire validation and the command
+        // envelope to the configured network, retains the exact un-gated
+        // bail texts, and enforces the funded-envelope + zero-exposure
+        // engine-start conditions on mainnet.
+        let sidecar_raw =
+            read_repository_file("crates/nautilus_sidecar/src/nautilus_sidecar.rs");
+        let sidecar = outside_the_tests(&sidecar_raw);
+        for required in [
+            "OMEGA-DELTA-0295",
+            "OMEGA_NAUTILUS_MAINNET_FUNDED_ENVELOPE_USDC",
+            "agent_wallet::mainnet_graduation_gate_open()",
+            "network: self.config.network",
+            "Nautilus mainnet is disabled until the mainnet graduation gate \
+             passes",
+            "Nautilus mainnet is disabled; only testnet is permitted",
+            "does not match the configured network",
+            "Nautilus mainnet engine start requires zero open orders and zero \
+             positions",
+            "account_value_exceeds_funded_envelope",
+        ] {
+            assert!(
+                sidecar.contains(required),
+                "OMEGA-DELTA-0295: the supervisor graduation gate lost \
+                 `{required}`; mainnet construction and engine start stay \
+                 behind the env pair, the configured-network binding, and the \
+                 founder-configured funded envelope"
+            );
+        }
+        // Negative branch: the superseded testnet-only wire literals must not
+        // return — the validation is "must equal the configured network"
+        // (testnet behavior unchanged, mismatched networks still refused).
+        for superseded in [
+            "Nautilus stream event is not testnet",
+            "Nautilus command event is not testnet",
+        ] {
+            assert!(
+                !sidecar.contains(superseded),
+                "OMEGA-DELTA-0295: the superseded testnet-only wire literal \
+                 `{superseded}` returned"
+            );
+        }
+
+        // The UI renders the gate status (locked until env + credential +
+        // funded envelope all pass) and names the opt-in.
+        let ui = read_repository_file("crates/trading_workspace_ui/src/agent_wallet_ui.rs");
+        for required in [
+            "locked until the graduation gate passes",
+            "OMEGA_NAUTILUS_MAINNET_GRADUATION=1",
+        ] {
+            assert!(
+                ui.contains(required),
+                "OMEGA-DELTA-0295: the UI lost `{required}`; the mainnet lane \
+                 must render the graduation-gate status, not a blanket lock"
+            );
+        }
+
+        // The delta's own behavior test and the inherited refusals (design
+        // §4.3, updated-with-citation — the refusals are retained un-gated,
+        // the gated construction path is added, nothing is deleted).
+        for test_name in [
+            "fn mainnet_constructs_only_when_the_graduation_gate_passes",
+            "fn mainnet_is_hard_refused",
+        ] {
+            assert!(
+                sidecar_raw.contains(test_name),
+                "OMEGA-DELTA-0295: the owning crate lost the named test \
+                 `{test_name}`"
+            );
+        }
+        for test_name in [
+            "fn mainnet_endpoint_resolves_only_when_the_gate_passes",
+            "fn mainnet_funded_envelope_refuses_exceeded_or_missing_account_value",
+        ] {
+            assert!(
+                wallet_raw.contains(test_name),
+                "OMEGA-DELTA-0295: the owning crate lost the named test \
+                 `{test_name}`"
+            );
+        }
+
+        // The registry row (appended at the registry tail; bounded by the
+        // next numeric heading when a later delta lands after it) must record
+        // the gate posture, the recorded env name, and the RV-3 item.
+        let registry = read_repository_file(DELTA_REGISTRY_PATH);
+        let row_after = registry
+            .split("### OMEGA-DELTA-0295")
+            .nth(1)
+            .unwrap_or_else(|| panic!("the OMEGA-DELTA-0295 registry row must exist"));
+        let row = match row_after.split_once("### OMEGA-DELTA-0296") {
+            Some((segment, _)) => segment,
+            None => row_after,
+        };
+        for required in [
+            "graduation gate",
+            "OMEGA_NAUTILUS_MAINNET_GRADUATION",
+            "RV-3",
+        ] {
+            assert!(
+                row.contains(required),
+                "OMEGA-DELTA-0295: the registry row must record `{required}`"
+            );
+        }
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0295"),
+            "OMEGA-DELTA-0295: the delta is no longer listed in ENFORCED_DELTAS"
         );
     }
 }

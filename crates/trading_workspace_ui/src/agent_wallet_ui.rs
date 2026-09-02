@@ -354,8 +354,15 @@ impl NautilusAgentWalletSettingsPage {
     }
 
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // OMEGA-DELTA-0295 — the mainnet lock renders the graduation-gate
+        // status (locked until the env opt-in pair, an approved mainnet
+        // agent wallet, and the zero-exposure funded envelope all pass);
+        // the credential slots stay disabled until activation.
         if self.network == Network::Mainnet {
-            self.local_error = Some("Mainnet connections are locked until graduation.".into());
+            self.local_error = Some(
+                "Mainnet is locked until the graduation gate passes: the OMEGA_NAUTILUS_NETWORK=mainnet and OMEGA_NAUTILUS_MAINNET_GRADUATION=1 opt-ins, an approved mainnet agent wallet, and a zero-exposure funded envelope."
+                    .into(),
+            );
             cx.notify();
             return;
         }
@@ -763,9 +770,14 @@ impl Render for NautilusAgentWalletSettingsPage {
             )
             .when(self.network == Network::Mainnet, |page| {
                 page.child(
-                    Label::new("Mainnet execution and network checks are locked until graduation.")
-                        .size(LabelSize::Small)
-                        .color(Color::Warning),
+                    // OMEGA-DELTA-0295 — the gate status, not a blanket
+                    // graduation note: the mainnet lane stays locked until
+                    // the gate conditions pass and activation follows.
+                    Label::new(
+                        "Mainnet execution and network checks are locked until the graduation gate passes: env opt-ins, an approved mainnet agent wallet, and a zero-exposure funded envelope.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Warning),
                 )
             })
             .child(

@@ -11170,3 +11170,69 @@ Omega now applies the 100-sat default at the operator-created escrow mandate/ses
 Why: founder Decision 5 (2026-08-31) — 100 sats for real-sats testing (WP-2 condition C4; 09-wp7b §10 item 4 founder-confirmation satisfied).
 
 - **Enforced by:** `escrow_fee_default_is_100_sats_and_labels_network_aware` in `omega_deltas`.
+
+### OMEGA-DELTA-0295 - Nautilus mainnet graduation gate: mainnet reachable only when explicitly configured + gate env + approved mainnet agent-wallet credential + bounded envelope; replaces the hard-bail messages (design AND implement behind flags; activation later)
+
+Upstream Zed has no Nautilus sidecar. Omega-before-this ran the Hyperliquid
+lane testnet-only by hard bail: `OMEGA_NAUTILUS_NETWORK=mainnet` bailed at the
+env gate ("Nautilus mainnet is disabled until the mainnet graduation gate
+passes"), non-testnet construction was refused ("Nautilus mainnet is disabled;
+only testnet is permitted" — the OMEGA-DELTA-0276-checked bail posture),
+`info_url(Mainnet)` bailed, the wire validation and the command envelope were
+pinned to `Network::Testnet` literals, and the launch arg was the literal
+`testnet`.
+
+Omega now replaces the bails with the founder-approved graduation gate
+(2026-08-31, Decision 7a — design AND implement behind flags now; any mainnet
+run is ACTIVATION, later and founder-gated per engine). Mainnet is reachable
+only when ALL of the following hold: (1) the env pair — `OMEGA_NAUTILUS_NETWORK=mainnet`
+explicitly (unset still means testnet, no default drift) AND the opt-in
+`OMEGA_NAUTILUS_MAINNET_GRADUATION=1`; without both, the exact legacy bail
+texts remain at the env gate, the supervisor construction gate, and
+`info_url(Mainnet)`. (2) A mainnet agent-wallet record exists at
+`omega://nautilus/hyperliquid/mainnet/agent-wallet-v1` and decodes with
+expected network Mainnet (cross-network decode already refused) with approved
+status (the halt machinery, including NetworkMismatch, is reused unchanged).
+(3) The Hyperliquid mainnet info endpoint is fail-closed (RV-3: it is NOT
+documented in this repo and is never invented — `MAINNET_INFO_URL` stays
+`None` until the verification against Hyperliquid's docs is recorded in the
+WP-5 evidence, so no mainnet probe or connection is possible; the 0295 check
+binds the fail-closed `None` and refuses any invented endpoint literal).
+(4) The bounded quote-strategy envelope validates identically on every
+configured network (same bounds, no widening; the message is network-labeled)
+and the official-venue zero-exposure gate is network-parameterized with
+identical semantics (mainnet requires zero open orders AND zero positions
+before the engine starts). (5) The stream/command wire validation and the
+command envelope must EQUAL the configured network (mismatches still refused;
+the launch arg follows the configured network). (6) A founder-configured
+funded-envelope cap (`OMEGA_NAUTILUS_MAINNET_FUNDED_ENVELOPE_USDC`, six-decimal
+USDC; values founder-set at ACTIVATION — placeholder-only now) is required for
+mainnet construction, and the engine refuses to start when the probed account
+value exceeds it or when the account value is missing/unparseable (fail
+closed). (7) The UI mainnet lock renders the gate status (env + credential +
+envelope) with the mainnet credential slots still disabled until activation,
+and the authority copy is unchanged ("Omega can trade on this account; Omega
+cannot withdraw." applies on mainnet). The un-gated refusals are retained
+everywhere (design §4.3 updated-with-citation: the inherited
+`mainnet_approval_probe_has_no_endpoint` becomes
+`mainnet_endpoint_resolves_only_when_the_gate_passes`; `mainnet_is_hard_refused`
+keeps the un-gated refusal and the gated construction test is added; the
+0276-check bail-literal pin is updated-with-citation to the gate seam; the
+0268/0270-check testnet-literal pins are updated-with-citation to the gate
+seam and the configured-network binding — the 0268/0270/0276 registry rows are
+NOT edited). The engine (Python) boundary stays testnet-only in this WP
+(`engine.py` refuses non-testnet `--network` before its network-checked
+bootstrap; the mainnet engine path — a separate credential slot in the same
+bootstrap — is wired at activation, founder-gated; the credential env name is
+testnet-literal `HYPERLIQUID_TESTNET_PK` and the key material arrives only via
+the stdin bootstrap, never a provisioned credential). No mainnet credentials
+exist anywhere (SEC-2026-101: the gate checks presence/validity/approval of a
+founder-provisioned record; nothing is provisioned).
+
+Why: the founder-approved mainnet transition (Decision 7a — implement behind
+flags now, activation later founder-gated) with the gate fail-closed on every
+missing condition, so "mainnet unreachable unless the gate passes" is
+literally enforced and the delta suite pins the env names, the configured-
+network wire binding, and the RV-3 fail-closed endpoint.
+
+- **Enforced by:** `nautilus_mainnet_graduation_gate_is_env_gated_and_fail_closed` in `omega_deltas`.

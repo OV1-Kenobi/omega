@@ -21,12 +21,56 @@ const TESTNET_CREDENTIAL_KEY: &str = "omega://nautilus/hyperliquid/testnet/agent
 const MAINNET_CREDENTIAL_KEY: &str = "omega://nautilus/hyperliquid/mainnet/agent-wallet-v1";
 const TESTNET_INFO_URL: &str = "https://api.hyperliquid-testnet.xyz/info";
 
+/// OMEGA-DELTA-0295 — the graduation-gate opt-in (design §6.3 item 1; the
+/// exact name is recorded in the WP-5 evidence per RV-6). Mainnet is
+/// reachable only when the process explicitly configures
+/// `OMEGA_NAUTILUS_NETWORK=mainnet` AND sets this opt-in to `1`; unset
+/// still means testnet (no default drift), and without both the exact
+/// legacy bail texts remain everywhere.
+pub const MAINNET_GRADUATION_ENVIRONMENT_VARIABLE: &str =
+    "OMEGA_NAUTILUS_MAINNET_GRADUATION";
+
+/// OMEGA-DELTA-0295 — the Hyperliquid mainnet info endpoint is
+/// [REQUIRES VERIFICATION] RV-3: it is NOT documented in this repo and is
+/// never invented. It stays `None` (fail-closed) until the verification
+/// against Hyperliquid's docs is recorded in the WP-5 evidence, at which
+/// point this constant is wired and the 0295 delta check is updated with
+/// the recorded value. RV-3 gates mainnet construction and every mainnet
+/// probe — no mainnet connection is possible while it is `None`.
+const MAINNET_INFO_URL: Option<&str> = None;
+const MAINNET_INFO_ENDPOINT_UNVERIFIED: &str = "Hyperliquid mainnet info endpoint is not wired: RV-3 requires the mainnet info API base URL to be verified against Hyperliquid's docs before any mainnet probe";
+
+/// OMEGA-DELTA-0295 — the graduation gate, read from the process
+/// environment. The pure two-argument form is unit-testable without env
+/// mutation; the zero-argument form is the wired seam every mainnet path
+/// consults (`info_url`, the supervisor construction gate, and the
+/// config env gate all fail closed through it).
+pub fn mainnet_graduation_gate_open() -> bool {
+    mainnet_graduation_gate(
+        std::env::var(crate::NETWORK_ENVIRONMENT_VARIABLE)
+            .ok()
+            .as_deref(),
+        std::env::var(MAINNET_GRADUATION_ENVIRONMENT_VARIABLE)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn mainnet_graduation_gate(network: Option<&str>, graduation: Option<&str>) -> bool {
+    network == Some("mainnet") && graduation == Some("1")
+}
+
 fn info_url(network: Network) -> Result<&'static str> {
     match network {
         Network::Testnet => Ok(TESTNET_INFO_URL),
-        Network::Mainnet => bail!(
-            "Hyperliquid mainnet connections are disabled until the mainnet graduation gate passes"
-        ),
+        Network::Mainnet => {
+            if !mainnet_graduation_gate_open() {
+                bail!(
+                    "Hyperliquid mainnet connections are disabled until the mainnet graduation gate passes"
+                );
+            }
+            MAINNET_INFO_URL.ok_or_else(|| anyhow!(MAINNET_INFO_ENDPOINT_UNVERIFIED))
+        }
     }
 }
 
@@ -326,11 +370,23 @@ pub struct OfficialVenueState {
     pub network: Network,
     pub open_orders: Vec<OfficialOpenOrder>,
     pub positions: Vec<OfficialPosition>,
+    /// OMEGA-DELTA-0295 — the probed clearinghouse account value (USDC)
+    /// when the venue response carries it; the mainnet funded-envelope
+    /// gate (design §6.3 item 6) compares it against the founder-set cap.
+    pub account_value_usdc: Option<String>,
 }
 
 impl OfficialVenueState {
+    /// OMEGA-DELTA-0295 — network-parameterized zero-exposure gate. The
+    /// state is tagged with the network the probes were actually sent to
+    /// (`evaluate_official_venue_state` takes that network), so the same
+    /// zero-exposure semantics — zero open orders AND zero positions —
+    /// apply on every configured network; mainnet requires zero exposure
+    /// before the engine starts. The former hard-coded
+    /// `self.network == Network::Testnet` conjunct is superseded by the
+    /// honest per-probe network tag.
     pub fn is_zero_exposure(&self) -> bool {
-        self.network == Network::Testnet && self.open_orders.is_empty() && self.positions.is_empty()
+        self.open_orders.is_empty() && self.positions.is_empty()
     }
 }
 
@@ -338,6 +394,14 @@ impl OfficialVenueState {
 #[serde(rename_all = "camelCase")]
 struct ClearinghouseState {
     asset_positions: Vec<AssetPosition>,
+    #[serde(default)]
+    margin_summary: Option<MarginSummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarginSummary {
+    account_value: String,
 }
 
 #[derive(Deserialize)]
@@ -367,7 +431,13 @@ fn decimal_is_zero(value: &str) -> Result<bool> {
     Ok(unsigned.bytes().all(|byte| byte == b'0' || byte == b'.'))
 }
 
+/// OMEGA-DELTA-0295 — network-parameterized official venue state: the
+/// state is tagged with the network the probes were sent to (the mainnet
+/// URL resolves only when the graduation gate passes, so a Mainnet tag
+/// can only arise from a gated mainnet probe), and the clearinghouse
+/// account value is carried for the mainnet funded-envelope gate.
 pub fn evaluate_official_venue_state(
+    network: Network,
     open_orders_response: &[u8],
     clearinghouse_response: &[u8],
 ) -> Result<OfficialVenueState> {
@@ -385,10 +455,63 @@ pub fn evaluate_official_venue_state(
         }
     }
     Ok(OfficialVenueState {
-        network: Network::Testnet,
+        network,
         open_orders,
         positions,
+        account_value_usdc: clearinghouse.margin_summary.map(|summary| summary.account_value),
     })
+}
+
+/// OMEGA-DELTA-0295 — the mainnet funded-envelope comparison (design
+/// §6.3 item 6): the engine refuses to start when the probed Hyperliquid
+/// account value exceeds the founder-configured cap. A missing or
+/// unparseable account value fails closed (refused), never assumed to be
+/// within the envelope. Both values are six-decimal USDC amounts.
+pub fn account_value_exceeds_funded_envelope(
+    funded_envelope_usdc: &str,
+    account_value_usdc: Option<&str>,
+) -> Result<bool> {
+    let cap = six_decimal_usdc_micros(funded_envelope_usdc).context(
+        "the mainnet funded envelope cap is not a six-decimal USDC value",
+    )?;
+    let Some(account_value) = account_value_usdc else {
+        bail!("the mainnet funded envelope check requires a probed account value");
+    };
+    let value = six_decimal_usdc_micros(account_value).context(
+        "the probed Hyperliquid account value is not a six-decimal USDC value",
+    )?;
+    Ok(value > cap)
+}
+
+/// OMEGA-DELTA-0295 — validate a six-decimal USDC amount and return it as
+/// integer micro-USDC. Non-negative, at most six fractional digits, no
+/// sign, no exponent.
+pub(crate) fn six_decimal_usdc_micros(value: &str) -> Result<u128> {
+    let (whole, fractional) = match value.split_once('.') {
+        Some((whole, fractional)) => (whole, fractional),
+        None => (value, ""),
+    };
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fractional.len() > 6
+        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!("not a six-decimal USDC value");
+    }
+    let mut micros = whole
+        .parse::<u128>()
+        .context("USDC whole amount exceeds the supported range")?;
+    micros = micros
+        .checked_mul(1_000_000)
+        .context("USDC amount exceeds the supported range")?;
+    let mut padded = fractional.to_owned();
+    padded.extend(std::iter::repeat_n('0', 6 - padded.len()));
+    let fraction = padded
+        .parse::<u128>()
+        .context("USDC fractional amount exceeds the supported range")?;
+    micros
+        .checked_add(fraction)
+        .context("USDC amount exceeds the supported range")
 }
 
 async fn info_response(
@@ -435,7 +558,7 @@ pub async fn probe_official_venue_state(
         }))?,
     )
     .await?;
-    evaluate_official_venue_state(&open_orders, &clearinghouse)
+    evaluate_official_venue_state(network, &open_orders, &clearinghouse)
 }
 
 pub fn evaluate_extra_agents(
@@ -477,7 +600,12 @@ pub async fn refresh_agent_wallet_approval(
     let info_url = info_url(network)?;
     let mut wallet = load_agent_wallet(provider, network, cx)
         .await?
-        .ok_or_else(|| anyhow!("Hyperliquid testnet agent wallet is not configured"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "Hyperliquid {} agent wallet is not configured",
+                network.label().to_ascii_lowercase()
+            )
+        })?;
     let body = serde_json::to_vec(&serde_json::json!({
         "type": "extraAgents",
         "user": wallet.owner_address,
@@ -533,24 +661,59 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_approval_probe_has_no_endpoint() {
+    fn mainnet_endpoint_resolves_only_when_the_gate_passes() {
+        // Updated-with-citation to OMEGA-DELTA-0295 (2026-08-31): the
+        // inherited `mainnet_approval_probe_has_no_endpoint` asserted the
+        // hard-bail posture; the graduation gate now resolves the mainnet
+        // endpoint ONLY when the gate passes — and RV-3 keeps the endpoint
+        // itself fail-closed (never invented) until it is verified against
+        // Hyperliquid's docs and wired into MAINNET_INFO_URL.
         assert_eq!(
             info_url(Network::Testnet).expect("testnet URL"),
             TESTNET_INFO_URL
         );
-        assert!(info_url(Network::Mainnet).is_err());
+
+        // Un-gated: the exact legacy bail text remains.
+        crate::test_support::assert_graduation_gate_closed(|| {
+            let error =
+                info_url(Network::Mainnet).expect_err("the un-gated mainnet probe is refused");
+            assert_eq!(
+                error.to_string(),
+                "Hyperliquid mainnet connections are disabled until the mainnet graduation gate passes"
+            );
+        });
+
+        // Gate open: the endpoint STILL refuses while RV-3 is unverified —
+        // fail-closed, never invented.
+        assert!(MAINNET_INFO_URL.is_none());
+        crate::test_support::with_graduation_gate_open(|| {
+            let error = info_url(Network::Mainnet).expect_err(
+                "the mainnet probe is refused while RV-3 is unverified",
+            );
+            assert_eq!(error.to_string(), MAINNET_INFO_ENDPOINT_UNVERIFIED);
+        });
+
+        // The gate is the explicit env pair — no default drift.
+        assert!(!mainnet_graduation_gate(Some("mainnet"), None));
+        assert!(!mainnet_graduation_gate(Some("mainnet"), Some("0")));
+        assert!(!mainnet_graduation_gate(None, Some("1")));
+        assert!(!mainnet_graduation_gate(Some("testnet"), Some("1")));
+        assert!(mainnet_graduation_gate(Some("mainnet"), Some("1")));
     }
 
     #[test]
     fn official_venue_state_requires_zero_orders_and_positions() {
         let zero = evaluate_official_venue_state(
+            Network::Testnet,
             br#"[]"#,
             br#"{"assetPositions":[{"position":{"coin":"BTC","szi":"0.000"}}]}"#,
         )
         .expect("zero venue state");
+        assert_eq!(zero.network, Network::Testnet);
         assert!(zero.is_zero_exposure());
 
         let exposed = evaluate_official_venue_state(
+            Network::Testnet,
             br#"[{"coin":"BTC","oid":7,"cloid":"0x01","side":"B","sz":"0.001","limitPx":"60000"}]"#,
             br#"{"assetPositions":[{"position":{"coin":"BTC","szi":"-0.001"}}]}"#,
         )
@@ -558,6 +721,47 @@ mod tests {
         assert!(!exposed.is_zero_exposure());
         assert_eq!(exposed.open_orders[0].oid, 7);
         assert_eq!(exposed.positions[0].size, "-0.001");
+
+        // OMEGA-DELTA-0295 — the same zero-exposure semantics apply to a
+        // mainnet probe (the tag follows the network the probes were sent
+        // to), and the probed account value is carried for the
+        // funded-envelope gate.
+        let mainnet_zero = evaluate_official_venue_state(
+            Network::Mainnet,
+            br#"[]"#,
+            br#"{"assetPositions":[],"marginSummary":{"accountValue":"1000.500000"}}"#,
+        )
+        .expect("mainnet zero venue state");
+        assert_eq!(mainnet_zero.network, Network::Mainnet);
+        assert!(mainnet_zero.is_zero_exposure());
+        assert_eq!(
+            mainnet_zero.account_value_usdc.as_deref(),
+            Some("1000.500000")
+        );
+    }
+
+    #[test]
+    fn mainnet_funded_envelope_refuses_exceeded_or_missing_account_value() {
+        // OMEGA-DELTA-0295 — the funded-envelope comparison (design §6.3
+        // item 6): under the cap is allowed; exceeding it refuses the
+        // start; a missing or unparseable account value fails closed.
+        assert!(!account_value_exceeds_funded_envelope(
+            "1000.000000",
+            Some("999.999999")
+        )
+        .expect("under the cap"));
+        assert!(!account_value_exceeds_funded_envelope("1000.0", Some("1000.0")).expect("at the cap"));
+        assert!(account_value_exceeds_funded_envelope("1000.000001", Some("1000.000002")).expect(
+            "exceeds the cap"
+        ));
+        assert!(account_value_exceeds_funded_envelope("5.0", Some("65.000001")).expect(
+            "well above the cap"
+        ));
+        assert!(account_value_exceeds_funded_envelope("1000.0", None).is_err());
+        assert!(account_value_exceeds_funded_envelope("-1.0", Some("0.0")).is_err());
+        assert!(account_value_exceeds_funded_envelope("1.0000001", Some("0.0")).is_err());
+        assert!(account_value_exceeds_funded_envelope("1.0", Some("abc")).is_err());
+        assert!(account_value_exceeds_funded_envelope("1.0", Some("0x10")).is_err());
     }
 
     #[test]
