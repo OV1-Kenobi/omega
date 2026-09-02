@@ -16,6 +16,12 @@
 mod client;
 mod l402;
 mod mandate;
+/// OMEGA-DELTA-0302: the NIP-AC authority projection (WP-11 design note
+/// §2-§5, §6, §7, §10-§13) — flag-gated OFF, read-only over the stores,
+/// emitting only after the local decision, and kind-limited to
+/// 39242/39243/39244/1985. Public so the wired lanes (l402 here, market_ui
+/// escrow) can reach the emission seam.
+pub mod nipac;
 mod protocol;
 mod spend_policy;
 mod supervisor;
@@ -187,6 +193,7 @@ pub fn supervisor_available(cx: &App) -> bool {
 pub(crate) mod test_support {
     pub(crate) static MAINNET_OPT_IN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     pub(crate) static SPEND_KILL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static NIPAC_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Run `run` with the allow-mainnet opt-in env set (serialized), then
     /// remove it. The unsafe env mutation matches the crate's existing test
@@ -232,6 +239,47 @@ pub(crate) mod test_support {
         let result = run();
         unsafe {
             std::env::remove_var(crate::SPEND_KILL_ENVIRONMENT_VARIABLE);
+        }
+        result
+    }
+
+    /// OMEGA-DELTA-0302: run `run` with the NIP-AC projection env state
+    /// exactly as requested (serialized on one lock — the flag and the relay
+    /// URL are process-global and a concurrently-running test constructing a
+    /// projection would race). `flag` = `Some(value)` sets
+    /// `OMEGA_NIPAC_PROJECTION` to that exact value (the tests exercise "1"
+    /// and "0"); `None` guarantees it ABSENT. `relay` does the same for
+    /// `OMEGA_NIPAC_RELAY_URL` (only ever None in this crate's tests — the
+    /// URL value itself is founder-held at activation and never committed).
+    /// Both envs are removed before returning.
+    pub(crate) fn with_nipac_projection_env<T>(
+        flag: Option<&str>,
+        relay: Option<&str>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = NIPAC_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match flag {
+            Some(value) => unsafe {
+                std::env::set_var(crate::nipac::NIPAC_PROJECTION_ENVIRONMENT_VARIABLE, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::nipac::NIPAC_PROJECTION_ENVIRONMENT_VARIABLE);
+            },
+        }
+        match relay {
+            Some(value) => unsafe {
+                std::env::set_var(crate::nipac::NIPAC_RELAY_URL_ENVIRONMENT_VARIABLE, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::nipac::NIPAC_RELAY_URL_ENVIRONMENT_VARIABLE);
+            },
+        }
+        let result = run();
+        unsafe {
+            std::env::remove_var(crate::nipac::NIPAC_PROJECTION_ENVIRONMENT_VARIABLE);
+            std::env::remove_var(crate::nipac::NIPAC_RELAY_URL_ENVIRONMENT_VARIABLE);
         }
         result
     }

@@ -49,7 +49,7 @@ use trading_ledger::{
 };
 use trading_mandate::{
     AssetId, MandateDecision, MandateStore, TradingInstruction, TradingNetwork,
-    MKT_SWP_ESCROW_VENUE,
+    MKT_SWP_ESCROW_VENUE, SOVEREIGN_WALLET_VENUE,
 };
 
 /// Escrow session persistence schema (digest-only fields).
@@ -965,14 +965,17 @@ pub async fn pay_arbitration_fee_and_request_arbitration(
     // OMEGA-DELTA-0286: the mandate instruction carries the SESSION's
     // network, so a mainnet escrow fee is gated by a
     // (sovereign-wallet, mainnet, principal) mandate; signet behavior is
-    // unchanged.
-    match sovereign_wallet::authorize_sovereign_spend(
+    // unchanged. OMEGA-DELTA-0302: the decision is kept for the projection's
+    // after-decision constructor — a Refused decision can never produce a
+    // spend-authorization emission.
+    let decision = sovereign_wallet::authorize_sovereign_spend(
         mandates,
         fee_sats,
         session.network,
         Some(escalator_pubkey),
         now_ms,
-    )? {
+    )?;
+    match decision {
         MandateDecision::Authorized { .. } => {}
         MandateDecision::Refused { reason, .. } => {
             bail!("arbitration fee payment refused by the wallet mandate: {reason:?}")
@@ -986,11 +989,34 @@ pub async fn pay_arbitration_fee_and_request_arbitration(
         .pay_invoice(&invoice.invoice, idempotency_key)
         .await
         .map_err(|error| anyhow::anyhow!("arbitration fee payment failed: {error}"))?;
+    // OMEGA-DELTA-0302: the settled-amount source is the sidecar's reported
+    // actual outflow (`PayResult::actual_amount_sat`; unparseable/absent
+    // fails the receipt emission honestly — the quoted fee is never
+    // substituted) and the invoice's payment hash is the purpose digest.
+    // Both are read BEFORE the preimage moves out of `paid`.
+    let actual_settled_sats = paid.actual_amount_sat.parse::<u64>().ok();
+    let payment_hash = paid.payment_hash.clone();
     let proof = paid
         .preimage
         .filter(|preimage| !preimage.is_empty())
         .context("arbitration fee payment returned no preimage proof")?;
     let digest = record_fee_payment(ledger, session, escalator_pubkey, &proof, now_ms)?;
+    // OMEGA-DELTA-0302: the projection emits AFTER the local decision (the
+    // wallet-mandate gate above) AND the settled fee (the balanced `Fee`
+    // entry just appended). Every outcome is logged, never propagated — the
+    // escrow flow is unaffected in every case.
+    sovereign_wallet::nipac::emit_settled_spend_pair(
+        mandates,
+        SOVEREIGN_WALLET_VENUE,
+        session.network,
+        Some(escalator_pubkey),
+        &decision,
+        fee_sats,
+        payment_hash.as_deref(),
+        sovereign_wallet::nipac::LANE_ESCROW_ARBITRATION_FEE,
+        actual_settled_sats,
+        &digest,
+    );
     session.request_arbitration(ledger, escalator_pubkey, digest, now_ms)
 }
 

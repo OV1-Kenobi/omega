@@ -265,8 +265,9 @@ pub const ENFORCED_DELTAS: &[&str] = &[
 "OMEGA-DELTA-0292",
 "OMEGA-DELTA-0293",
 "OMEGA-DELTA-0294",
-"OMEGA-DELTA-0300",
-"OMEGA-DELTA-0301",
+    "OMEGA-DELTA-0300",
+    "OMEGA-DELTA-0301",
+    "OMEGA-DELTA-0302",
 ];
 
 /// OMEGA-DELTA-0284. The sidecar identity keygen module — the sidecar's
@@ -3807,6 +3808,9 @@ pub const SOVEREIGN_MANDATE_PATH: &str = "crates/sovereign_wallet/src/mandate.rs
 /// OMEGA-DELTA-0300. The spend-policy module (kill + budgets + loss-rule
 /// auto-kill + persistence).
 pub const SOVEREIGN_SPEND_POLICY_PATH: &str = "crates/sovereign_wallet/src/spend_policy.rs";
+/// OMEGA-DELTA-0302. The NIP-AC authority projection module (flag-gated OFF,
+/// read-only over the stores, kind-limited; the wired settled-spend seam).
+pub const NIPAC_PROJECTION_PATH: &str = "crates/sovereign_wallet/src/nipac.rs";
 /// OMEGA-DELTA-0287. The Rust L-402 client (configured-network mandate).
 pub const SOVEREIGN_L402_CLIENT_PATH: &str = "crates/sovereign_wallet/src/l402.rs";
 /// OMEGA-DELTA-0286. The sidecar network-guard tests (invoice/network
@@ -33229,6 +33233,146 @@ mod tests {
         assert!(
             ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0294"),
             "OMEGA-DELTA-0294: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0302. The NIP-AC authority projection exists, is
+    /// flag-gated OFF, and never gates: the projection module constructs,
+    /// signs, and emits satnam-v0.2 NIP-AC events (39242 envelope, 39243
+    /// spend authorization, 39244 settlement receipt, 1985 revocation label)
+    /// ONLY at moments where the local authority layer has already decided;
+    /// it is read-only over MandateStore/LedgerStore; the kind policy
+    /// (founder decision 2A) admits ONLY the four NIP-AC kinds — the MKT-SWP
+    /// 39610/39603 escrow family stays reserved.
+    ///
+    /// The FOUR-PART check of the design note §10, at real repository state
+    /// (never comment-only):
+    /// (a) emission-after-decision — the two settled-payment lanes carry the
+    ///     wired `emit_settled_spend_pair` call AFTER the gate + payment
+    ///     (the wiring sits after the preimage/Fee-entry points in the
+    ///     shipped halves of l402.rs and escrow.rs), and the module carries
+    ///     the after-decision constructors that refuse a Refused decision
+    ///     and refuse a settlement without a real settled amount + digest
+    ///     proof;
+    /// (b) flag default OFF — the module carries the exact env names, the
+    ///     exact enabled value "1", and the inert Disabled path;
+    /// (c) no store mutation — the shipped module borrows `&MandateStore`
+    ///     and contains no widening door, revocation, or restriction call;
+    /// (d) the kind policy — the module pins the four kinds and the named
+    ///     negative test refuses 39603/39610 through the projection.
+    #[test]
+    fn nipac_authority_projection_is_flag_gated_read_only_and_kind_limited() {
+        // 1. The module: flag plan, after-decision constructors, read-only
+        //    shape, kind policy, and the delta citation.
+        let nipac_raw = read_repository_file(NIPAC_PROJECTION_PATH);
+        let nipac = outside_the_tests(&nipac_raw);
+        for required in [
+            "OMEGA_NIPAC_PROJECTION",
+            "OMEGA_NIPAC_RELAY_URL",
+            "OMEGA-DELTA-0302",
+            "spend_authorization_after_decision",
+            "settlement_after_settled_pay",
+            "enforce_kind_policy",
+            "KIND_ENVELOPE",
+            "KIND_SPEND_AUTHORIZATION",
+            "KIND_SETTLEMENT_RECEIPT",
+            "KIND_REVOCATION",
+            "emit_settled_spend_pair",
+            "&MandateStore",
+        ] {
+            assert!(
+                nipac.contains(required),
+                "OMEGA-DELTA-0302: the projection module lost `{required}`; the \
+                 flag plan, the after-decision constructors, the read-only \
+                 store shape, and the kind policy must stay present"
+            );
+        }
+        // (a) negative branches: a Refused decision and an invented
+        //     settlement are refused BY CONSTRUCTION in the shipped module.
+        for required in [
+            "the local authority refused this spend",
+            "projection may exist for it (emission-after-decision)",
+            "the settled amount was not reported",
+            "the completion proof must be a 64-char lowercase hex digest",
+        ] {
+            assert!(
+                nipac.contains(required),
+                "OMEGA-DELTA-0302: the after-decision refusal lost `{required}`; \
+                 a Refused decision, a missing settled amount, and a non-digest \
+                 completion proof must each fail the emission honestly"
+            );
+        }
+        // (b) the flag default: only the exact value "1" enables; anything
+        //     else (including unset) is the inert Disabled path.
+        assert!(
+            nipac.contains("NIPAC_ENABLED_VALUE: &str = \"1\""),
+            "OMEGA-DELTA-0302: the exact enabled value must stay \"1\" (default OFF)"
+        );
+        assert!(
+            nipac.contains("NipacEmissionOutcome::Disabled"),
+            "OMEGA-DELTA-0302: the inert Disabled outcome must stay present"
+        );
+        // (c) read-only structure: the shipped module never widens, revokes,
+        //     or restricts a mandate through the store.
+        for forbidden in [".apply_ui_approved(", ".revoke(", "save_restriction("] {
+            assert!(
+                !nipac.contains(forbidden),
+                "OMEGA-DELTA-0302: the shipped projection module must never \
+                 mutate the authority store (found `{forbidden}`)"
+            );
+        }
+        // (d) the kind policy's named tests stay in the owning crate.
+        for test_name in [
+            "fn nipac_projection_four_part_check",
+            "fn kind_policy_refuses_39603_and_39610_emission_through_the_projection",
+            "fn emitted_fields_carry_sats_matching_the_local_entries",
+        ] {
+            assert!(
+                nipac_raw.contains(test_name),
+                "OMEGA-DELTA-0302: the owning crate lost the named test \
+                 `{test_name}`"
+            );
+        }
+
+        // 2. The wired emission sites sit in the SHIPPED halves of both
+        //    settled-payment lanes, each carrying the delta citation.
+        let l402_raw = read_repository_file(SOVEREIGN_L402_CLIENT_PATH);
+        let l402 = outside_the_tests(&l402_raw);
+        for required in ["OMEGA-DELTA-0302", "emit_settled_spend_pair"] {
+            assert!(
+                l402.contains(required),
+                "OMEGA-DELTA-0302: the L-402 redemption lane lost `{required}`; \
+                 the after-decision emission wiring must stay present"
+            );
+        }
+        let escrow_raw = read_repository_file(MARKET_UI_ESCROW_PATH);
+        let escrow = outside_the_tests(&escrow_raw);
+        for required in ["OMEGA-DELTA-0302", "emit_settled_spend_pair"] {
+            assert!(
+                escrow.contains(required),
+                "OMEGA-DELTA-0302: the escrow fee-settlement lane lost \
+                 `{required}`; the after-decision emission wiring must stay \
+                 present"
+            );
+        }
+        // The projection reaches the lanes through the registered module.
+        let lib_rs = read_repository_file("crates/sovereign_wallet/src/lib.rs");
+        assert!(
+            lib_rs.contains("pub mod nipac;"),
+            "OMEGA-DELTA-0302: the projection module must stay registered in \
+             the sovereign wallet crate"
+        );
+
+        // 3. The registration is three-place: the registry row carries the
+        //    §6 mapping note, and ENFORCED_DELTAS lists the delta.
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0302").contains("mapping note"),
+            "OMEGA-DELTA-0302: the registry row must carry the WP-11 §6 \
+             bidirectional escrow-receipt mapping note"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0302"),
+            "OMEGA-DELTA-0302: the delta is no longer listed in ENFORCED_DELTAS"
         );
     }
 }

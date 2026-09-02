@@ -31,7 +31,7 @@ use http_client::{AsyncBody, HttpClient, Request, Response};
 use crate::client::SovereignWalletError;
 use crate::mandate::{authorize_sovereign_spend, sovereign_wallet_network};
 use crate::supervisor::SovereignWalletSupervisor;
-use trading_mandate::{MandateDecision, MandateRefusal, MandateStore};
+use trading_mandate::{MandateDecision, MandateRefusal, MandateStore, SOVEREIGN_WALLET_VENUE};
 
 /// The L-402 proof: the opaque credential plus the payment preimage. Sent as
 /// `X-OpenAgents-L402: <macaroon>:<preimage>` (the audit's preferred v0).
@@ -85,16 +85,46 @@ pub async fn pay_l402_challenge(
     now_ms: i64,
 ) -> Result<L402Proof, L402PayError> {
     let network = sovereign_wallet_network(supervisor.network());
-    match authorize_sovereign_spend(mandate_store, challenge.amount_sats, network, principal, now_ms)? {
+    // OMEGA-DELTA-0302: the decision is kept for the projection's
+    // after-decision constructor — a Refused decision can never produce a
+    // spend-authorization emission (the gate is the ONLY authority; the
+    // projection never gates).
+    let decision =
+        authorize_sovereign_spend(mandate_store, challenge.amount_sats, network, principal, now_ms)?;
+    match decision {
         MandateDecision::Authorized { .. } => {}
         MandateDecision::Refused { reason, .. } => {
             return Err(L402PayError::MandateRefused(reason));
         }
     }
     let paid = supervisor.pay_invoice(&challenge.invoice, idempotency_key).await?;
+    // OMEGA-DELTA-0302: the settled-amount source is the sidecar's reported
+    // actual outflow (`PayResult::actual_amount_sat`); unparseable/absent
+    // fails the receipt emission honestly later — the quoted amount is never
+    // substituted. Read BEFORE the preimage moves out of `paid`.
+    let actual_settled_sats = paid.actual_amount_sat.parse::<u64>().ok();
     let preimage = paid.preimage.ok_or_else(|| {
         anyhow!("the sidecar returned no preimage for the L-402 invoice (payment did not settle)")
     })?;
+    // OMEGA-DELTA-0302: the projection emits AFTER the local decision
+    // (Authorized above) AND the settled payment (the preimage proof
+    // returned). Every outcome is logged, never propagated — the L-402
+    // result is unaffected in every case. Purpose lane: the L-402
+    // redemption; completion proof: the invoice's payment hash
+    // (sha256(preimage) per the gateway's redemption verification — the
+    // preimage itself never travels in the projection).
+    crate::nipac::emit_settled_spend_pair(
+        mandate_store,
+        SOVEREIGN_WALLET_VENUE,
+        network,
+        principal,
+        &decision,
+        challenge.amount_sats,
+        Some(&challenge.payment_hash),
+        crate::nipac::LANE_L402_REDEMPTION,
+        actual_settled_sats,
+        &challenge.payment_hash,
+    );
     Ok(L402Proof {
         macaroon: challenge.macaroon.clone(),
         preimage,
