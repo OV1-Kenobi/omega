@@ -1886,4 +1886,393 @@ mod tests {
         other_principal.principal_pubkey = Some(governor_pubkey());
         assert_ne!(scope_constraints_hash(&other_principal), first);
     }
+
+    // -------------------------------------------------------------------
+    // WP-13 round-trip fixtures (OA-MAINNET-WP13-2026-09-02; design note
+    // §12 item c). The ONLY validator below is TEST-SIDE: it encodes
+    // satnam-v0.2's src/lib/nip-ac/types.ts schema expectations
+    // (CreditEnvelopeContent :98-110 + CreditEnvelopeTags :112-119;
+    // SpendAuthorizationContent :129-137 + SpendAuthorizationTags
+    // :139-143). Omega has NO production inbound NIP-AC validator —
+    // inbound events are display-only by the binding §13.2 boundary, and
+    // these fixtures do not add one. The reverse direction therefore
+    // validates the hand-built satnam-shaped fixtures against the SAME
+    // test-side schema rules the Omega-emitted events must pass, and runs
+    // the fixture kinds through the projection's one production-side gate
+    // (`enforce_kind_policy`) — with the explicit recorded statement of
+    // what Omega cannot yet validate (see the third fixture's comments).
+    // -------------------------------------------------------------------
+
+    /// First value of a named tag in a `["name", "value", ...]` row list.
+    fn fixture_first_tag<'a>(tags: &'a [Vec<String>], name: &str) -> Option<&'a str> {
+        tags.iter()
+            .find(|tag| tag.first().map(String::as_str) == Some(name))
+            .and_then(|tag| tag.get(1).map(String::as_str))
+    }
+
+    /// Test-side satnam-schema validator for kind 39242 (types.ts
+    /// CreditEnvelopeContent + CreditEnvelopeTags). Returns every
+    /// violation so a failure names the exact schema expectation.
+    fn validate_satnam_credit_envelope_39242(
+        content: &serde_json::Value,
+        tags: &[Vec<String>],
+    ) -> Result<(), Vec<String>> {
+        let mut violations = Vec::new();
+        let field = |violations: &mut Vec<String>, ok: bool, what: &str| {
+            if !ok {
+                violations.push(what.to_owned());
+            }
+        };
+        // Required content fields (types.ts :98-110; allowed_mints optional).
+        field(
+            &mut violations,
+            content["offer_id"].as_str().is_some_and(|v| !v.is_empty()),
+            "offer_id must be a non-empty string",
+        );
+        let agent = content["agent_pubkey"].as_str();
+        field(
+            &mut violations,
+            agent.is_some_and(is_64_lower_hex),
+            "agent_pubkey must be 64-char lowercase hex",
+        );
+        let governor = content["governor_pubkey"].as_str();
+        field(
+            &mut violations,
+            governor.is_some_and(is_64_lower_hex),
+            "governor_pubkey must be 64-char lowercase hex",
+        );
+        field(
+            &mut violations,
+            content["max_sats"]
+                .as_u64()
+                .is_some_and(|v| v > 0),
+            "max_sats must be a positive integer (sats, not a string)",
+        );
+        field(
+            &mut violations,
+            content["scope_constraints_hash"]
+                .as_str()
+                .is_some_and(is_64_lower_hex),
+            "scope_constraints_hash must be a 64-char lowercase hex digest",
+        );
+        field(
+            &mut violations,
+            content["expires_at"]
+                .as_u64()
+                .is_some_and(|v| v > 0),
+            "expires_at must be a positive integer (Unix SECONDS)",
+        );
+        if let Some(mints) = content.get("allowed_mints") {
+            field(
+                &mut violations,
+                mints.is_array()
+                    && mints
+                        .as_array()
+                        .expect("array")
+                        .iter()
+                        .all(|mint| mint.is_string()),
+                "allowed_mints, when present, must be an array of strings",
+            );
+        }
+        // Required tags (types.ts :112-119), single-valued; content/tag
+        // duality: the tag mirrors the content value as a STRING. `d` is
+        // the envelope identifier — its exact derivation is
+        // implementation-specific (Omega: omega-mandate-<digest>;
+        // satnam: generateDTag), so only presence/non-emptiness is
+        // schema-level.
+        let max_sats = content["max_sats"].as_u64();
+        let expires_at = content["expires_at"].as_u64();
+        match fixture_first_tag(tags, "d") {
+            Some(value) if value.is_empty() => {
+                violations.push("tag d must be non-empty".to_owned());
+            }
+            Some(_) => {}
+            None => violations.push("required tag d is missing".to_owned()),
+        }
+        let expect_tag = |violations: &mut Vec<String>, name: &str, expected: Option<String>| {
+            match fixture_first_tag(tags, name) {
+                Some(value) => {
+                    if Some(value.to_owned()) != expected {
+                        violations.push(format!("tag {name} value {value:?} must match {expected:?}"));
+                    }
+                }
+                None => violations.push(format!("required tag {name} is missing")),
+            }
+        };
+        expect_tag(&mut violations, "p", agent.map(str::to_owned));
+        expect_tag(
+            &mut violations,
+            "e",
+            content["offer_id"].as_str().map(str::to_owned),
+        );
+        expect_tag(&mut violations, "max_sats", max_sats.map(|v| v.to_string()));
+        expect_tag(&mut violations, "expires_at", expires_at.map(|v| v.to_string()));
+        expect_tag(
+            &mut violations,
+            "scope_hash",
+            content["scope_constraints_hash"].as_str().map(str::to_owned),
+        );
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+
+    /// Test-side satnam-schema validator for kind 39243 (types.ts
+    /// SpendAuthorizationContent + SpendAuthorizationTags).
+    fn validate_satnam_spend_authorization_39243(
+        content: &serde_json::Value,
+        tags: &[Vec<String>],
+    ) -> Result<(), Vec<String>> {
+        let mut violations = Vec::new();
+        let field = |violations: &mut Vec<String>, ok: bool, what: &str| {
+            if !ok {
+                violations.push(what.to_owned());
+            }
+        };
+        field(
+            &mut violations,
+            content["envelope_id"].as_str().is_some_and(|v| !v.is_empty()),
+            "envelope_id must be a non-empty string",
+        );
+        let agent = content["agent_pubkey"].as_str();
+        field(
+            &mut violations,
+            agent.is_some_and(is_64_lower_hex),
+            "agent_pubkey must be 64-char lowercase hex",
+        );
+        field(
+            &mut violations,
+            content["amount_sats"].as_u64().is_some_and(|v| v > 0),
+            "amount_sats must be a positive integer (sats, not a string)",
+        );
+        field(
+            &mut violations,
+            content["purpose"].as_str().is_some_and(|v| !v.is_empty()),
+            "purpose must be a non-empty string",
+        );
+        field(
+            &mut violations,
+            matches!(content["rail"].as_str(), Some("lightning") | Some("cashu")),
+            "rail must be \"lightning\" or \"cashu\"",
+        );
+        if let Some(recipient) = content.get("recipient") {
+            field(
+                &mut violations,
+                recipient.is_string(),
+                "recipient, when present, must be a string",
+            );
+        }
+        let expect_tag = |violations: &mut Vec<String>, name: &str, expected: Option<String>| {
+            match fixture_first_tag(tags, name) {
+                Some(value) => {
+                    if Some(value.to_owned()) != expected {
+                        violations.push(format!("tag {name} value {value:?} must match {expected:?}"));
+                    }
+                }
+                None => violations.push(format!("required tag {name} is missing")),
+            }
+        };
+        expect_tag(
+            &mut violations,
+            "e",
+            content["envelope_id"].as_str().map(str::to_owned),
+        );
+        expect_tag(&mut violations, "p", agent.map(str::to_owned));
+        expect_tag(
+            &mut violations,
+            "amount",
+            content["amount_sats"].as_u64().map(|v| v.to_string()),
+        );
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+
+    /// Collect a delivered event's tags as `Vec<Vec<String>>` rows (the
+    /// schema validators read first-values only, per types.ts's
+    /// single-valued tag grammar).
+    fn fixture_tag_rows(event: &Event) -> Vec<Vec<String>> {
+        ["d", "p", "e", "max_sats", "expires_at", "scope_hash", "amount"]
+            .iter()
+            .filter_map(|name| {
+                tag_value(event, *name).map(|value| vec![(*name).to_owned(), value])
+            })
+            .collect()
+    }
+
+    /// FORWARD fixture (a): construct a 39242 envelope through the
+    /// committed projection and validate it against satnam's types.ts
+    /// schema expectations (required content fields, tag names/shapes,
+    /// hex pubkeys, sats magnitudes, d/p/e rules).
+    #[test]
+    fn roundtrip_fixture_envelope_39242_matches_the_satnam_schema() {
+        let store = MandateStore::in_memory().expect("store");
+        let digest = approve_mandate(&store, 50_000);
+        let projection = test_projection();
+        let sink = Arc::new(RecordingSink::default());
+        let projection = projection.with_sink(sink.clone());
+        let outcome = projection.emit_envelope_for_approved_mandate(
+            &store,
+            SOVEREIGN_WALLET_VENUE,
+            TradingNetwork::Signet,
+            Some(AGENT),
+            10,
+        );
+        assert!(outcome.is_emitted(), "the envelope must emit: {outcome:?}");
+        let event = sink
+            .delivered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last()
+            .expect("delivered")
+            .clone();
+        assert_eq!(event.kind, 39_242);
+        let content: serde_json::Value = serde_json::from_str(&event.content).expect("json");
+        let tags = fixture_tag_rows(&event);
+        validate_satnam_credit_envelope_39242(&content, &tags)
+            .unwrap_or_else(|violations| panic!("the Omega 39242 violates satnam's schema: {violations:?}"));
+        // The d/p/e rules per the mapping note: `d` is the envelope id
+        // (omega-mandate-<approval digest>), `e` carries the SAME local
+        // proposal identity as content.offer_id, `p` names the agent.
+        let envelope_id = envelope_id_for(&digest);
+        assert_eq!(fixture_first_tag(&tags, "d"), Some(envelope_id.as_str()));
+        assert_eq!(fixture_first_tag(&tags, "e"), Some(digest.as_str()));
+        assert_eq!(content["offer_id"], digest, "e tag == content.offer_id");
+        // Sats magnitude duality: content is a NUMBER, the tag the string form.
+        assert_eq!(content["max_sats"], serde_json::json!(50_000u64));
+        assert_eq!(fixture_first_tag(&tags, "max_sats"), Some("50000"));
+    }
+
+    /// FORWARD fixture (a, continued): construct a 39243 spend
+    /// authorization through the committed projection against the SAME
+    /// envelope and validate it against satnam's types.ts schema.
+    #[test]
+    fn roundtrip_fixture_spend_authorization_39243_matches_the_satnam_schema() {
+        let store = MandateStore::in_memory().expect("store");
+        let digest = approve_mandate(&store, 50_000);
+        let envelope_id = envelope_id_for(&digest);
+        let projection = test_projection();
+        let sink = Arc::new(RecordingSink::default());
+        let projection = projection.with_sink(sink.clone());
+        let spend = spend_authorization_after_decision(
+            &authorized(),
+            &envelope_id,
+            AGENT,
+            10_000,
+            Some(PAYMENT_HASH),
+            LANE_L402_REDEMPTION,
+        )
+        .expect("input");
+        assert!(
+            spend.amount_sats <= 50_000,
+            "amount_sats must stay within the envelope's max_sats cap"
+        );
+        let outcome = projection.emit_spend_authorization(&spend, 11);
+        assert!(outcome.is_emitted(), "the spend authorization must emit: {outcome:?}");
+        let event = sink
+            .delivered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last()
+            .expect("delivered")
+            .clone();
+        assert_eq!(event.kind, 39_243);
+        let content: serde_json::Value = serde_json::from_str(&event.content).expect("json");
+        let tags = fixture_tag_rows(&event);
+        validate_satnam_spend_authorization_39243(&content, &tags)
+            .unwrap_or_else(|violations| panic!("the Omega 39243 violates satnam's schema: {violations:?}"));
+        // Cross-kind correlation (design §6 item 3): the 39243 references
+        // the envelope BY the 39242's `d` value, never by kind equivalence.
+        assert_eq!(fixture_first_tag(&tags, "e"), Some(envelope_id.as_str()));
+        assert_eq!(content["envelope_id"], envelope_id);
+        // The purpose is digest-composed (P10 content-free): lane + payment hash.
+        assert_eq!(
+            content["purpose"],
+            format!("sovereign-wallet:{LANE_L402_REDEMPTION}:{PAYMENT_HASH}")
+        );
+        assert_eq!(content["rail"], "lightning");
+        assert_eq!(fixture_first_tag(&tags, "amount"), Some("10000"));
+        assert_eq!(content["amount_sats"], serde_json::json!(10_000u64));
+    }
+
+    /// REVERSE fixture (b): a satnam-shaped 39242 + 39243 pair,
+    /// hand-built EXACTLY from types.ts (including the satnam-legal
+    /// optional fields Omega omits — `allowed_mints`, `recipient` — and
+    /// satnam-style values: `offer_id` is a 39241 event id, agent !=
+    /// governor, free-form-schema `purpose`), validated against the SAME
+    /// test-side schema rules the Omega-emitted events pass, plus the
+    /// projection's one production-side gate (`enforce_kind_policy`).
+    ///
+    /// WHAT OMEGA CANNOT YET VALIDATE (recorded honestly, per the WP-13
+    /// brief): Omega has NO production inbound NIP-AC validator or parser.
+    /// The inbound boundary (module doc, threat-model §13.2) keeps every
+    /// received NIP-AC event display-only, so a satnam-shaped event can be
+    /// schema-checked only here in test code — never against local
+    /// authority state, and never through a production parse path. Adding
+    /// one is a separately founder-gated inbound feature.
+    #[test]
+    fn roundtrip_fixture_satnam_shaped_events_validate_against_the_satnam_schema() {
+        // Hand-built from types.ts CreditEnvelopeContent (:98-110) and
+        // CreditEnvelopeTags (:112-119) — satnam side of the wire.
+        let satnam_offer_event_id =
+            "f1e2d3c4b5a69788796a5b4c3d2e1f00ff11e2d3c4b5a69788796a5b4c3d2e1f";
+        let satnam_agent = "aa11bb22cc33dd44ee55ff66112233445566778899aabbccddeeff0012345678";
+        let satnam_governor = "bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff0012345678aa";
+        let satnam_scope_hash = "cc33dd44ee55ff6600112233445566778899aabbccddeeff0012345678aa11bb";
+        let envelope_d = "envelope-1a2b3c4d5e6f7788"; // satnam generateDTag shape (client.ts :122-125)
+        let envelope_content = serde_json::json!({
+            "offer_id": satnam_offer_event_id,
+            "agent_pubkey": satnam_agent,
+            "governor_pubkey": satnam_governor,
+            "max_sats": 75_000u64,
+            "scope_constraints_hash": satnam_scope_hash,
+            "expires_at": 2_000_000_000u64,
+            // satnam-legal optional field Omega omits (empty = all allowed):
+            "allowed_mints": ["https://mint.example"],
+        });
+        let envelope_tags = vec![
+            vec!["d".to_owned(), envelope_d.to_owned()],
+            vec!["p".to_owned(), satnam_agent.to_owned()],
+            vec!["e".to_owned(), satnam_offer_event_id.to_owned()],
+            vec!["max_sats".to_owned(), "75000".to_owned()],
+            vec!["expires_at".to_owned(), "2000000000".to_owned()],
+            vec!["scope_hash".to_owned(), satnam_scope_hash.to_owned()],
+        ];
+        validate_satnam_credit_envelope_39242(&envelope_content, &envelope_tags)
+            .unwrap_or_else(|violations| panic!("the hand-built satnam 39242 must satisfy its own schema: {violations:?}"));
+        // The one production-side check that exists for an INBOUND kind:
+        // the 2A kind policy admits 39242/39243 (it is an emission gate —
+        // it says nothing about validating the rest of the event).
+        assert!(enforce_kind_policy(39_242).is_ok());
+        assert!(enforce_kind_policy(39_243).is_ok());
+
+        // Hand-built from types.ts SpendAuthorizationContent (:129-137)
+        // and SpendAuthorizationTags (:139-143). `purpose` per types.ts is
+        // a description string; `recipient` is satnam-legal and Omega omits it.
+        let spend_content = serde_json::json!({
+            "envelope_id": envelope_d,
+            "agent_pubkey": satnam_agent,
+            "amount_sats": 2_500u64,
+            "purpose": "research 5 companies, batch 3",
+            "recipient": "pay@example.com",
+            "rail": "lightning",
+        });
+        let spend_tags = vec![
+            vec!["e".to_owned(), envelope_d.to_owned()],
+            vec!["p".to_owned(), satnam_agent.to_owned()],
+            vec!["amount".to_owned(), "2500".to_owned()],
+        ];
+        validate_satnam_spend_authorization_39243(&spend_content, &spend_tags)
+            .unwrap_or_else(|violations| panic!("the hand-built satnam 39243 must satisfy its own schema: {violations:?}"));
+        assert!(enforce_kind_policy(39_243).is_ok());
+        // Cross-kind correlation holds on the satnam side too: the spend's
+        // envelope_id == the envelope's `d`.
+        assert_eq!(spend_content["envelope_id"], envelope_d);
+        // And the schema rule both directions share: amount <= max_sats.
+        assert!(spend_content["amount_sats"].as_u64().expect("sats") <= envelope_content["max_sats"].as_u64().expect("sats"));
+    }
 }
