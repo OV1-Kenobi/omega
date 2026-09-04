@@ -31,7 +31,7 @@ import { Effect } from "effect";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { lockdownTree } from "./acl.js";
+import { getTipHeight } from "./tip-api.js";
 import { LoopbackHttpServer, validateLoopbackToken } from "./http.js";
 import { IdempotencyStore } from "./idempotency.js";
 import { L402Gateway, DEMO_ECHO_PATH, DEMO_MCP_PATH_PREFIX } from "./l402.js";
@@ -524,17 +524,15 @@ export class SidecarCore {
   }
 
   /**
-   * OMEGA-DELTA-0303: the wallet-height seam fails CLOSED with a named error
-   * until the C3-2 slice wires the public tip API (OMEGA-DELTA-0304). The
-   * escrow timeout gate must never substitute wall-clock or a guessed height —
-   * TIP_HEIGHT_UNAVAILABLE is the honest answer today.
+   * OMEGA-DELTA-0303/0304: the wallet-height seam returns the observed
+   * chain tip height from the public tip-API (mempool.space primary,
+   * blockstream.info fallback). Fails closed with TIP_HEIGHT_UNAVAILABLE
+   * (never wall-clock). The escrow timeout gate consumes this via
+   * `observe_wallet_height` -> `timeout_window_open`.
    */
   async walletHeight(): Promise<Record<string, unknown>> {
-    throw envelopeError(
-      "TIP_HEIGHT_UNAVAILABLE",
-      "TIP_HEIGHT_UNAVAILABLE: the public tip API is not wired in this slice (OMEGA-DELTA-0303; the C3-2 slice lands OMEGA-DELTA-0304); the escrow timeout gate fails closed — no height is ever guessed",
-      { retryable: true, remediation: "the C3-2 slice wires the tip API; until then the escrow gate fails closed" },
-    );
+    const height = await getTipHeight();
+    return { block_height: height };
   }
 
 /**
