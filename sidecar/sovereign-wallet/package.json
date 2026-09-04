@@ -2,7 +2,7 @@
   "name": "sovereign-wallet",
   "version": "0.1.0",
   "private": true,
-  "description": "Supervised Node 24/Effect sovereign wallet sidecar (Wavelength waved engine, signet-only). WP-3+WP-4 of OA-P2-WALLET-2026-08-26.",
+  "description": "Supervised Node 24/Effect sovereign wallet sidecar (phoenixd node rail, client-only — OMEGA-DELTA-0303; make/pay/height). WP-C3 of OA-MAINNET-WP-C1 2026-09-04.",
   "type": "module",
   "engines": {
     "node": ">=23.4.0"

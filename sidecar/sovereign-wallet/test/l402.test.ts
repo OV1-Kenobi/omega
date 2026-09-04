@@ -46,13 +46,14 @@ import { buildTestBolt11 } from "./fixtures/build-bolt11.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "..", "..");
 const MAIN_JS = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "dist", "main.js");
-const FAKE_WAVED_CMD = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "test", "fixtures", "fake-waved.cmd");
+const FAKE_PHOENIXD_CMD = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "test", "fixtures", "fake-phoenixd.cmd");
+/** The fixture's Basic-auth password (RV-C1: the username is not validated). */
+const FAKE_PHOENIXD_API_KEY = "fixture-phoenixd-api-key";
 
 /** The deterministic proof pair: preimage "b"*64 and its sha256 payment hash. */
 const PREIMAGE = "b".repeat(64);
 const PAYMENT_HASH = createHash("sha256").update(Buffer.from(PREIMAGE, "hex")).digest("hex");
 const PASSPHRASE = "correct horse battery staple";
-const WALLET_PASSWORD = "correct horse battery staple";
 
 /** An envelope-shaped error so the gateway's walletReady catch maps it. */
 function envErr(code: string, message: string): Error {
@@ -592,12 +593,16 @@ describe("L-402 gateway unit", () => {
 });
 
 // ---------------------------------------------------------------------------
-// End-to-end over the real loopback HTTP surface (real sidecar + fake waved)
+// End-to-end over the real loopback HTTP surface (real sidecar + fake
+// phoenixd node; OMEGA-DELTA-0303 — the sidecar is client-only, so the test
+// harness owns the fake node's lifecycle)
 // ---------------------------------------------------------------------------
 
 interface Sidecar {
   child: ChildProcess;
   token: string;
+  /** The fake phoenixd child (owned by the test harness; killed on close). */
+  fakeNode: ChildProcess;
   request(method: string, params?: Record<string, unknown>, generation?: number): Promise<Record<string, unknown>>;
   close(): Promise<number | null>;
   stderrText(): string;
@@ -610,24 +615,56 @@ function nextPort(): number {
   return 12_000 + ((portCounter * 7919) % 30_000);
 }
 
-function spawnSidecar(overrides: Record<string, string>): Sidecar {
+/** Start the fake phoenixd node and wait for its "listening" line. */
+async function startFakePhoenixd(port: number, overrides: Record<string, string>): Promise<ChildProcess> {
+  const fakeNode = spawn(FAKE_PHOENIXD_CMD, [], {
+    env: {
+      FAKE_PHOENIXD_PORT: String(port),
+      FAKE_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
+      FAKE_PHOENIXD_CHAIN: overrides.FAKE_PHOENIXD_CHAIN ?? "signet",
+      FAKE_PHOENIXD_MODE: overrides.FAKE_PHOENIXD_MODE ?? "normal",
+      FAKE_PHOENIXD_INVOICE_HRP: overrides.FAKE_PHOENIXD_INVOICE_HRP ?? "lntbs100u",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  fakeNode.stdout?.setEncoding("utf8");
+  fakeNode.stderr?.setEncoding("utf8");
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("fake-phoenixd did not listen in time")), 10_000);
+    const onData = (chunk: string): void => {
+      if (chunk.includes("listening")) {
+        clearTimeout(timer);
+        fakeNode.stdout?.removeListener("data", onData);
+        resolve();
+      }
+    };
+    fakeNode.stdout?.on("data", onData);
+    fakeNode.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`fake-phoenixd exited early with code ${code}`));
+    });
+  });
+  return fakeNode;
+}
+
+async function spawnSidecar(overrides: Record<string, string>): Promise<Sidecar> {
   const dataRoot = mkdtempSync(path.join(tmpdir(), "sw-l402-"));
   const port = nextPort();
   const token = generateLoopbackToken();
+  // OMEGA-DELTA-0303: the fake phoenixd node is spawned by the TEST (the
+  // sidecar is client-only and never spawns a node child).
+  const fakeNode = await startFakePhoenixd(port, overrides);
   const env: Record<string, string> = {
     OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot,
     OMEGA_SOVEREIGN_WALLET_NETWORK: "signet",
     OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN: token,
-    OMEGA_SOVEREIGN_WALLET_WAVED_BIN: FAKE_WAVED_CMD,
-    OMEGA_SOVEREIGN_WALLET_WAVED_REST_PORT: String(port),
+    OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: `http://127.0.0.1:${port}`,
+    OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
     // OMEGA-DELTA-0301 (RV6-REQ-1): the TEST-ONLY in-memory keychain seam —
     // e2e processes must never touch the real OS keychain. Production never
     // sets this; the default is the OS-keychain binding.
     OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN: "memory",
-    FAKE_WAVED_NETWORK: "signet",
-    FAKE_WAVED_MODE: "normal",
-    FAKE_WAVED_PORT: String(port),
-    FAKE_WAVED_DATA_ROOT: dataRoot,
     ...overrides,
   };
   const child = spawn(process.execPath, [MAIN_JS], {
@@ -684,6 +721,7 @@ function spawnSidecar(overrides: Record<string, string>): Sidecar {
 
   const close = async (): Promise<number | null> => {
     killTree(child.pid);
+    killTree(fakeNode.pid);
     if (!child.pid) child.kill();
     await new Promise<void>((resolve) => {
       if (child.exitCode !== null) {
@@ -707,7 +745,7 @@ function spawnSidecar(overrides: Record<string, string>): Sidecar {
     return child.exitCode;
   };
 
-  return { child, token, request, close, stderrText: () => stderrBuffer };
+  return { child, token, fakeNode, request, close, stderrText: () => stderrBuffer };
 }
 
 function expectOk(response: Record<string, unknown>): Record<string, unknown> {
@@ -741,15 +779,17 @@ async function waitForExit(child: ChildProcess, ms = 10_000): Promise<number | n
 }
 
 /**
- * Bring a fresh sidecar to the operator-ready state: identity ceremony
- * (vault unlocked — required for the gateway HMAC key, SEC-2026-044), wallet
- * create + unlock (required for invoice minting, SEC-2026-054). Returns the
+ * Bring a fresh sidecar to the operator-ready state: identity ceremony (vault
+ * unlocked — required for the gateway HMAC key, SEC-2026-044). The node rail
+ * is client-only (OMEGA-DELTA-0303): the fake phoenixd answers the startup
+ * probe, so the node-ready gate (the gateway's walletReady dep) passes; the
+ * waved create-wallet/unlock ceremony is removed with the rail. Returns the
  * sidecar plus the data-root path for restart tests. `overrides` are extra
  * env vars for the spawned sidecar (e.g. OMEGA_SPEND_KILL for the 0300
  * kill-closure test).
  */
 async function readySidecar(overrides: Record<string, string> = {}): Promise<{ sidecar: Sidecar; dataRoot: string }> {
-  const sidecar = spawnSidecar(overrides);
+  const sidecar = await spawnSidecar(overrides);
   await sidecar.request("initialize");
   const prepared = expectOk(await sidecar.request("vault-init-prepare"));
   const words = (prepared.mnemonic as string).split(" ");
@@ -757,8 +797,6 @@ async function readySidecar(overrides: Record<string, string> = {}): Promise<{ s
     passphrase: PASSPHRASE,
     answers: { 2: words[1], 7: words[6], 11: words[10] },
   });
-  await sidecar.request("create-wallet", { idempotencyKey: "l402-11111111-1111-4111-8111-111111111111", password: WALLET_PASSWORD });
-  await sidecar.request("unlock", { idempotencyKey: "l402-22222222-2222-4222-8222-222222222222", password: WALLET_PASSWORD });
   const dataRoot = (expectOk(await sidecar.request("status")).dataRoot as string) ?? "";
   return { sidecar, dataRoot };
 }
@@ -843,7 +881,7 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
     }
   });
 
-  it("locked wallet: mint fails with the stable wallet_locked error; redemption stays honored", async () => {
+  it("OMEGA-DELTA-0303: node unreachable -> the mint fails with a stable named error; redemption stays honored", async () => {
     const { sidecar } = await readySidecar();
     try {
       const port = await httpPort(sidecar);
@@ -856,22 +894,27 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
       };
       const preimage = await payInvoice(sidecar, challenge.invoice);
 
-      // Lock the wallet AND the vault.
-      expectOk(await sidecar.request("lock"));
+      // Take the fake phoenixd node down: the sidecar's make path fails
+      // closed (the createinvoice fetch throws INTERNAL node-unreachable;
+      // the gateway maps the mint failure to the stable named error — the
+      // "wallet_locked" label is the gateway's pre-0303 mapping, recorded as
+      // a C5 honesty-label item in the WP-C3 evidence).
+      killTree(sidecar.fakeNode.pid);
+      await sleep(300);
 
-      // Minting now fails with the stable named error (not a hang).
       const lockedMint = await fetch(`${base}${DEMO_ECHO_PATH}`, { method: "POST", headers, body: "{}" });
-      assert.equal(lockedMint.status, 503);
+      assert.equal(lockedMint.status, 502);
       const lockedBody = (await lockedMint.json()) as { error: { code: string } };
-      assert.equal(lockedBody.error.code, "wallet_locked");
+      assert.equal(lockedBody.error.code, "invoice_mint_failed");
 
-      // Redemption of the already-paid challenge stays honored while locked.
+      // Redemption of the already-paid challenge stays honored (the proof is
+      // a gateway-HMAC property, not a node property — SEC-2026-054).
       const retry = await fetch(`${base}${DEMO_ECHO_PATH}`, {
         method: "POST",
         headers: { ...headers, "x-openagents-l402": `${challenge.macaroon}:${preimage}` },
         body: "{}",
       });
-      assert.equal(retry.status, 200, "redemption while the wallet is locked must stay honored (SEC-2026-054)");
+      assert.equal(retry.status, 200, "redemption must stay honored when the node is unreachable");
     } finally {
       await sidecar.close();
     }
@@ -940,22 +983,18 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
       // whose OS keychain is unavailable — the unlock uses the DEGRADED path
       // (explicit opt-in OMEGA_VAULT_ALLOW_PASSPHRASE_FALLBACK=1) and reports
       // wrapMethod "passphrase-fallback" (RV6-REQ-5).
-      const restarted = spawnSidecar({
+      const restarted = await spawnSidecar({
         OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot,
         OMEGA_VAULT_ALLOW_PASSPHRASE_FALLBACK: "1",
       });
       try {
         await restarted.request("initialize");
         // The normal operator flow after restart: unlock the vault (the
-        // gateway's HMAC key is re-loaded from the vault entry) and the wallet.
+        // gateway's HMAC key is re-loaded from the vault entry). The node
+        // rail is client-only — no wallet unlock step exists on the phoenixd
+        // rail (OMEGA-DELTA-0303).
         const vaultUnlock = expectOk(await restarted.request("vault-unlock", { passphrase: PASSPHRASE }));
         assert.equal(vaultUnlock.wrapMethod, "passphrase-fallback", "restart unlock uses the degraded path (RV6-REQ-5)");
-        expectOk(
-          await restarted.request("unlock", {
-            idempotencyKey: "l402-33333333-3333-4333-8333-333333333333",
-            password: WALLET_PASSWORD,
-          }),
-        );
         const port2 = await httpPort(restarted);
         const base2 = `http://127.0.0.1:${port2}`;
         const headers2 = { authorization: `Bearer ${restarted.token}` };
@@ -1010,7 +1049,7 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
   });
 
   it("gateway state is reported honestly in status.l402_gateway_state", async () => {
-    const sidecar = spawnSidecar({});
+    const sidecar = await spawnSidecar({});
     try {
       const status = expectOk(await sidecar.request("status"));
       // Fresh data root: vault absent -> the gateway key is unavailable (locked).
@@ -1031,7 +1070,7 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
   });
 
   it("mcp-identity-map get/set round-trip (design §6.4 dashboard wiring)", async () => {
-    const sidecar = spawnSidecar({});
+    const sidecar = await spawnSidecar({});
     try {
       await sidecar.request("initialize");
       const empty = expectOk(await sidecar.request("mcp-identity-map-get"));

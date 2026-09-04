@@ -34,12 +34,16 @@ pub enum ErrorCode {
     /// The one-time Nostr-secret export bridge has already been consumed and
     /// refuses to re-export (design §2.2 `export-nostr-secret`).
     ExportAlreadyConsumed,
-    WavedBinaryMissing,
-    WavedWalletApiUnavailable,
-    /// WP-4b (SEC-2026-087): the waved getinfo height probe failed — the
-    /// pinned build serves getinfo gRPC-only, so no observed tip exists. The
-    /// escrow timeout gate fails closed on this (never wall-clock).
-    WavedHeightUnavailable,
+    /// OMEGA-DELTA-0303 (rail renames): the waved codes are replaced on the
+    /// rail. `WAVED_BINARY_MISSING` -> `NODE_UNCONFIGURED` (the missing
+    /// phoenixd env / rail connection); `WAVED_WALLET_API_UNAVAILABLE` is
+    /// removed (the waved wallet-API probe has no phoenixd equivalent);
+    /// `WAVED_HEIGHT_UNAVAILABLE` -> `TIP_HEIGHT_UNAVAILABLE` (the public
+    /// tip-API fail-closed code; 0304 carries the tip client — this slice's
+    /// wallet-height seam answers it fail-closed, so the escrow timeout gate
+    /// never substitutes wall-clock).
+    NodeUnconfigured,
+    TipHeightUnavailable,
     /// OMEGA-DELTA-0300 (kill closure): the sidecar's gateway mint path
     /// reads the environment-level spend kill and refuses with this code.
     /// The Rust choke point refuses BEFORE forwarding when killed, so this
@@ -87,7 +91,10 @@ pub struct ResponseFrame {
     pub error: Option<ErrorEnvelope>,
 }
 
-/// Wallet state normalized from the Wavelength daemon (design §1.4).
+/// Wallet state normalized from the node rail (design §1.4; the phoenixd
+/// rail derives "ready" from the getinfo probe, "error" from a failed probe;
+/// the waved lifecycle states none/locked/syncing no longer apply to a remote
+/// operator-managed node — OMEGA-DELTA-0303).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WalletState {
@@ -108,12 +115,14 @@ pub struct InitializeResult {
     pub capabilities: Vec<String>,
     pub data_root: String,
     pub network: String,
-    /// The waved daemon's ACTUAL runtime network from the probe (SEC-2026-050),
-    /// never the env value alone. `None` when waved is unavailable.
+    /// OMEGA-DELTA-0303 (honest renames): the node's ACTUAL runtime network
+    /// from the rail's getinfo probe (the `chain` field when present, else
+    /// `None` — the assertion is then carried by the env gate + the invoice
+    /// HRP guard, design §2.6.3), never the env value alone.
     #[serde(default)]
-    pub waved_network: Option<String>,
+    pub node_network: Option<String>,
     #[serde(default)]
-    pub waved_state: String,
+    pub node_state: String,
     #[serde(default)]
     pub http_surface: HttpSurface,
 }
@@ -137,7 +146,8 @@ pub struct HealthResult {
     pub generation: u64,
     pub data_root: String,
     pub wallet_state: WalletState,
-    pub waved_connected: bool,
+    #[serde(default)]
+    pub node_connected: bool,
     pub network: String,
     #[serde(default)]
     pub note: String,
@@ -150,9 +160,10 @@ pub struct StatusResult {
     pub protocol_version: u32,
     pub service_version: String,
     pub network: String,
-    pub waved_connected: bool,
     #[serde(default)]
-    pub waved_unavailable_reason: String,
+    pub node_connected: bool,
+    #[serde(default)]
+    pub node_unavailable_reason: String,
     pub wallet_state: WalletState,
     #[serde(default)]
     pub vault_state: String,
@@ -271,12 +282,11 @@ pub struct CreateWalletResult {
     pub note: String,
 }
 
-/// WP-4b (SEC-2026-087): the observed daemon tip height, read through the
-/// sidecar's `wallet-height` probe of the waved getinfo surface. This is the
-/// ONLY sanctioned tip domain for the escrow `timeout_at_height` gate (the
-/// WP-3b decision: one source, cross-domain comparison refused). When the
-/// probe fails (`WAVED_HEIGHT_UNAVAILABLE`) no height exists and the escrow
-/// caller must fail closed — the tip never comes from wall-clock.
+/// WP-4b (SEC-2026-087) / OMEGA-DELTA-0303: the observed tip height, read
+/// through the sidecar's `wallet-height` seam. THIS SLICE fails closed with
+/// `TIP_HEIGHT_UNAVAILABLE` (the public tip API lands under OMEGA-DELTA-0304
+/// in the C3-2 slice); the escrow `timeout_at_height` gate must fail closed
+/// on it — the tip never comes from wall-clock.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockHeightResult {

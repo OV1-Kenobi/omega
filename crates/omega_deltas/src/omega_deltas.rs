@@ -3796,6 +3796,9 @@ pub const SOVEREIGN_SIDECAR_MAIN_PATH: &str = "sidecar/sovereign-wallet/src/main
 /// OMEGA-DELTA-0286. The waved launch + guards (network type, launch args,
 /// runtime assertion, invoice guard).
 pub const SOVEREIGN_WAVELENGTH_PATH: &str = "sidecar/sovereign-wallet/src/wavelength.ts";
+/// OMEGA-DELTA-0303. The phoenixd rail client (network type, launch flags,
+/// runtime assertion, invoice guard).
+pub const SOVEREIGN_PHOENIXD_PATH: &str = "sidecar/sovereign-wallet/src/phoenixd.ts";
 /// OMEGA-DELTA-0286/0287. The L-402 gateway (network type, mint HRP check,
 /// network-aware honesty labels).
 pub const SOVEREIGN_L402_GATEWAY_PATH: &str = "sidecar/sovereign-wallet/src/l402.ts";
@@ -32583,30 +32586,29 @@ mod tests {
              positive (opted-in) branch must exist"
         );
 
-        // 2. wavelength.ts: network type, launch flag, gated assertion,
-        //    parameterized guard, citation.
-        let wavelength = read_repository_file(SOVEREIGN_WAVELENGTH_PATH);
+        // 2. phoenixd.ts: network type, launch flag, gated assertion,
+        //    parameterized guard, citation (OMEGA-DELTA-0303).
+        let phoenixd = read_repository_file(SOVEREIGN_PHOENIXD_PATH);
         for required in [
-            "\"signet\" | \"regtest\" | \"mainnet\"",
-            "--allow-mainnet",
-            "OMEGA-DELTA-0286",
+            "PhoenixdNetwork = \"signet\" | \"regtest\" | \"mainnet\"",
+            "allowMainnet",
+            "OMEGA-DELTA-0303",
         ] {
             assert!(
-                wavelength.contains(required),
-                "OMEGA-DELTA-0286: wavelength.ts lost `{required}`; the mainnet \
-                 network type, the gated --allow-mainnet launch, and the delta \
+                phoenixd.contains(required),
+                "OMEGA-DELTA-0303: phoenixd.ts lost `{required}`; the mainnet \
+                 network type, the gated allowMainnet flag, and the delta \
                  citation must stay present"
             );
         }
         assert!(
-            wavelength.contains("allowMainnet === true"),
-            "OMEGA-DELTA-0286: wavelength.ts lost the allow-mainnet launch gate; \
-             --allow-mainnet must be passed ONLY for the opted-in mainnet case"
+            phoenixd.contains("allowMainnet"),
+            "OMEGA-DELTA-0303: phoenixd.ts lost the allowMainnet config field; the \
+             positive (opted-in) branch must exist"
         );
         assert!(
-            wavelength.contains("assertNetworkMatches(config.network, status.network")
-                || wavelength.contains("assertNetworkMatches(configured, reported, allowMainnet"),
-            "OMEGA-DELTA-0286: wavelength.ts lost the gated runtime assertion call"
+            phoenixd.contains("assertNetworkMatches(") && phoenixd.contains("configured: string") && phoenixd.contains("reported: string | null") && phoenixd.contains("allowMainnet: boolean"),
+            "OMEGA-DELTA-0303: phoenixd.ts lost the gated runtime assertion call"
         );
 
         // 3. lib.rs: the grammar includes mainnet; the opt-in env name is bound.
@@ -32768,38 +32770,38 @@ mod tests {
              SpendHalted refusal (SEC-2026-098)"
         );
 
-        // Kill closure (WP-3, 2026-08-31): the L-402 gateway's HTTP mint
-        // path is sidecar-internal (a direct waved recv) and does NOT
-        // traverse the Rust choke point, so the sidecar reads the kill env
-        // itself on that mint path; the gateway maps the SPEND_HALTED
-        // envelope to the stable 503 spend_halted error.
-        let sidecar_main = read_repository_file(SOVEREIGN_SIDECAR_MAIN_PATH);
-        for required in [
-            "OMEGA_SPEND_KILL",
-            "process.env[SPEND_KILL_ENV] === \"1\"",
-            "SPEND_HALTED",
-            "OMEGA-DELTA-0300",
-        ] {
+// Kill closure (WP-3, 2026-08-31): the L-402 gateway's HTTP mint
+            // path is sidecar-internal (a direct phoenixd pay_invoice) and does NOT
+            // traverse the Rust choke point, so the sidecar reads the kill env
+            // itself on that mint path; the gateway maps the SPEND_HALTED
+            // envelope to the stable 503 spend_halted error.
+            let sidecar_main = read_repository_file(SOVEREIGN_SIDECAR_MAIN_PATH);
+            for required in [
+                "OMEGA_SPEND_KILL",
+                "process.env[SPEND_KILL_ENV] === \"1\"",
+                "SPEND_HALTED",
+                "OMEGA-DELTA-0300",
+            ] {
+                assert!(
+                    sidecar_main.contains(required),
+                    "OMEGA-DELTA-0300: main.ts lost `{required}`; the gateway mint \
+                     path must read the spend kill itself (it does not traverse \
+                     the Rust choke point) and refuse with the SPEND_HALTED \
+                     envelope until the founder re-enables"
+                );
+            }
+            let kill_check = sidecar_main
+                .find("process.env[SPEND_KILL_ENV] === \"1\"")
+                .expect("the gateway mint kill check must exist");
+            let gateway_recv = sidecar_main
+                .find("#phoenixd!.payInvoice")
+                .expect("the gateway mint's phoenixd payInvoice call must exist");
             assert!(
-                sidecar_main.contains(required),
-                "OMEGA-DELTA-0300: main.ts lost `{required}`; the gateway mint \
-                 path must read the spend kill itself (it does not traverse \
-                 the Rust choke point) and refuse with the SPEND_HALTED \
-                 envelope until the founder re-enables"
+                kill_check < gateway_recv,
+                "OMEGA-DELTA-0300: the gateway kill check must precede the phoenixd \
+                 payInvoice call on the mint path (killed -> refuse BEFORE contacting \
+                 phoenixd)"
             );
-        }
-        let kill_check = sidecar_main
-            .find("process.env[SPEND_KILL_ENV] === \"1\"")
-            .expect("the gateway mint kill check must exist");
-        let gateway_recv = sidecar_main
-            .find("this.#waved!.client.recvInvoice")
-            .expect("the gateway mint's waved recv call must exist");
-        assert!(
-            kill_check < gateway_recv,
-            "OMEGA-DELTA-0300: the gateway kill check must precede the waved \
-             recv call on the mint path (killed -> refuse BEFORE contacting \
-             waved)"
-        );
         let gateway = read_repository_file(SOVEREIGN_L402_GATEWAY_PATH);
         assert!(
             gateway.contains("SPEND_HALTED") && gateway.contains("spend_halted"),

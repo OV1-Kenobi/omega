@@ -1,15 +1,17 @@
-//! Data-root lock, waved pid/lock, stale-waved reaping, single-waved
-//! enforcement, and Windows process-tree termination (SEC-2026-049).
+//! Data-root lock and stale-lock reaping (SEC-2026-049 heritage).
+//!
+//! OMEGA-DELTA-0303 (rail swap): the waved launch/probe/PID machinery
+//! (`waved.pid`, stale-waved reaping, single-waved enforcement, the Windows
+//! process-tree termination used only for waved) is REMOVED — the sidecar is a
+//! client-only process for the phoenixd rail (design §2, deletion disposition
+//! §8.1); no daemon child is spawned, supervised, or tree-killed.
 //!
 //! - The sidecar takes an exclusive lock on `run/sidecar.lock` (O_EXCL-style
 //!   create) and reports ALREADY_RUNNING if it is held.
-//! - waved's pid is recorded at `run/waved.pid`; before spawning a new waved,
-//!   the sidecar reaps a stale waved (graceful stop, then tree kill) and
-//!   refuses a second waved on the same data dir (single-waved enforcement).
-//! - When the sidecar is force-terminated on Windows, the supervisor uses
-//!   `taskkill /T` (job-object-equivalent) so the waved tree dies with it.
+//! - Stale-lock detection: if the pid in the lock file is not alive, the lock
+//!   is reclaimed.
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -94,84 +96,6 @@ export function isPidAlive(pid: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
-}
-
-/**
- * Terminate a process and its whole tree on Windows (`taskkill /T`), or
- * SIGTERM-then-KILL on POSIX. `graceMs` is the wait before escalation.
- */
-export async function terminateTree(pid: number, graceMs = 2000): Promise<void> {
-  if (!isPidAlive(pid)) return;
-  if (process.platform === "win32") {
-    // First a soft TerminateProcess via node (matches the effectd supervisor's
-    // non-Unix path), then the tree kill as the authoritative sweep.
-    try {
-      process.kill(pid);
-    } catch {
-      // already gone
-    }
-    await sleep(graceMs);
-    if (isPidAlive(pid)) {
-      execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-    }
-    return;
-  }
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    return;
-  }
-  await sleep(graceMs);
-  if (isPidAlive(pid)) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // gone
-    }
-  }
-}
-
-/**
- * Reap a stale waved for this data root: if `run/waved.pid` names a live
- * process, terminate its tree (graceful stop first, then tree kill). If a
- * live waved exists AND `sidecar.lock` is held by another live sidecar, refuse
- * (single-waved enforcement) rather than killing a healthy owner's daemon.
- */
-export async function reapStaleWaved(
-  runDir: string,
-  opts: { refuseIfOwnedByLiveSidecar: boolean; sidecarLockPath: string },
-): Promise<void> {
-  const pidPath = path.join(runDir, "waved.pid");
-  const record = await readLock(pidPath);
-  if (!record || !isPidAlive(record.pid)) {
-    await fs.rm(pidPath, { force: true });
-    return;
-  }
-  if (opts.refuseIfOwnedByLiveSidecar) {
-    const sidecar = await readLock(opts.sidecarLockPath);
-    if (sidecar && isPidAlive(sidecar.pid)) {
-      throw new LockHeldError(
-        `waved pid ${record.pid} is owned by a live sidecar (pid ${sidecar.pid}); refusing a second waved on this data root`,
-      );
-    }
-  }
-  await terminateTree(record.pid);
-  await fs.rm(pidPath, { force: true });
-}
-
-export async function writeWavedPid(runDir: string, pid: number): Promise<void> {
-  await fs.mkdir(runDir, { recursive: true });
-  await fs.writeFile(path.join(runDir, "waved.pid"), `${pid}|waved|${Date.now()}\n`, {
-    mode: 0o600,
-  });
-}
-
-export async function clearWavedPid(runDir: string): Promise<void> {
-  await fs.rm(path.join(runDir, "waved.pid"), { force: true });
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export { fsConstants };

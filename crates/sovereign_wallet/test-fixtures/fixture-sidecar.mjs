@@ -2,17 +2,20 @@
 // Speaks the framed protocol (openagents.omega.sovereign-wallet.v1) over
 // stdio. The reported network comes from `--network=<name>` (per-instance
 // arg, so parallel tests never race on env) with FIXTURE_NETWORK as a
-// fallback. `--no-wallet-height` makes the WP-4b wallet-height probe fail
-// closed with WAVED_HEIGHT_UNAVAILABLE (test-only knob). `--over-settle`
+// fallback. `--no-wallet-height` makes the OMEGA-DELTA-0303 wallet-height
+// seam fail closed with TIP_HEIGHT_UNAVAILABLE (test-only knob). `--over-settle`
 // simulates an over-settled payment (actual > prepared-for total) so the
 // OMEGA-DELTA-0300 loss-rule auto-kill is observable from Rust tests.
+// Updated-with-citation (0303): the honest field renames (nodeNetwork/
+// nodeState/nodeConnected/nodeUnavailableReason) mirror the rail surfaces.
 
 import fs from "node:fs";
 
 const argNetwork = process.argv.find((arg) => arg.startsWith("--network="));
 const FIXTURE_NETWORK = argNetwork ? argNetwork.slice("--network=".length) : (process.env.FIXTURE_NETWORK ?? "signet");
-// WP-4b test knob: --no-wallet-height disables the fixture's height answer so
-// the typed WAVED_HEIGHT_UNAVAILABLE path is observable from Rust tests.
+// OMEGA-DELTA-0303 test knob: --no-wallet-height disables the fixture's
+// height answer so the typed TIP_HEIGHT_UNAVAILABLE path is observable from
+// Rust tests (the C3-2 slice wires the real tip API under 0304).
 const FIXTURE_NO_WALLET_HEIGHT = process.argv.includes("--no-wallet-height");
 // OMEGA-DELTA-0300: over-settlement simulation for the loss rule.
 const FIXTURE_OVER_SETTLE = process.argv.includes("--over-settle");
@@ -96,8 +99,8 @@ process.stdin.on("data", (chunk) => {
           ],
           dataRoot: process.env.OMEGA_SOVEREIGN_WALLET_DATA_ROOT ?? "",
           network: FIXTURE_NETWORK,
-          wavedNetwork: FIXTURE_NETWORK,
-          wavedState: "connected",
+          nodeNetwork: FIXTURE_NETWORK,
+          nodeState: "connected",
           httpSurface: { bound: false, port: 0 },
         });
         break;
@@ -108,7 +111,7 @@ process.stdin.on("data", (chunk) => {
           generation,
           dataRoot: process.env.OMEGA_SOVEREIGN_WALLET_DATA_ROOT ?? "",
           walletState: "ready",
-          wavedConnected: true,
+          nodeConnected: true,
           network: FIXTURE_NETWORK,
           note: "",
         });
@@ -119,8 +122,8 @@ process.stdin.on("data", (chunk) => {
           protocolVersion: 1,
           serviceVersion: "fixture",
           network: FIXTURE_NETWORK,
-          wavedConnected: true,
-          wavedUnavailableReason: "",
+          nodeConnected: true,
+          nodeUnavailableReason: "",
           walletState: "ready",
           vaultState: "absent",
           l402GatewayState: "absent",
@@ -140,11 +143,11 @@ process.stdin.on("data", (chunk) => {
       case "wallet-height":
         if (FIXTURE_NO_WALLET_HEIGHT) {
           respond(id, false, undefined, {
-            code: "WAVED_HEIGHT_UNAVAILABLE",
-            message: "waved getinfo height unavailable (fixture knob)",
-            details: "getinfo is gRPC-only on the pinned waved build (Phase 2 record)",
+            code: "TIP_HEIGHT_UNAVAILABLE",
+            message: "the public tip API is not wired in this slice (OMEGA-DELTA-0303/0304; fixture knob)",
+            details: "the C3-2 slice wires the tip API; until then the escrow gate fails closed",
             retryable: true,
-            remediation: "confirm the live waved getinfo REST shape at the staged operator step",
+            remediation: "the C3-2 slice wires the tip API; no height is ever guessed",
           });
           break;
         }

@@ -204,19 +204,22 @@ impl SovereignWalletSupervisor {
             self.stop().await.ok();
             bail!("sidecar protocol version is incompatible (want {PROTOCOL_VERSION}, got {})", result.protocol_version);
         }
-        // SEC-2026-050 (revised by OMEGA-DELTA-0286): the initialize-reported
-        // network (waved's ACTUAL runtime network from the sidecar's probe)
-        // MUST equal the configured network. `mainnet` is refused UNLESS
-        // configured mainnet AND the allow-mainnet opt-in is present — the
-        // opt-in is re-checked here at startup, never trusting the env alone.
-        let reported = result.waved_network.as_deref().unwrap_or(&result.network);
+        // SEC-2026-050 (revised by OMEGA-DELTA-0286, rail form by
+        // OMEGA-DELTA-0303): the initialize-reported network (the node's
+        // ACTUAL runtime network from the rail's getinfo probe — the `chain`
+        // field when present, else `None`, which is then carried by the env
+        // gate + the invoice HRP guard) MUST equal the configured network.
+        // `mainnet` is refused UNLESS configured mainnet AND the
+        // allow-mainnet opt-in is present — the opt-in is re-checked here at
+        // startup, never trusting the env alone.
+        let reported = result.node_network.as_deref().unwrap_or(&result.network);
         let allow_mainnet =
             std::env::var(crate::ALLOW_MAINNET_ENVIRONMENT_VARIABLE).as_deref() == Ok("1");
         if reported == "mainnet" && !(self.options.network == "mainnet" && allow_mainnet) {
             self.stop().await.ok();
             bail!(
-                "MAINNET_REFUSED: sidecar reported waved on mainnet; child torn down \
-                 (SEC-2026-050; OMEGA-DELTA-0286)"
+                "MAINNET_REFUSED: sidecar reported the node on mainnet; child torn down \
+                 (SEC-2026-050; OMEGA-DELTA-0286/0303)"
             );
         }
         if reported != self.options.network {
@@ -296,8 +299,15 @@ pub async fn health(&mut self) -> Result<HealthResult, crate::client::SovereignW
         command.env("OMEGA_SOVEREIGN_WALLET_NETWORK", &self.options.network);
         command.env("OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN", self.loopback_token.as_str());
         command.env("OMEGA_SOVEREIGN_WALLET_GENERATION", self.generation().to_string());
-        if let Some(waved_bin) = std::env::var_os("OMEGA_SOVEREIGN_WALLET_WAVED_BIN") {
-            command.env("OMEGA_SOVEREIGN_WALLET_WAVED_BIN", waved_bin);
+        // OMEGA-DELTA-0303: the phoenixd rail envs are passed through from the
+        // supervisor's process env (secrets are env-injected, never args —
+        // design §1.3). The waved-era `OMEGA_SOVEREIGN_WALLET_WAVED_BIN` env
+        // is REMOVED with the waved rail (0303 deletion disposition §8.1).
+        if let Some(phoenixd_url) = std::env::var_os("OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL") {
+            command.env("OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL", phoenixd_url);
+        }
+        if let Some(phoenixd_api_key) = std::env::var_os("OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY") {
+            command.env("OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY", phoenixd_api_key);
         }
 
         let mut child = Child::spawn(command, Stdio::piped(), Stdio::piped(), Stdio::piped())

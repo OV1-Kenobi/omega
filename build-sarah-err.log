@@ -1,0 +1,125 @@
+   Compiling settings_content v0.1.0 (C:\Users\ov1kn\omega\crates\settings_content)
+warning: unused variable: `path`
+   --> crates\omega_identity\src\recovery_artifact.rs:209:22
+    |
+209 | fn validate_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), RecoveryArtifactError> {
+    |                      ^^^^ help: if this is intentional, prefix it with an underscore: `_path`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `WeakPermissions` is never constructed
+   --> crates\omega_identity\src\recovery_artifact.rs:252:5
+    |
+248 | pub(crate) enum RecoveryArtifactError {
+    |                 --------------------- variant in this enum
+...
+252 |     WeakPermissions,
+    |     ^^^^^^^^^^^^^^^
+    |
+    = note: `RecoveryArtifactError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `omega_identity` (lib) generated 2 warnings (run `cargo fix --lib -p omega_identity` to apply 1 suggestion)
+   Compiling theme v0.1.0 (C:\Users\ov1kn\omega\crates\theme)
+warning: constant `SHUTDOWN_GRACE_PERIOD` is never used
+  --> crates\omega_effectd\src\supervisor.rs:56:7
+   |
+56 | const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(2);
+   |       ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `omega_effectd` (lib) generated 1 warning
+   Compiling cli v0.1.0 (C:\Users\ov1kn\omega\crates\cli)
+   Compiling omega v0.2.0 (C:\Users\ov1kn\omega\crates\omega)
+   Compiling component v0.1.0 (C:\Users\ov1kn\omega\crates\component)
+   Compiling file_icons v0.1.0 (C:\Users\ov1kn\omega\crates\file_icons)
+   Compiling ui v0.1.0 (C:\Users\ov1kn\omega\crates\ui)
+   Compiling ui_input v0.1.0 (C:\Users\ov1kn\omega\crates\ui_input)
+   Compiling ai_onboarding v0.1.0 (C:\Users\ov1kn\omega\crates\ai_onboarding)
+   Compiling command_center_ui v0.1.0 (C:\Users\ov1kn\omega\crates\command_center_ui)
+   Compiling migrator v0.1.0 (C:\Users\ov1kn\omega\crates\migrator)
+   Compiling settings v0.1.0 (C:\Users\ov1kn\omega\crates\settings)
+   Compiling language v0.1.0 (C:\Users\ov1kn\omega\crates\language)
+   Compiling feature_flags v0.1.0 (C:\Users\ov1kn\omega\crates\feature_flags)
+   Compiling theme_settings v0.1.0 (C:\Users\ov1kn\omega\crates\theme_settings)
+   Compiling remote v0.1.0 (C:\Users\ov1kn\omega\crates\remote)
+   Compiling git_hosting_providers v0.1.0 (C:\Users\ov1kn\omega\crates\git_hosting_providers)
+   Compiling context_server v0.1.0 (C:\Users\ov1kn\omega\crates\context_server)
+   Compiling vim_mode_setting v0.1.0 (C:\Users\ov1kn\omega\crates\vim_mode_setting)
+   Compiling copilot_chat v0.1.0 (C:\Users\ov1kn\omega\crates\copilot_chat)
+   Compiling open_router v0.1.0 (C:\Users\ov1kn\omega\crates\open_router)
+   Compiling terminal v0.1.0 (C:\Users\ov1kn\omega\crates\terminal)
+   Compiling ollama v0.1.0 (C:\Users\ov1kn\omega\crates\ollama)
+   Compiling audio v0.1.0 (C:\Users\ov1kn\omega\crates\audio)
+   Compiling worktree v0.1.0 (C:\Users\ov1kn\omega\crates\worktree)
+   Compiling buffer_diff v0.1.0 (C:\Users\ov1kn\omega\crates\buffer_diff)
+   Compiling client v0.1.0 (C:\Users\ov1kn\omega\crates\client)
+   Compiling markdown v0.1.0 (C:\Users\ov1kn\omega\crates\markdown)
+   Compiling prettier v0.1.0 (C:\Users\ov1kn\omega\crates\prettier)
+   Compiling multi_buffer v0.1.0 (C:\Users\ov1kn\omega\crates\multi_buffer)
+   Compiling prompt_store v0.1.0 (C:\Users\ov1kn\omega\crates\prompt_store)
+   Compiling dap v0.1.0 (C:\Users\ov1kn\omega\crates\dap)
+   Compiling edit_prediction_types v0.1.0 (C:\Users\ov1kn\omega\crates\edit_prediction_types)
+   Compiling extension v0.1.0 (C:\Users\ov1kn\omega\crates\extension)
+   Compiling snippet_provider v0.1.0 (C:\Users\ov1kn\omega\crates\snippet_provider)
+   Compiling project v0.1.0 (C:\Users\ov1kn\omega\crates\project)
+   Compiling channel v0.1.0 (C:\Users\ov1kn\omega\crates\channel)
+   Compiling theme_extension v0.1.0 (C:\Users\ov1kn\omega\crates\theme_extension)
+   Compiling debug_adapter_extension v0.1.0 (C:\Users\ov1kn\omega\crates\debug_adapter_extension)
+   Compiling web_search_providers v0.1.0 (C:\Users\ov1kn\omega\crates\web_search_providers)
+   Compiling zlog_settings v0.1.0 (C:\Users\ov1kn\omega\crates\zlog_settings)
+   Compiling agent_settings v0.1.0 (C:\Users\ov1kn\omega\crates\agent_settings)
+   Compiling workspace v0.1.0 (C:\Users\ov1kn\omega\crates\workspace)
+   Compiling action_log v0.1.0 (C:\Users\ov1kn\omega\crates\action_log)
+   Compiling extension_host v0.1.0 (C:\Users\ov1kn\omega\crates\extension_host)
+   Compiling json_schema_store v0.1.0 (C:\Users\ov1kn\omega\crates\json_schema_store)
+   Compiling language_extension v0.1.0 (C:\Users\ov1kn\omega\crates\language_extension)
+   Compiling acp_thread v0.1.0 (C:\Users\ov1kn\omega\crates\acp_thread)
+   Compiling languages v0.1.0 (C:\Users\ov1kn\omega\crates\languages)
+   Compiling agent_servers v0.1.0 (C:\Users\ov1kn\omega\crates\agent_servers)
+   Compiling breadcrumbs v0.1.0 (C:\Users\ov1kn\omega\crates\breadcrumbs)
+   Compiling command_palette_hooks v0.1.0 (C:\Users\ov1kn\omega\crates\command_palette_hooks)
+   Compiling picker v0.1.0 (C:\Users\ov1kn\omega\crates\picker)
+   Compiling editor v0.1.0 (C:\Users\ov1kn\omega\crates\editor)
+   Compiling auto_update v0.1.0 (C:\Users\ov1kn\omega\crates\auto_update)
+   Compiling copilot v0.1.0 (C:\Users\ov1kn\omega\crates\copilot)
+   Compiling notifications v0.1.0 (C:\Users\ov1kn\omega\crates\notifications)
+   Compiling copilot_ui v0.1.0 (C:\Users\ov1kn\omega\crates\copilot_ui)
+   Compiling remote_connection v0.1.0 (C:\Users\ov1kn\omega\crates\remote_connection)
+   Compiling panel v0.1.0 (C:\Users\ov1kn\omega\crates\panel)
+   Compiling picker_preview v0.1.0 (C:\Users\ov1kn\omega\crates\picker_preview)
+   Compiling search v0.1.0 (C:\Users\ov1kn\omega\crates\search)
+   Compiling git_ui v0.1.0 (C:\Users\ov1kn\omega\crates\git_ui)
+   Compiling language_models v0.1.0 (C:\Users\ov1kn\omega\crates\language_models)
+   Compiling platform_title_bar v0.1.0 (C:\Users\ov1kn\omega\crates\platform_title_bar)
+   Compiling command_palette v0.1.0 (C:\Users\ov1kn\omega\crates\command_palette)
+   Compiling terminal_view v0.1.0 (C:\Users\ov1kn\omega\crates\terminal_view)
+   Compiling agent v0.1.0 (C:\Users\ov1kn\omega\crates\agent)
+   Compiling project_panel v0.1.0 (C:\Users\ov1kn\omega\crates\project_panel)
+   Compiling settings_ui v0.1.0 (C:\Users\ov1kn\omega\crates\settings_ui)
+   Compiling vim v0.1.0 (C:\Users\ov1kn\omega\crates\vim)
+   Compiling full_auto_ui v0.1.0 (C:\Users\ov1kn\omega\crates\full_auto_ui)
+   Compiling component_library v0.1.0 (C:\Users\ov1kn\omega\crates\component_library)
+   Compiling market_ui v0.1.0 (C:\Users\ov1kn\omega\crates\market_ui)
+   Compiling agent_ui v0.1.0 (C:\Users\ov1kn\omega\crates\agent_ui)
+   Compiling trading_workspace_ui v0.1.0 (C:\Users\ov1kn\omega\crates\trading_workspace_ui)
+   Compiling open_path_prompt v0.1.0 (C:\Users\ov1kn\omega\crates\open_path_prompt)
+   Compiling lnmarkets_ui v0.1.0 (C:\Users\ov1kn\omega\crates\lnmarkets_ui)
+   Compiling onboarding v0.1.0 (C:\Users\ov1kn\omega\crates\onboarding)
+   Compiling file_finder v0.1.0 (C:\Users\ov1kn\omega\crates\file_finder)
+   Compiling lnmarkets v0.1.0 (C:\Users\ov1kn\omega\crates\lnmarkets)
+   Compiling acp_tools v0.1.0 (C:\Users\ov1kn\omega\crates\acp_tools)
+   Compiling account_ui v0.1.0 (C:\Users\ov1kn\omega\crates\account_ui)
+   Compiling workroom_ui v0.1.0 (C:\Users\ov1kn\omega\crates\workroom_ui)
+   Compiling nautilus_governance v0.1.0 (C:\Users\ov1kn\omega\crates\nautilus_governance)
+   Compiling title_bar v0.1.0 (C:\Users\ov1kn\omega\crates\title_bar)
+   Compiling omega_convex v0.1.0 (C:\Users\ov1kn\omega\crates\omega_convex)
+   Compiling lsp_locations v0.1.0 (C:\Users\ov1kn\omega\crates\lsp_locations)
+   Compiling language_tools v0.1.0 (C:\Users\ov1kn\omega\crates\language_tools)
+   Compiling activity_indicator v0.1.0 (C:\Users\ov1kn\omega\crates\activity_indicator)
+   Compiling agent_computer_ui v0.1.0 (C:\Users\ov1kn\omega\crates\agent_computer_ui)
+   Compiling go_to_line v0.1.0 (C:\Users\ov1kn\omega\crates\go_to_line)
+   Compiling ui_prompt v0.1.0 (C:\Users\ov1kn\omega\crates\ui_prompt)
+   Compiling etw_tracing v0.1.0 (C:\Users\ov1kn\omega\crates\etw_tracing)
+    Finished `release-fast` profile [optimized + debuginfo] target(s) in 23m 37s

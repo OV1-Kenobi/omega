@@ -55,11 +55,14 @@ fn flag_is_off_by_default() {
 
 #[test]
 fn supervisor_refuses_mainnet_at_config() {
-    // OMEGA-DELTA-0286 (updated-with-citation): the refusal remains for the
-    // UN-OPTED-IN case — `mainnet` construction requires
+    // OMEGA-DELTA-0286 (updated-with-citation to 0303): the refusal remains
+    // for the UN-OPTED-IN case — `mainnet` construction requires
     // OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1 at the process level; without
     // it the exact refusal stays. The gated construction path is covered by
-    // `supervisor_accepts_opted_in_mainnet_at_config` below.
+    // `supervisor_accepts_opted_in_mainnet_at_config` below. (0303: the
+    // STARTING rail additionally requires the phoenixd envs — the rail gate,
+    // design §2.6.2 — enforced sidecar-side; the construction gate here is
+    // unchanged.)
     crate::test_support::assert_allow_mainnet_opt_in_absent(|| {
         let options = default_options(
             PathBuf::from(std::env::temp_dir()),
@@ -79,9 +82,11 @@ fn supervisor_refuses_mainnet_at_config() {
 
 #[test]
 fn supervisor_accepts_opted_in_mainnet_at_config() {
-    // OMEGA-DELTA-0286: with the explicit allow-mainnet opt-in at the
-    // process level, a mainnet-configured supervisor constructs (the sidecar
-    // env gate and the runtime assertion are covered by the sidecar suite).
+    // OMEGA-DELTA-0286 (updated-with-citation to 0303): with the explicit
+    // allow-mainnet opt-in at the process level, a mainnet-configured
+    // supervisor constructs (the sidecar env gate, the rail gate — phoenixd
+    // envs required for a mainnet START — and the runtime assertion are
+    // covered by the sidecar suite).
     crate::test_support::with_allow_mainnet_opt_in(|| {
         let options = default_options(
             PathBuf::from(std::env::temp_dir()),
@@ -103,13 +108,13 @@ fn initialize_health_balance_round_trip() {
             .expect("supervisor");
         let initialize = supervisor.start().await.context("initialize handshake").unwrap();
         assert_eq!(initialize.network, "signet");
-        assert_eq!(initialize.waved_network.as_deref(), Some("signet"));
+        assert_eq!(initialize.node_network.as_deref(), Some("signet"));
         assert_eq!(initialize.protocol_version, 1);
 
         let health = supervisor.health().await.context("health").unwrap();
         assert!(health.ok);
         assert_eq!(health.network, "signet");
-        assert!(health.waved_connected);
+        assert!(health.node_connected);
 
         let status = supervisor.status().await.context("status").unwrap();
         assert_eq!(status.network, "signet");
@@ -130,12 +135,12 @@ fn initialize_health_balance_round_trip() {
 #[test]
 fn mainnet_runtime_report_is_a_hard_bail() {
     smol::block_on(async {
-        // SEC-2026-050 (OMEGA-DELTA-0286, updated-with-citation): the
-        // supervisor refuses the initialize-reported network (waved's ACTUAL
-        // runtime network from the sidecar probe), not just the env value.
-        // A mainnet report on a SIGNET-configured supervisor is still a
-        // hard bail — mainnet is accepted only when configured mainnet AND
-        // opted in (covered by
+        // SEC-2026-050 (OMEGA-DELTA-0286, rail form OMEGA-DELTA-0303): the
+        // supervisor refuses the initialize-reported network (the node's
+        // ACTUAL runtime network from the rail's getinfo probe), not just the
+        // env value. A mainnet report on a SIGNET-configured supervisor is
+        // still a hard bail — mainnet is accepted only when configured
+        // mainnet AND opted in (covered by
         // `mainnet_runtime_report_is_accepted_when_configured_and_opted_in`).
         let mut supervisor =
             make_supervisor("signet", fixture_command_with_network(&fixture_path(), "mainnet"))
@@ -171,7 +176,7 @@ fn mainnet_runtime_report_is_accepted_when_configured_and_opted_in() {
             .expect("supervisor");
             let initialize = supervisor.start().await.context("initialize").unwrap();
             assert_eq!(initialize.network, "mainnet");
-            assert_eq!(initialize.waved_network.as_deref(), Some("mainnet"));
+            assert_eq!(initialize.node_network.as_deref(), Some("mainnet"));
             assert_eq!(supervisor.network(), "mainnet");
             supervisor.stop().await.ok();
         });
@@ -181,10 +186,10 @@ fn mainnet_runtime_report_is_accepted_when_configured_and_opted_in() {
 #[test]
 fn unsupported_runtime_network_is_refused() {
     smol::block_on(async {
-        // OMEGA-DELTA-0286 (updated-with-citation): the assertion is now
-        // "reported MUST equal configured" — `testnet` remains unsupported
-        // (a testnet report on a signet-configured supervisor is a mismatch,
-        // refused; a testnet-configured supervisor cannot even be
+        // OMEGA-DELTA-0286 (updated-with-citation to 0303): the assertion is
+        // now "reported MUST equal configured" — `testnet` remains
+        // unsupported (a testnet report on a signet-configured supervisor is
+        // a mismatch, refused; a testnet-configured supervisor cannot even be
         // constructed — the config gate refuses it).
         let mut supervisor =
             make_supervisor("signet", fixture_command_with_network(&fixture_path(), "testnet"))
@@ -339,9 +344,13 @@ fn over_settlement_auto_kills_the_surface_fail_closed() {
 }
 
 #[test]
-fn wallet_height_round_trips_the_observed_daemon_tip() {
+fn wallet_height_round_trips_the_observed_tip() {
     // WP-4b (SEC-2026-087): the tip is read through the sidecar `wallet-height`
-    // seam. Daemon-level: answers while the wallet surface is still untouched.
+    // seam. This test drives the PROTOCOL FIXTURE (which answers a height);
+    // the REAL sidecar's wallet-height fails closed with
+    // TIP_HEIGHT_UNAVAILABLE in this slice (OMEGA-DELTA-0303) — covered by the
+    // sidecar suite; the C3-2 slice wires the tip API (0304) and the fixture
+    // keeps answering.
     smol::block_on(async {
         let mut supervisor = make_supervisor("signet", fixture_command(&fixture_path()))
             .expect("supervisor");
@@ -354,10 +363,9 @@ fn wallet_height_round_trips_the_observed_daemon_tip() {
 
 #[test]
 fn wallet_height_unavailable_is_a_typed_fail_closed_error() {
-    // WP-4b (SEC-2026-087): when the waved build does not serve the REST
-    // getinfo surface (the pinned build's recorded posture), no tip exists —
-    // the typed error forces the escrow caller to fail closed instead of
-    // substituting wall-clock.
+    // OMEGA-DELTA-0303/0304: when the tip source does not answer, no tip
+    // exists — the typed TIP_HEIGHT_UNAVAILABLE error forces the escrow
+    // caller to fail closed instead of substituting wall-clock.
     smol::block_on(async {
         let command = {
             let mut command = fixture_command(&fixture_path());
@@ -372,9 +380,9 @@ fn wallet_height_unavailable_is_a_typed_fail_closed_error() {
             .expect_err("the height probe must fail closed");
         match error {
             SovereignWalletError::Protocol { code, .. } => {
-                assert_eq!(code, crate::ErrorCode::WavedHeightUnavailable);
+                assert_eq!(code, crate::ErrorCode::TipHeightUnavailable);
             }
-            other => panic!("expected a typed WavedHeightUnavailable error, got: {other:?}"),
+            other => panic!("expected a typed TipHeightUnavailable error, got: {other:?}"),
         }
         supervisor.stop().await.context("stop").unwrap();
     });

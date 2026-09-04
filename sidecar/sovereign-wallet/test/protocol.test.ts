@@ -1,8 +1,19 @@
 //! End-to-end protocol round-trip tests: real sidecar process (dist/main.js)
-//! driven over the framed stdio protocol against a fake waved daemon.
-//! Covers: full wallet flow, signet-only refusal (env + runtime), wallet-API
-//! probe fail-closed, lock semantics, idempotency, generation fencing, frame
-//! bounds, HTTP surface auth, secret redaction on stderr.
+//! driven over the framed stdio protocol against a fake phoenixd node
+//! (OMEGA-DELTA-0303 — the waved fixture is replaced; the sidecar is a
+//! client-only process for the phoenixd rail, so the test harness owns the
+//! fake node's lifecycle and points OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL at
+//! it). Covers: the node rail flow, signet-only refusal (env + runtime),
+//! node-probe fail-closed, the fail-closed wallet-height seam, idempotency,
+//! generation fencing, frame bounds, HTTP surface auth, secret redaction on
+//! stderr.
+//!
+//! Updated-with-citation (OMEGA-DELTA-0303): the waved ceremony
+//! (create-wallet/unlock/lock) and the waved lifecycle are REMOVED with the
+//! rail — those verbs answer named fail-closed errors; balance/activity fail
+//! closed until their phoenixd re-point lands in a later C3 slice;
+//! wallet-height fails closed with TIP_HEIGHT_UNAVAILABLE until the C3-2
+//! slice wires the public tip API (OMEGA-DELTA-0304).
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -17,7 +28,9 @@ import { generateLoopbackToken } from "../dist/http.js";
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "..", "..");
 const MAIN_JS = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "dist", "main.js");
-const FAKE_WAVED_CMD = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "test", "fixtures", "fake-waved.cmd");
+const FAKE_PHOENIXD_CMD = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "test", "fixtures", "fake-phoenixd.cmd");
+/** The fixture's Basic-auth password (RV-C1: the username is not validated). */
+const FAKE_PHOENIXD_API_KEY = "fixture-phoenixd-api-key";
 
 let portCounter = 11100;
 
@@ -29,29 +42,66 @@ function nextPort(): number {
 
 interface Sidecar {
   child: ChildProcess;
+  /** The fake phoenixd child (owned by the test harness; killed on close). */
+  fakeNode: ChildProcess;
   request(method: string, params?: Record<string, unknown>, generation?: number): Promise<Record<string, unknown>>;
   close(): Promise<number | null>;
   stderrText(): string;
 }
 
-function spawnSidecar(overrides: Record<string, string>): Sidecar {
+/** Start the fake phoenixd node and wait for its "listening" line. */
+async function startFakePhoenixd(port: number, overrides: Record<string, string>): Promise<ChildProcess> {
+  const fakeNode = spawn(FAKE_PHOENIXD_CMD, [], {
+    env: {
+      FAKE_PHOENIXD_PORT: String(port),
+      FAKE_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
+      FAKE_PHOENIXD_CHAIN: overrides.FAKE_PHOENIXD_CHAIN ?? "signet",
+      FAKE_PHOENIXD_MODE: overrides.FAKE_PHOENIXD_MODE ?? "normal",
+      FAKE_PHOENIXD_INVOICE_HRP: overrides.FAKE_PHOENIXD_INVOICE_HRP ?? "lntbs100u",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  fakeNode.stdout?.setEncoding("utf8");
+  fakeNode.stderr?.setEncoding("utf8");
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("fake-phoenixd did not listen in time")), 10_000);
+    const onData = (chunk: string): void => {
+      if (chunk.includes("listening")) {
+        clearTimeout(timer);
+        fakeNode.stdout?.removeListener("data", onData);
+        resolve();
+      }
+    };
+    fakeNode.stdout?.on("data", onData);
+    fakeNode.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`fake-phoenixd exited early with code ${code}`));
+    });
+  });
+  return fakeNode;
+}
+
+/**
+ * Spawn a real sidecar against a per-test fake phoenixd node. The phoenixd
+ * rail is client-only (OMEGA-DELTA-0303), so the TEST owns the fake node's
+ * lifecycle; the sidecar's rail envs point at it.
+ */
+async function spawnSidecar(overrides: Record<string, string>): Promise<Sidecar> {
   const dataRoot = mkdtempSync(path.join(tmpdir(), "sw-sidecar-"));
   const port = nextPort();
   const token = generateLoopbackToken();
+  const fakeNode = await startFakePhoenixd(port, overrides);
   const env: Record<string, string> = {
     OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot,
     OMEGA_SOVEREIGN_WALLET_NETWORK: "signet",
     OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN: token,
-    OMEGA_SOVEREIGN_WALLET_WAVED_BIN: FAKE_WAVED_CMD,
-    OMEGA_SOVEREIGN_WALLET_WAVED_REST_PORT: String(port),
+    OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: `http://127.0.0.1:${port}`,
+    OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
     // OMEGA-DELTA-0301 (RV6-REQ-1): the TEST-ONLY in-memory keychain seam —
     // the e2e process must never touch the real OS keychain. Production never
     // sets this; the default is the OS-keychain binding.
     OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN: "memory",
-    FAKE_WAVED_NETWORK: "signet",
-    FAKE_WAVED_MODE: "normal",
-    FAKE_WAVED_PORT: String(port),
-    FAKE_WAVED_DATA_ROOT: dataRoot,
     ...overrides,
   };
   const child = spawn(process.execPath, [MAIN_JS], {
@@ -106,8 +156,9 @@ function spawnSidecar(overrides: Record<string, string>): Sidecar {
       child.stdin?.write(`${JSON.stringify(frame)}\n`);
     });
 
-const close = async (): Promise<number | null> => {
+  const close = async (): Promise<number | null> => {
     killTree(child.pid);
+    killTree(fakeNode.pid);
     if (!child.pid) child.kill();
     await new Promise<void>((resolve) => {
       if (child.exitCode !== null) {
@@ -132,7 +183,7 @@ const close = async (): Promise<number | null> => {
     return child.exitCode;
   };
 
-  return { child, request, close, stderrText: () => stderrBuffer };
+  return { child, fakeNode, request, close, stderrText: () => stderrBuffer };
 }
 
 function expectOk(response: Record<string, unknown>): Record<string, unknown> {
@@ -178,52 +229,47 @@ async function cleanupDir(dir: string): Promise<void> {
   }
 }
 
-describe("protocol round-trip against fake waved", () => {
-  it("full wallet flow: initialize/status/balance/create/unlock/make-invoice/pay-invoice/activity", async () => {
-    const sidecar = spawnSidecar({});
+describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)", () => {
+  it("node rail flow: initialize/status/make-invoice/pay-invoice; the waved ceremony verbs fail closed", async () => {
+    const sidecar = await spawnSidecar({});
     try {
       const initialize = expectOk(await sidecar.request("initialize"));
       assert.equal(initialize.schema, "openagents.omega.sovereign-wallet.v1");
       assert.equal(initialize.network, "signet");
-      assert.equal(initialize.wavedState, "connected");
-      assert.equal(initialize.wavedNetwork, "signet"); // SEC-2026-050: actual runtime network
+      assert.equal(initialize.nodeState, "connected");
+      assert.equal(initialize.nodeNetwork, "signet"); // SEC-2026-050 (rail form): actual runtime network
 
       const health = expectOk(await sidecar.request("health"));
       assert.equal(health.ok, true);
-      assert.equal(health.wavedConnected, true);
-      assert.equal(health.walletState, "none");
+      assert.equal(health.nodeConnected, true);
 
       const status = expectOk(await sidecar.request("status"));
       assert.equal(status.network, "signet");
+      assert.equal(status.nodeConnected, true);
       // WP-4 (OMEGA-DELTA-0284): the vault is now a real surface. In a fresh
       // data root it is "none" (no vault initialized), not the WP-3 "absent"
       // stub marker.
       assert.equal(status.vaultState, "none");
 
-      // Wallet not created: balance refuses with WALLET_LOCKED-class error.
-      const lockedBalance = expectError(await sidecar.request("balance"));
-      assert.equal(lockedBalance.code, "WALLET_LOCKED");
-
-// Operator-only create -> unlock -> balance.
-      const created = expectOk(await sidecar.request("create-wallet", {
+      // OMEGA-DELTA-0303: the waved ceremony verbs are REMOVED with the rail —
+      // they answer named fail-closed errors (the phoenixd node is remote and
+      // operator-managed; the API key is the access).
+      const createRefused = expectError(await sidecar.request("create-wallet", {
         idempotencyKey: "11111111-1111-4111-8111-111111111111",
         password: "correct horse battery staple",
       }));
-      assert.equal(Array.isArray(created.mnemonic), true);
-      assert.equal((created.mnemonic as string[]).length, 24);
-      // WP-5 seam: with the vault locked/absent the capture is reported
-      // HONESTLY as not vaulted (operator-held password + paper aezeed).
-      assert.equal(created.walletDbPasswordVaulted, false);
-      assert.equal(typeof created.note, "string");
-
-      const unlocked = expectOk(await sidecar.request("unlock", {
+      assert.equal(createRefused.code, "INTERNAL");
+      assert.match(createRefused.message, /phoenixd rail/);
+      const unlockRefused = expectError(await sidecar.request("unlock", {
         idempotencyKey: "22222222-2222-4222-8222-222222222222",
         password: "correct horse battery staple",
       }));
-      assert.equal(typeof unlocked.identityPubkey, "string");
+      assert.equal(unlockRefused.code, "INTERNAL");
 
-      const balance = expectOk(await sidecar.request("balance"));
-      assert.equal(balance.confirmedSat, "12345");
+      // balance/activity fail closed until their phoenixd re-point lands.
+      const balanceRefused = expectError(await sidecar.request("balance"));
+      assert.equal(balanceRefused.code, "INTERNAL");
+      assert.match(balanceRefused.message, /balance is not yet wired/);
 
       const invoice = expectOk(await sidecar.request("make-invoice", {
         amtSat: 10_000,
@@ -236,11 +282,16 @@ describe("protocol round-trip against fake waved", () => {
         invoice: "lntbs10u1p0example",
         idempotencyKey: "44444444-4444-4444-8444-444444444444",
       }));
-      assert.equal(paid.status, "ENTRY_STATUS_PENDING");
-      assert.equal(paid.preimage, "b".repeat(64)); // proof of payment to the operator
+      assert.equal(paid.status, "settled"); // phoenixd payment_sent
+      assert.equal(paid.preimage, "b".repeat(64)); // proof of payment to the operator (RV-C2: present)
+      // OMEGA-DELTA-0300: the loss-rule bound — expected total outflow =
+      // invoice amount (10u = 1,000 sats) + 0.4% fee (4 sats) = 1004.
+      assert.equal(paid.expectedTotalOutflowSat, "1004");
+      assert.equal(paid.totalOutflowKnown, true);
 
-      const activity = expectOk(await sidecar.request("activity"));
-      assert.equal(Array.isArray(activity.entries), true);
+      const activityRefused = expectError(await sidecar.request("activity"));
+      assert.equal(activityRefused.code, "INTERNAL");
+      assert.match(activityRefused.message, /activity is not yet wired/);
 
       const identity = expectOk(await sidecar.request("identity-status"));
       // WP-4 (OMEGA-DELTA-0284): the identity-status stub is now wired to real
@@ -258,17 +309,9 @@ describe("protocol round-trip against fake waved", () => {
   });
 
   it("idempotency: a duplicate make-invoice key replays the stored invoice", async () => {
-    const sidecar = spawnSidecar({});
+    const sidecar = await spawnSidecar({});
     try {
       await sidecar.request("initialize");
-      await sidecar.request("create-wallet", {
-        idempotencyKey: "11111111-1111-4111-8111-111111111111",
-        password: "correct horse battery staple",
-      });
-      await sidecar.request("unlock", {
-        idempotencyKey: "22222222-2222-4222-8222-222222222222",
-        password: "correct horse battery staple",
-      });
       const first = expectOk(
         await sidecar.request("make-invoice", { amtSat: 1000, memo: "a", idempotencyKey: "33333333-3333-4333-8333-333333333333" }),
       );
@@ -282,17 +325,9 @@ describe("protocol round-trip against fake waved", () => {
   });
 
   it("SEC-2026-047: a duplicate pay-invoice key replays a PREIMAGE-FREE cached result", async () => {
-    const sidecar = spawnSidecar({});
+    const sidecar = await spawnSidecar({});
     try {
       await sidecar.request("initialize");
-      await sidecar.request("create-wallet", {
-        idempotencyKey: "11111111-1111-4111-8111-111111111111",
-        password: "correct horse battery staple",
-      });
-      await sidecar.request("unlock", {
-        idempotencyKey: "22222222-2222-4222-8222-222222222222",
-        password: "correct horse battery staple",
-      });
       const first = expectOk(
         await sidecar.request("pay-invoice", {
           invoice: "lntbs10u1p0example",
@@ -313,29 +348,20 @@ describe("protocol round-trip against fake waved", () => {
     }
   });
 
-  it("lock: after lock(), wallet RPCs refuse with WALLET_LOCKED until unlock", async () => {
-    const sidecar = spawnSidecar({});
+  it("OMEGA-DELTA-0303: lock() is a named fail-closed error on the phoenixd rail (the vault lock still applies)", async () => {
+    const sidecar = await spawnSidecar({});
     try {
       await sidecar.request("initialize");
-      await sidecar.request("create-wallet", {
-        idempotencyKey: "11111111-1111-4111-8111-111111111111",
-        password: "correct horse battery staple",
-      });
-      await sidecar.request("unlock", {
-        idempotencyKey: "22222222-2222-4222-8222-222222222222",
-        password: "correct horse battery staple",
-      });
-      const locked = expectOk(await sidecar.request("lock"));
-      assert.equal(locked.walletState, "locked");
-      const refused = expectError(await sidecar.request("balance"));
-      assert.equal(refused.code, "WALLET_LOCKED");
+      const refused = expectError(await sidecar.request("lock"));
+      assert.equal(refused.code, "INTERNAL");
+      assert.match(refused.message, /phoenixd rail/);
     } finally {
       await sidecar.close();
     }
   });
 
   it("generation fencing: a stale generation is refused with STALE_GENERATION", async () => {
-    const sidecar = spawnSidecar({});
+    const sidecar = await spawnSidecar({});
     try {
       const initialize = expectOk(await sidecar.request("initialize"));
       assert.equal(initialize.generation, 1);
@@ -346,52 +372,68 @@ describe("protocol round-trip against fake waved", () => {
     }
   });
 
-  it("WP-4b (SEC-2026-087): wallet-height returns the observed daemon tip height", async () => {
-    const sidecar = spawnSidecar({});
+  it("OMEGA-DELTA-0303: wallet-height fails closed with TIP_HEIGHT_UNAVAILABLE (the C3-2 slice wires the tip API)", async () => {
+    const sidecar = await spawnSidecar({});
     try {
       await sidecar.request("initialize");
-      // Daemon-level read: works while the wallet is still locked (no wallet
-      // created yet), because the tip does not depend on the wallet surface.
-      const height = expectOk(await sidecar.request("wallet-height"));
-      assert.equal(height.blockHeight, 250000);
+      const refused = expectError(await sidecar.request("wallet-height"));
+      assert.equal(refused.code, "TIP_HEIGHT_UNAVAILABLE");
+      assert.match(refused.message, /OMEGA-DELTA-0304/);
     } finally {
       await sidecar.close();
     }
   });
 
-  it("WP-4b (SEC-2026-087): a waved without a REST getinfo surface fails closed with WAVED_HEIGHT_UNAVAILABLE", async () => {
-    const sidecar = spawnSidecar({ FAKE_WAVED_MODE: "no-getinfo" });
+  it("OMEGA-DELTA-0303: a node without a working getinfo is a named node-unreachable state", async () => {
+    const sidecar = await spawnSidecar({ FAKE_PHOENIXD_MODE: "no-getinfo" });
     try {
-      await sidecar.request("initialize");
-      const refused = expectError(await sidecar.request("wallet-height"));
-      assert.equal(refused.code, "WAVED_HEIGHT_UNAVAILABLE");
+      const initialize = expectOk(await sidecar.request("initialize"));
+      assert.equal(initialize.nodeState, "unavailable");
+      const health = expectOk(await sidecar.request("health"));
+      assert.equal(health.nodeConnected, false);
+      const status = expectOk(await sidecar.request("status"));
+      assert.match(String(status.nodeUnavailableReason ?? ""), /phoenixd node unreachable/);
     } finally {
       await sidecar.close();
     }
   });
 
   it("OMEGA-DELTA-0286: mainnet env WITHOUT the opt-in is refused at startup (MAINNET_REFUSED)", async () => {
-    const sidecar = spawnSidecar({ OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet" });
+    const sidecar = await spawnSidecar({ OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet" });
     const exitCode = await waitForExit(sidecar.child);
     assert.notEqual(exitCode, 0);
     assert.match(sidecar.stderrText(), /MAINNET_REFUSED/);
     await sidecar.close();
   });
 
-  it("OMEGA-DELTA-0286: mainnet env WITH the opt-in configures mainnet (reported == configured)", async () => {
-    const sidecar = spawnSidecar({
+  it("OMEGA-DELTA-0303: a mainnet rail WITHOUT the phoenixd envs is refused at startup (rail gate)", async () => {
+    // The rail gate (design §2.6.2): mainnet with no configured node
+    // connection is a configuration error, never a silent zero.
+    const sidecar = await spawnSidecar({
       OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
       OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
-      FAKE_WAVED_NETWORK: "mainnet",
+      OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: "",
+    });
+    const exitCode = await waitForExit(sidecar.child);
+    assert.notEqual(exitCode, 0);
+    assert.match(sidecar.stderrText(), /NODE_UNCONFIGURED/);
+    await sidecar.close();
+  });
+
+  it("OMEGA-DELTA-0286/0303: mainnet env WITH the opt-in + the phoenixd rail configures mainnet (reported == configured)", async () => {
+    const sidecar = await spawnSidecar({
+      OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
+      OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
+      FAKE_PHOENIXD_CHAIN: "mainnet",
     });
     try {
       const initialize = expectOk(await sidecar.request("initialize"));
       assert.equal(initialize.network, "mainnet");
-      // SEC-2026-050 (0286 revision): the probed runtime network must equal
-      // the configured network — mainnet accepted only when configured
-      // mainnet AND the opt-in is present.
-      assert.equal(initialize.wavedNetwork, "mainnet");
-      assert.equal(initialize.wavedState, "connected");
+      // SEC-2026-050 (0286 revision, rail form): the probed runtime network
+      // must equal the configured network — mainnet accepted only when
+      // configured mainnet AND the opt-in is present.
+      assert.equal(initialize.nodeNetwork, "mainnet");
+      assert.equal(initialize.nodeState, "connected");
       const health = expectOk(await sidecar.request("health"));
       assert.equal(health.ok, true);
       assert.equal(health.network, "mainnet");
@@ -401,50 +443,38 @@ describe("protocol round-trip against fake waved", () => {
   });
 
   it("an unset network never defaults to mainnet (design §3.2)", async () => {
-    const sidecar = spawnSidecar({ OMEGA_SOVEREIGN_WALLET_NETWORK: "" });
+    const sidecar = await spawnSidecar({ OMEGA_SOVEREIGN_WALLET_NETWORK: "" });
     const exitCode = await waitForExit(sidecar.child);
     assert.notEqual(exitCode, 0);
     assert.match(sidecar.stderrText(), /must be signet, regtest, or mainnet/);
     await sidecar.close();
   });
 
-  it("SEC-2026-050 (OMEGA-DELTA-0286): waved reporting mainnet at runtime is refused when not configured mainnet (MAINNET_REFUSED)", async () => {
-    const sidecar = spawnSidecar({ FAKE_WAVED_NETWORK: "mainnet" });
+  it("SEC-2026-050 (OMEGA-DELTA-0286/0303): the node reporting mainnet at runtime is refused when not configured mainnet (MAINNET_REFUSED)", async () => {
+    const sidecar = await spawnSidecar({ FAKE_PHOENIXD_CHAIN: "mainnet" });
     const exitCode = await waitForExit(sidecar.child);
     assert.notEqual(exitCode, 0);
     assert.match(sidecar.stderrText(), /MAINNET_REFUSED/);
     await sidecar.close();
   });
 
-  it("wallet-API probe: an Unimplemented waved is a named fail-closed state", async () => {
-    const sidecar = spawnSidecar({ FAKE_WAVED_MODE: "unimplemented" });
+  it("OMEGA-DELTA-0303: a missing phoenixd rail env is a named unavailable state, not a silent zero", async () => {
+    const sidecar = await spawnSidecar({ OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: "" });
     try {
       const initialize = expectOk(await sidecar.request("initialize"));
-      assert.equal(initialize.wavedState, "unavailable");
-      const health = expectOk(await sidecar.request("health"));
-      assert.equal(health.wavedConnected, false);
-      const status = expectOk(await sidecar.request("status"));
-      assert.match(String(status.wavedUnavailableReason ?? ""), /WAVED_WALLET_API_UNAVAILABLE|Unimplemented/);
-    } finally {
-      await sidecar.close();
-    }
-  });
-
-  it("missing waved binary is a named unavailable state, not a silent zero", async () => {
-    const sidecar = spawnSidecar({ OMEGA_SOVEREIGN_WALLET_WAVED_BIN: "" });
-    try {
-      const initialize = expectOk(await sidecar.request("initialize"));
-      assert.equal(initialize.wavedState, "unavailable");
+      assert.equal(initialize.nodeState, "unavailable");
       const health = expectOk(await sidecar.request("health"));
       assert.equal(health.ok, true);
-      assert.equal(health.wavedConnected, false);
+      assert.equal(health.nodeConnected, false);
+      const status = expectOk(await sidecar.request("status"));
+      assert.match(String(status.nodeUnavailableReason ?? ""), /NODE_UNCONFIGURED/);
     } finally {
       await sidecar.close();
     }
   });
 
   it("an oversized frame is refused (frame bound)", async () => {
-    const sidecar = spawnSidecar({});
+    const sidecar = await spawnSidecar({});
     try {
       await sidecar.request("initialize");
       const huge = "x".repeat(70 * 1024);
@@ -470,18 +500,10 @@ describe("protocol round-trip against fake waved", () => {
     }
   });
 
-  it("OMEGA-DELTA-0286: mainnet invoices are refused on pay on a signet-configured wallet (lnbc prefix guard)", async () => {
-    const sidecar = spawnSidecar({});
+  it("OMEGA-DELTA-0286: mainnet invoices are refused on pay on a signet-configured rail (lnbc prefix guard)", async () => {
+    const sidecar = await spawnSidecar({});
     try {
       await sidecar.request("initialize");
-      await sidecar.request("create-wallet", {
-        idempotencyKey: "11111111-1111-4111-8111-111111111111",
-        password: "correct horse battery staple",
-      });
-      await sidecar.request("unlock", {
-        idempotencyKey: "22222222-2222-4222-8222-222222222222",
-        password: "correct horse battery staple",
-      });
       const refused = expectError(
         await sidecar.request("pay-invoice", {
           invoice: "lnbc10u1p0example",
@@ -494,26 +516,18 @@ describe("protocol round-trip against fake waved", () => {
     }
   });
 
-  it("OMEGA-DELTA-0286: a mainnet-configured wallet mints and pays lnbc (never lnbcrt); mismatched HRP refused on mint AND pay", async () => {
-    const sidecar = spawnSidecar({
+  it("OMEGA-DELTA-0286/0303: a mainnet-configured rail mints and pays lnbc (never lnbcrt); mismatched HRP refused on mint AND pay", async () => {
+    const sidecar = await spawnSidecar({
       OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
       OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
-      FAKE_WAVED_NETWORK: "mainnet",
-      FAKE_WAVED_INVOICE_HRP: "lnbc100u",
+      FAKE_PHOENIXD_CHAIN: "mainnet",
+      FAKE_PHOENIXD_INVOICE_HRP: "lnbc100u",
     });
     try {
       await sidecar.request("initialize");
-      await sidecar.request("create-wallet", {
-        idempotencyKey: "11111111-1111-4111-8111-111111111111",
-        password: "correct horse battery staple",
-      });
-      await sidecar.request("unlock", {
-        idempotencyKey: "22222222-2222-4222-8222-222222222222",
-        password: "correct horse battery staple",
-      });
 
-      // Mint: the fake waved serves an lnbc invoice and the guard accepts it
-      // (the HRP follows the configured network).
+      // Mint: the fake phoenixd serves an lnbc invoice and the guard accepts
+      // it (the HRP follows the configured network).
       const minted = expectOk(
         await sidecar.request("make-invoice", {
           amtSat: 10_000,
@@ -523,14 +537,14 @@ describe("protocol round-trip against fake waved", () => {
       );
       assert.match(String(minted.hrp), /^lnbc/); // mainnet HRP (0286; the 5-char slice carries the first amount digit)
 
-      // Pay: an lnbc invoice is accepted on the mainnet-configured wallet.
+      // Pay: an lnbc invoice is accepted on the mainnet-configured rail.
       const paid = expectOk(
         await sidecar.request("pay-invoice", {
           invoice: "lnbc10u1p0example",
           idempotencyKey: "44444444-4444-4444-8444-444444444444",
         }),
       );
-      assert.equal(paid.status, "ENTRY_STATUS_PENDING");
+      assert.equal(paid.status, "settled");
 
       // Mismatched HRP refused on PAY (a signet invoice on mainnet config).
       const payMismatch = expectError(
@@ -545,24 +559,16 @@ describe("protocol round-trip against fake waved", () => {
     }
   });
 
-  it("OMEGA-DELTA-0286: mismatched HRP refused on MINT on a mainnet-configured wallet (signet invoice from the daemon)", async () => {
-    const sidecar = spawnSidecar({
+  it("OMEGA-DELTA-0286/0303: mismatched HRP refused on MINT on a mainnet-configured rail (signet invoice from the node)", async () => {
+    const sidecar = await spawnSidecar({
       OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
       OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
-      FAKE_WAVED_NETWORK: "mainnet",
-      // The fake waved serves its default signet-shaped invoice — the wallet
-      // engine guard must refuse it (configuration mismatch).
+      FAKE_PHOENIXD_CHAIN: "mainnet",
+      // The fake phoenixd serves its default signet-shaped invoice — the
+      // node guard must refuse it (configuration mismatch).
     });
     try {
       await sidecar.request("initialize");
-      await sidecar.request("create-wallet", {
-        idempotencyKey: "11111111-1111-4111-8111-111111111111",
-        password: "correct horse battery staple",
-      });
-      await sidecar.request("unlock", {
-        idempotencyKey: "22222222-2222-4222-8222-222222222222",
-        password: "correct horse battery staple",
-      });
       const refused = expectError(
         await sidecar.request("make-invoice", {
           amtSat: 10_000,
@@ -582,7 +588,7 @@ describe("protocol round-trip against fake waved", () => {
     // registers ONLY the read projections — a wallet-mutating path over HTTP
     // is structurally absent (404), so create/unlock are unreachable from any
     // agent channel by construction.
-    const sidecar = spawnSidecar({});
+    const sidecar = await spawnSidecar({});
     try {
       const initialize = expectOk(await sidecar.request("initialize"));
       const httpPort = (initialize.httpSurface as { bound: boolean; port: number }).port;
@@ -606,22 +612,19 @@ describe("loopback HTTP surface (SEC-2026-053)", () => {
     const dataRoot = mkdtempSync(path.join(tmpdir(), "sw-http-"));
     const port = nextPort();
     const token = generateLoopbackToken();
+    const fakeNode = await startFakePhoenixd(port, {});
     const child = spawn(process.execPath, [MAIN_JS], {
       env: {
         OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot,
         OMEGA_SOVEREIGN_WALLET_NETWORK: "signet",
         OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN: token,
-        OMEGA_SOVEREIGN_WALLET_WAVED_BIN: FAKE_WAVED_CMD,
-        OMEGA_SOVEREIGN_WALLET_WAVED_REST_PORT: String(port),
-        FAKE_WAVED_NETWORK: "signet",
-        FAKE_WAVED_MODE: "normal",
-        FAKE_WAVED_PORT: String(port),
-        FAKE_WAVED_DATA_ROOT: dataRoot,
+        OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: `http://127.0.0.1:${port}`,
+        OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
       },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
-try {
+    try {
       let stdout = "";
       const initialized = new Promise<void>((resolve) => {
         child.stdout?.setEncoding("utf8");
@@ -658,6 +661,7 @@ try {
       assert.equal(missing.status, 401);
     } finally {
       killTree(child.pid);
+      killTree(fakeNode.pid);
       await cleanupDir(dataRoot);
     }
   });
@@ -665,21 +669,18 @@ try {
   it("fail-closed: no token -> HTTP surface disabled and named", async () => {
     const dataRoot = mkdtempSync(path.join(tmpdir(), "sw-http-"));
     const port = nextPort();
+    const fakeNode = await startFakePhoenixd(port, {});
     const child = spawn(process.execPath, [MAIN_JS], {
       env: {
         OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot,
         OMEGA_SOVEREIGN_WALLET_NETWORK: "signet",
-        OMEGA_SOVEREIGN_WALLET_WAVED_BIN: FAKE_WAVED_CMD,
-        OMEGA_SOVEREIGN_WALLET_WAVED_REST_PORT: String(port),
-        FAKE_WAVED_NETWORK: "signet",
-        FAKE_WAVED_MODE: "normal",
-        FAKE_WAVED_PORT: String(port),
-        FAKE_WAVED_DATA_ROOT: dataRoot,
+        OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: `http://127.0.0.1:${port}`,
+        OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
       },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
-try {
+    try {
       let stdout = "";
       await new Promise<void>((resolve) => {
         child.stdout?.setEncoding("utf8");
@@ -700,16 +701,17 @@ try {
       });
       const initialize = JSON.parse(stdout.trim().split("\n")[0] ?? "{}") as Record<string, unknown>;
       const httpSurface = ((initialize.result ?? {}) as { httpSurface?: { bound: boolean; reason?: string } }).httpSurface;
-assert.equal(httpSurface?.bound, false);
+      assert.equal(httpSurface?.bound, false);
       assert.match(httpSurface?.reason ?? "", /LOOPBACK_TOKEN is not set/);
     } finally {
       killTree(child.pid);
+      killTree(fakeNode.pid);
       await cleanupDir(dataRoot);
     }
   });
 
-  it("WP-5: identity ceremony, create-wallet vault capture, and the one-time export bridge", async () => {
-    const sidecar = spawnSidecar({});
+  it("WP-5: identity ceremony and the one-time export bridge (the create-wallet vault capture is removed with the rail)", async () => {
+    const sidecar = await spawnSidecar({});
     try {
       await sidecar.request("initialize");
 
@@ -743,14 +745,13 @@ assert.equal(httpSurface?.bound, false);
       assert.equal(identity.derivedNpub, initialized.npub);
       assert.equal(identity.derivedPubkeyHex, initialized.pubkeyHex);
 
-      // WP-5 seam: create-wallet now CAPTURES the wallet DB password + aezeed
-      // into the unlocked vault.
-      const created = expectOk(await sidecar.request("create-wallet", {
+      // OMEGA-DELTA-0303: the WP-5 create-wallet vault-capture seam is
+      // removed with the waved ceremony (the node is remote; no aezeed).
+      const createRefused = expectError(await sidecar.request("create-wallet", {
         idempotencyKey: "51111111-1111-4111-8111-111111111111",
         password: "correct horse battery staple",
       }));
-      assert.equal(created.walletDbPasswordVaulted, true);
-      assert.equal(typeof created.vaultWalletId, "string");
+      assert.equal(createRefused.code, "INTERNAL");
 
       // WP-5 seam: the one-time export bridge hands the derived nsec to the
       // operator exactly once (bridge to the Rust omega_identity import path).
@@ -779,7 +780,7 @@ assert.equal(httpSurface?.bound, false);
   // reports wrapMethod. The degraded-path refusal semantics (opt-in +
   // operator confirmation) are covered in vault-keychain.test.ts (RV6-REQ-10).
   it("WP-5: vault unlock is keychain-first and reports wrapMethod (OMEGA-DELTA-0301)", async () => {
-    const sidecar = spawnSidecar({});
+    const sidecar = await spawnSidecar({});
     try {
       await sidecar.request("initialize");
       const prepared = expectOk(await sidecar.request("vault-init-prepare"));
@@ -788,7 +789,10 @@ assert.equal(httpSurface?.bound, false);
         passphrase: "correct horse battery staple",
         answers: { 2: words[1], 7: words[6], 11: words[10] },
       });
-      await sidecar.request("lock");
+      // OMEGA-DELTA-0303: lock() refuses on the phoenixd rail BUT still locks
+      // the vault (zeroizes the master key) — the keychain-first unlock below
+      // exercises the vault-lock side effect.
+      expectError(await sidecar.request("lock"));
 
       // Keychain-first: the unlock succeeds via the OS-keychain path even
       // with an arbitrary passphrase argument.
@@ -801,7 +805,3 @@ assert.equal(httpSurface?.bound, false);
     }
   });
 });
-
-
-
-

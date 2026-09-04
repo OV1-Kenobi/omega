@@ -2,8 +2,19 @@
 //!
 //! Effect-composed Node 24 service supervised by `crates/sovereign_wallet`:
 //! stdio control plane (newline-framed JSON, bounded frames, generation
-//! fencing), supervised `waved` child (signet), loopback HTTP projections
-//! (bearer-token protected), idempotency ledger, owner-only data-root ACLs.
+//! fencing), the phoenixd node rail (client-only — OMEGA-DELTA-0303),
+//! loopback HTTP projections (bearer-token protected), idempotency ledger,
+//! owner-only data-root ACLs.
+//!
+//! OMEGA-DELTA-0303 (rail swap): `wavelength.ts` / the waved daemon are
+//! REMOVED. The sidecar is a CLIENT-ONLY process for the phoenixd rail: no
+//! daemon child is spawned, supervised, or tree-killed (design §2, §8.1).
+//! make-invoice/pay-invoice re-point to phoenixd (createinvoice/payinvoice);
+//! wallet-height fails closed with TIP_HEIGHT_UNAVAILABLE until the C3-2
+//! slice wires the public tip API (0304); balance/activity/create-wallet/
+//! unlock/lock fail closed with named errors (their phoenixd re-point is
+//! later-slice [REQUIRES VERIFICATION] work; the waved wallet ceremony is
+//! removed with the rail).
 //!
 //! Environment (injected by the supervisor; never secrets in args):
 //!   OMEGA_SOVEREIGN_WALLET_DATA_ROOT        (required)
@@ -11,7 +22,10 @@
 //!     (mainnet requires OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1 — 0286)
 //!   OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET    the explicit mainnet opt-in (=1)
 //!   OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN   32-byte hex, per launch
-//!   OMEGA_SOVEREIGN_WALLET_WAVED_BIN        path to the pinned waved artifact
+//!   OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL     the phoenixd REST base over
+//!     Tailscale/SSH (design §9.3; required for the mainnet rail — 0303)
+//!   OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY the phoenixd full-access
+//!     http-password (env-only; redaction-registered; never repo/log/settings)
 
 import { Effect } from "effect";
 import fs from "node:fs/promises";
@@ -32,14 +46,15 @@ import { listPrimaryIdentity } from "./identity/index.js";
 import { deriveFromMnemonic, encodeNsec, generateMnemonic12 } from "./identity/keygen.js";
 import { challengeLabels, verifyChallenge } from "./identity/ceremony.js";
 import {
-  WavelengthClient,
+  PHOENIXD_API_KEY_ENV,
+  PHOENIXD_URL_ENV,
+  PhoenixdClient,
   assertInvoiceNetwork,
   assertNetworkMatches,
-  startWaved,
-  terminateWaved,
-  type WavelengthNetwork,
-  type WavedHandle,
-} from "./wavelength.js";
+  expectedFeeSat,
+  expectedTotalOutflowSat,
+  type PhoenixdNetwork,
+} from "./phoenixd.js";
 
 const MAX_FRAME_BYTES = 64 * 1024;
 const HEALTH_TIMEOUT_MS = 5_000;
@@ -49,18 +64,19 @@ const SHUTDOWN_GRACE_MS = 2_000;
 
 /**
  * OMEGA-DELTA-0286: the explicit mainnet opt-in env name. `mainnet` is
- * accepted ONLY when this is "1" — mirrors waved's `--allow-mainnet`; the
- * exact name is bound by the 0286 delta check.
+ * accepted ONLY when this is "1" (the allow-mainnet authority; the exact
+ * name is bound by the 0286 delta check).
  */
 export const ALLOW_MAINNET_ENV = "OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET";
 
 /**
  * OMEGA-DELTA-0300 (kill closure): the environment-level spend kill env
  * name. The L-402 gateway's HTTP mint path is sidecar-internal (a direct
- * waved recv call) and does NOT traverse the Rust spend_policy choke point,
- * so the sidecar reads the kill itself on that mint path — a halted surface
- * creates no new invoices at the HTTP surface either. Mirrors the Rust-side
- * constant (crates/sovereign_wallet/src/spend_policy.rs).
+ * phoenixd createinvoice call — OMEGA-DELTA-0303) and does NOT traverse the
+ * Rust spend_policy choke point, so the sidecar reads the kill itself on that
+ * mint path — a halted surface creates no new invoices at the HTTP surface
+ * either. Mirrors the Rust-side constant
+ * (crates/sovereign_wallet/src/spend_policy.rs).
  */
 export const SPEND_KILL_ENV = "OMEGA_SPEND_KILL";
 
@@ -68,25 +84,25 @@ export type WalletState = "none" | "locked" | "syncing" | "ready" | "error";
 
 export interface SidecarConfig {
   dataRoot: string;
-  network: WavelengthNetwork;
+  network: PhoenixdNetwork;
   /**
-   * OMEGA-DELTA-0286: the allow-mainnet launch authority. True only when the
+   * OMEGA-DELTA-0286: the allow-mainnet authority. True only when the
    * configured network is mainnet AND the explicit opt-in env is set at the
-   * process level (parseEnvironment). signet/regtest never set this, and
-   * `--allow-mainnet` is never passed for them.
+   * process level (parseEnvironment). signet/regtest never set this.
    */
   allowMainnet: boolean;
   loopbackToken: string | undefined;
-  wavedBin: string | undefined;
-  generation: number;
   /**
-   * Test/dev-only knob: where the sidecar's REST client points. The real waved
-   * daemon always serves the REST gateway on the documented default
-   * 127.0.0.1:10031 (api/get-started.md); the flag to move it is not
-   * documented, so this only redirects the CLIENT (used by tests that run a
-   * fake waved on a per-test port).
+   * OMEGA-DELTA-0303: the phoenixd REST base over Tailscale/SSH (design
+   * §9.3) and the full-access API key (the http-password; env-only,
+   * redaction-registered). A mainnet rail WITHOUT both is a configuration
+   * error refused at startup (the rail gate, design §2.6.2). On
+   * signet/regtest (fixture rails) the absence is a named unavailable state
+   * (`NODE_UNCONFIGURED`), never a silent zero.
    */
-  wavedRestPort?: number;
+  phoenixdUrl: string | undefined;
+  phoenixdApiKey: string | undefined;
+  generation: number;
   /**
    * OS-keychain backend selection (OMEGA-DELTA-0301 / RV6-REQ-1): `"os"` (the
    * default — Windows Credential Manager / macOS Keychain Services via the
@@ -113,8 +129,8 @@ export interface HealthProjection {
   generation: number;
   dataRoot: string;
   walletState: WalletState;
-  wavedConnected: boolean;
-  network: WavelengthNetwork;
+  nodeConnected: boolean;
+  network: PhoenixdNetwork;
   note: string;
 }
 
@@ -127,14 +143,16 @@ export class SidecarCore {
   readonly #config: SidecarConfig;
   readonly #runDir: string;
   #lock: LockHandle | null = null;
-  #waved: WavedHandle | null = null;
-  #wavedUnavailableReason = "";
+  /**
+   * OMEGA-DELTA-0303: the phoenixd rail client (client-only — no daemon child
+   * is spawned). Non-null when the phoenixd envs are configured AND the
+   * startup getinfo probe answered (the rail gate, design §2.6.2).
+   */
+  #phoenixd: PhoenixdClient | null = null;
+  #nodeUnavailableReason = "";
   #idempotency: IdempotencyStore | null = null;
   #http: LoopbackHttpServer | null = null;
   #httpReason: string | undefined;
-  #walletPassword: string | null = null;
-  #operatorLocked = false;
-  #walletCreated = false;
   #walletState: WalletState = "none";
   #generation: number;
   #syncWatcher: ReturnType<typeof setInterval> | null = null;
@@ -157,7 +175,7 @@ export class SidecarCore {
     this.#generation = config.generation;
   }
 
-  get network(): WavelengthNetwork {
+  get network(): PhoenixdNetwork {
     return this.#config.network;
   }
 
@@ -169,8 +187,8 @@ export class SidecarCore {
     return this.#config.dataRoot;
   }
 
-  get wavedConnected(): boolean {
-    return this.#waved !== null;
+  get nodeConnected(): boolean {
+    return this.#phoenixd !== null;
   }
 
   get walletState(): WalletState {
@@ -186,13 +204,12 @@ export class SidecarCore {
     this.#generation = generation;
   }
 
-  /** Full startup: data root, ACLs, lock, idempotency, waved, HTTP, marker. */
+  /** Full startup: data root, ACLs, lock, idempotency, phoenixd rail, HTTP, gateway. */
   async start(): Promise<void> {
     const { dataRoot, network } = this.#config;
     await fs.mkdir(dataRoot, { recursive: true });
     await fs.mkdir(this.#runDir, { recursive: true });
     await fs.mkdir(path.join(dataRoot, "logs"), { recursive: true });
-    await fs.mkdir(path.join(dataRoot, "wavelength"), { recursive: true });
 
     // SEC-2026-045: owner-only ACLs on the whole data root, fail closed.
     try {
@@ -208,16 +225,7 @@ export class SidecarCore {
 
     this.#idempotency = IdempotencyStore.open(dataRoot);
 
-    // Wallet-created marker (non-secret; distinguishes none/locked within the
-    // REST-only surface — getinfo is gRPC-only and not on the REST gateway).
-    const markerPath = path.join(this.#runDir, "wallet-state.json");
-    const marker = await readMarker(markerPath);
-    this.#walletCreated = marker?.created ?? false;
-    this.#walletState = this.#walletCreated ? "locked" : "none";
-
     // WP-4 vault: satnam-derived identity/vault root at <data_root>/vault.
-    // The vault is the sidecar's authority for the BIP-39 identity/vault root
-    // and the Wavelength wallet secrets (Q1: aezeed vaulted, not derived).
     // WP-3a (OMEGA-DELTA-0301 / RV6-REQ-1..9): the master key is wrapped by
     // K_os in the OS keychain; the passphrase is the degraded/portable
     // fallback (opt-in `OMEGA_VAULT_ALLOW_PASSPHRASE_FALLBACK=1`). The
@@ -242,7 +250,7 @@ export class SidecarCore {
 
     // WP-6: the L-402 gateway state store (SQLite; survives restarts by
     // construction — design §5.5). The gateway itself is constructed after
-    // waved so its mint path can reach the wallet engine.
+    // the rail so its mint path can reach the node engine.
     this.#l402Store = L402Store.open(path.join(dataRoot, "l402"));
 
     // HTTP surface: fail-closed on a missing/malformed token (SEC-2026-053).
@@ -253,7 +261,7 @@ export class SidecarCore {
         onStatus: () => this.statusProjection(),
         onBalance: () => this.balance(),
         // WP-6: the L-402 gateway routes (the ONLY paid boundary). The
-        // gateway is constructed after waved below; the handler is bound
+        // gateway is constructed after the rail below; the handler is bound
         // lazily through `this.#l402Gateway`.
         onL402: (method, pathname, headers, body) => {
           const gateway = this.#l402Gateway;
@@ -269,69 +277,84 @@ export class SidecarCore {
       });
     }
 
-    // waved: only when a pinned binary is configured. A missing binary is a
-    // named, surfaced state (never a silent zero); a network mismatch is a
-    // hard bail (SEC-2026-050).
-    if (this.#config.wavedBin) {
+    // OMEGA-DELTA-0303: the phoenixd rail — client-only. A configured rail
+    // (URL + API key) runs the startup getinfo probe: the network assertion
+    // (SEC-2026-050 rail form) hard-bails on a mismatch; a failed probe is a
+    // named node-unreachable state (retryable; health re-probes), except on a
+    // MAINNET rail where the rail gate (design §2.6.2) refuses to start
+    // without an answering node connection. An absent phoenixd env is the
+    // named NODE_UNCONFIGURED state (never a silent zero).
+    if (this.#config.phoenixdUrl && this.#config.phoenixdApiKey) {
+      this.#phoenixd = new PhoenixdClient({
+        baseUrl: this.#config.phoenixdUrl,
+        apiKey: this.#config.phoenixdApiKey,
+        network,
+        allowMainnet: this.#config.allowMainnet,
+      });
       try {
-        this.#waved = await startWaved({
-          binary: this.#config.wavedBin,
-          dataRoot,
-          network,
-          // OMEGA-DELTA-0286: the allow-mainnet launch authority (only the
-          // mainnet-configured + opt-in state is true; signet/regtest never
-          // pass --allow-mainnet).
-          allowMainnet: this.#config.allowMainnet,
-          restPort: this.#config.wavedRestPort,
-        });
+        const chain = await this.#phoenixd.probeChain();
+        assertNetworkMatches(this.#config.network, chain, this.#config.allowMainnet);
+        this.#walletState = "ready";
+        this.#nodeUnavailableReason = "";
       } catch (error) {
         const envelope = error instanceof Error && "envelope" in error
           ? (error as { envelope: { code: ErrorCode; message: string } }).envelope
           : null;
         if (envelope?.code === "MAINNET_REFUSED") {
+          // The node reported a network the config refuses: hard bail.
           await this.#releaseAll();
           throw error;
         }
-        this.#wavedUnavailableReason = envelope?.message ?? (error instanceof Error ? error.message : String(error));
-        this.#waved = null;
+        if (network === "mainnet") {
+          // Rail gate (design §2.6.2): a mainnet rail without an answering
+          // node connection is a configuration error, never a silent zero.
+          await this.#releaseAll();
+          throw envelopeError(
+            "NODE_UNCONFIGURED",
+            `NODE_UNCONFIGURED: the mainnet rail requires an answering phoenixd connection (${PHOENIXD_URL_ENV} present and the startup getinfo probe answering; OMEGA-DELTA-0303)`,
+            { details: envelope?.message ?? String(error), remediation: "verify the phoenixd node + the Tailscale/SSH path" },
+          );
+        }
+        this.#nodeUnavailableReason = envelope?.message ?? (error instanceof Error ? error.message : String(error));
+        this.#phoenixd = null;
         this.#walletState = "error";
       }
     } else {
-      this.#wavedUnavailableReason = "OMEGA_SOVEREIGN_WALLET_WAVED_BIN is not set";
+      this.#nodeUnavailableReason =
+        `NODE_UNCONFIGURED: the phoenixd rail is not configured (${PHOENIXD_URL_ENV} and ${PHOENIXD_API_KEY_ENV} are required for the rail; OMEGA-DELTA-0303)`;
+      this.#walletState = "error";
     }
 
     // WP-6: construct the L-402 gateway (design §5). The gateway mints via
-    // the Wavelength engine (Recv) and refuses mainnet everywhere; the
-    // wallet-ready gate is the sidecar's own `#requireWalletReady`
-    // (SEC-2026-054 locked-wallet fail-closed mint).
+    // the phoenixd rail (createinvoice) and refuses mainnet everywhere; the
+    // node-ready gate is the sidecar's own `#requireNodeReady`.
     if (this.#l402Store) {
       this.#l402Gateway = new L402Gateway({
         network,
         store: this.#l402Store,
         vault: this.#vault,
-        walletReady: () => this.#requireWalletReady(),
+        walletReady: () => this.#requireNodeReady(),
         mintInvoice: async (amtSat, memo) => {
           // OMEGA-DELTA-0300 (kill closure): the gateway mint is
-          // sidecar-internal (direct waved recv) and does not traverse the
-          // Rust spend_policy choke point — the sidecar reads the
+          // sidecar-internal (a direct phoenixd createinvoice) and does not
+          // traverse the Rust spend_policy choke point — the sidecar reads the
           // environment-level kill itself so a killed surface refuses to
           // mint at the HTTP surface too (C2: ALL-VALUE-TOUCHING; a halted
           // surface creates no new invoices either). The typed code mirrors
           // the Rust-side SpendHalted shape; only the founder re-enables.
+          // OMEGA-DELTA-0303: the kill check must PRECEDE the phoenixd
+          // createinvoice call (the 0300 check's re-anchored ordering anchor).
           if (process.env[SPEND_KILL_ENV] === "1") {
             throw envelopeError(
               "SPEND_HALTED",
               `SPEND_HALTED: the spend kill is set (${SPEND_KILL_ENV}=1); the gateway refuses to mint until the founder re-enables (OMEGA-DELTA-0300)`,
             );
           }
-          const received = await this.#waved!.client.recvInvoice(amtSat, memo);
-          assertInvoiceNetwork(network, received.invoice);
+          const created = await this.#phoenixd!.createInvoice(amtSat, memo);
+          assertInvoiceNetwork(network, created.serialized);
           return {
-            invoice: received.invoice,
-            entryPaymentHash:
-              received.entry.request?.lightning_invoice?.payment_hash ??
-              received.entry.progress?.payment_hash ??
-              null,
+            invoice: created.serialized,
+            entryPaymentHash: created.paymentHash ?? null,
           };
         },
         nowMs: () => Date.now(),
@@ -339,7 +362,7 @@ export class SidecarCore {
     }
   }
 
-  /** Ordered teardown: waved first, then HTTP, then idempotency, then lock. */
+  /** Ordered teardown: rail, HTTP, idempotency, lock (OMEGA-DELTA-0303). */
   async stop(): Promise<void> {
     await this.#releaseAll();
   }
@@ -368,10 +391,10 @@ export class SidecarCore {
       this.#l402Store.close();
       this.#l402Store = null;
     }
-    if (this.#waved) {
-      await terminateWaved(this.#waved.child).catch(() => {});
-      this.#waved = null;
-    }
+    // OMEGA-DELTA-0303: the phoenixd rail is client-only — nothing to
+    // terminate; the client object is dropped (its API key lives in the
+    // process heap until the registered-secret clear below).
+    this.#phoenixd = null;
     if (this.#http) {
       await this.#http.close().catch(() => {});
       this.#http = null;
@@ -387,23 +410,22 @@ export class SidecarCore {
     clearRegisteredSecrets();
   }
 
-  /** Periodic health: re-assert waved's runtime network (SEC-2026-050, 0286). */
+/** Periodic health: re-probe the phoenixd rail + re-assert the runtime network (SEC-2026-050, 0286 rail form). */
   async health(): Promise<HealthProjection> {
-    if (this.#waved) {
+    if (this.#phoenixd) {
       try {
-        const status = await this.#waved.status();
-        assertNetworkMatches(this.#config.network, status.network, this.#config.allowMainnet);
+        const chain = await this.#phoenixd.probeChain();
+        assertNetworkMatches(this.#config.network, chain, this.#config.allowMainnet);
+        this.#walletState = "ready";
       } catch (error) {
         if (isMainnetRefused(error)) {
-          // The daemon drifted to mainnet at runtime: hard bail.
+          // The node drifted to mainnet at runtime: hard bail.
           await this.stop();
           return this.healthProjection(false, "mainnet drift detected; sidecar stopped");
         }
-        if (this.#waved.child.exitCode !== null) {
-          this.#waved = null;
-          this.#wavedUnavailableReason = "waved exited";
-          this.#walletState = "error";
-        }
+        // Node unreachable at health time: named unavailable state (the
+        // wallet-state surfaces honestly; the next health re-probes).
+        this.#walletState = "error";
       }
     }
     return this.healthProjection(true, "");
@@ -416,7 +438,7 @@ export class SidecarCore {
       generation: this.#generation,
       dataRoot: this.#config.dataRoot,
       walletState: this.#walletState,
-      wavedConnected: this.wavedConnected,
+      nodeConnected: this.nodeConnected,
       network: this.#config.network,
       note,
     };
@@ -429,8 +451,8 @@ export class SidecarCore {
       protocolVersion: PROTOCOL_VERSION,
       serviceVersion: SERVICE_VERSION,
       network: this.#config.network,
-      wavedConnected: this.wavedConnected,
-      wavedUnavailableReason: this.#wavedUnavailableReason,
+      nodeConnected: this.nodeConnected,
+      nodeUnavailableReason: this.#nodeUnavailableReason,
       walletState: this.#walletState,
       // WP-4: the satnam-derived vault state — none (absent), locked, or unlocked.
       vaultState: this.#vaultState,
@@ -442,6 +464,14 @@ export class SidecarCore {
   }
 
   async initialize(): Promise<Record<string, unknown>> {
+    let nodeNetwork: string | null = null;
+    if (this.#phoenixd) {
+      try {
+        nodeNetwork = await this.#phoenixd.probeChain();
+      } catch {
+        nodeNetwork = null;
+      }
+    }
     return {
       schema: PROTOCOL_SCHEMA,
       protocolVersion: PROTOCOL_VERSION,
@@ -468,193 +498,145 @@ export class SidecarCore {
       ],
       dataRoot: this.#config.dataRoot,
       network: this.#config.network,
-      // SEC-2026-050: initialize reports waved's ACTUAL runtime network from
-      // the probe, never the env value alone.
-      wavedNetwork: this.#waved ? (await this.#waved.status()).network : null,
-      wavedState: this.wavedConnected ? "connected" : "unavailable",
+      // SEC-2026-050 (rail form, 0303): initialize reports the node's ACTUAL
+      // runtime network (the getinfo chain field when present), never the env
+      // value alone. `null` when the rail is unconfigured or getinfo exposes
+      // no chain field (the assertion is then carried by the env gate + HRP
+      // guard — design §2.6.3).
+      nodeNetwork,
+      nodeState: this.nodeConnected ? "connected" : "unavailable",
       httpSurface: this.httpSurface,
     };
   }
 
   async balance(): Promise<Record<string, unknown>> {
-    await this.#requireWalletReady();
-    const balance = await this.#waved!.client.balance();
-    return {
-      confirmedSat: balance.confirmed_sat,
-      pendingInSat: balance.pending_in_sat,
-      pendingOutSat: balance.pending_out_sat,
-      creditAvailableSat: balance.credit_available_sat,
-      creditReservedSat: balance.credit_reserved_sat,
-    };
+    // OMEGA-DELTA-0303: the phoenixd balance re-point (getbalance —
+    // RV-C3: the shape was verified in the phoenixd source) is later-slice
+    // work; until it lands, balance fails closed with a named error. The
+    // The credit fields (OQ-6, founder 2026-09-04) stay PRESERVED in the
+    // protocol shape — never removed; the honest-zero + note reporting lands
+    // with the balance re-point (a later C3 slice).
+    throw envelopeError(
+      "INTERNAL",
+      "INTERNAL: balance is not yet wired on the phoenixd rail (OMEGA-DELTA-0303); the getbalance re-point lands in a later C3 slice",
+      { remediation: "use the node operator surfaces (getbalance) until the re-point lands" },
+    );
   }
 
   /**
-   * WP-4b (SEC-2026-087): the observed daemon tip height for the escrow
-   * HTLC-window gate. Daemon-level: no wallet-ready requirement (the tip is
-   * readable while the wallet is locked/syncing). Fails closed with
-   * WAVED_HEIGHT_UNAVAILABLE when the pinned build does not serve the REST
-   * getinfo surface — the escrow caller then renders a named unavailable
-   * state and never substitutes wall-clock.
+   * OMEGA-DELTA-0303: the wallet-height seam fails CLOSED with a named error
+   * until the C3-2 slice wires the public tip API (OMEGA-DELTA-0304). The
+   * escrow timeout gate must never substitute wall-clock or a guessed height —
+   * TIP_HEIGHT_UNAVAILABLE is the honest answer today.
    */
   async walletHeight(): Promise<Record<string, unknown>> {
-    this.#requireWaved();
-    const blockHeight = await this.#waved!.client.getInfoHeight();
-    return { blockHeight };
+    throw envelopeError(
+      "TIP_HEIGHT_UNAVAILABLE",
+      "TIP_HEIGHT_UNAVAILABLE: the public tip API is not wired in this slice (OMEGA-DELTA-0303; the C3-2 slice lands OMEGA-DELTA-0304); the escrow timeout gate fails closed — no height is ever guessed",
+      { retryable: true, remediation: "the C3-2 slice wires the tip API; until then the escrow gate fails closed" },
+    );
   }
 
-/** Operator-only: create the Wavelength wallet (never the agent channel). */
+/**
+ * OMEGA-DELTA-0303: the waved wallet ceremony (create/unlock/lock) is REMOVED
+ * with the rail. The phoenixd node is remote and operator-managed — the
+ * sidecar never creates, unlocks, or locks it (the API key IS the access;
+ * design §2.1). These methods fail closed with a named error; the protocol
+ * surface stays so the stdio seam is stable (the Rust client still references
+ * them; a later slice decides their final disposition).
+ */
   async createWallet(idempotencyKey: string, password: string): Promise<Record<string, unknown>> {
-    this.#requireWaved();
-    const stored = this.#idempotency?.fetch("create-wallet", idempotencyKey);
-    if (stored) return stored.result as Record<string, unknown>;
-    registerSecret(password);
-    try {
-      const created = await this.#waved!.client.createWallet(password);
-      // Show-once aezeed; capture for the vault seam (WP-4) then register for
-      // redaction so it can never reach a log.
-      const mnemonic = created.mnemonic.join(" ");
-      registerSecret(mnemonic);
-      await writeMarker(path.join(this.#runDir, "wallet-state.json"), { created: true });
-      this.#walletCreated = true;
-      this.#walletState = "syncing";
-      this.#startSyncWatcher();
-
-      // WP-5 seam (design §4.2 `wallet/` entry, §4.3): capture the wallet DB
-      // password + aezeed into the vault immediately at create. The vault must
-      // be unlocked; otherwise the capture is honestly reported as not
-      // vaulted (the operator holds the password + paper aezeed).
-      let walletDbPasswordVaulted = false;
-      let vaultWalletId: string | null = null;
-      let note = "";
-      const walletId = created.identity_pubkey ?? "default";
-      if (this.#vault && this.#vault.isUnlocked()) {
-        try {
-          await this.#vault.storeWalletEntry({
-            walletId,
-            walletDbPassword: password,
-            aezeed: mnemonic,
-            createdAt: new Date().toISOString(),
-          });
-          walletDbPasswordVaulted = true;
-          vaultWalletId = walletId;
-        } catch (error) {
-          // The vault write failed (e.g. locked mid-flight): never fail the
-          // wallet creation on a capture problem; report the honest state.
-          note = `vault capture failed: ${error instanceof Error ? error.message : String(error)}`;
-        }
-      } else {
-        note =
-          "the vault is not unlocked; the wallet DB password and aezeed were NOT vaulted (operator-held only)";
-      }
-      const result = {
-        mnemonic: created.mnemonic,
-        identityPubkey: created.identity_pubkey,
-        walletDbPasswordVaulted,
-        vaultWalletId,
-        note,
-      };
-      this.#idempotency?.store("create-wallet", idempotencyKey, result);
-      return result;
-    } finally {
-      // The password is consumed by the daemon; drop our copy.
-      this.#walletPassword = null;
-    }
+    throw envelopeError(
+      "INTERNAL",
+      "INTERNAL: create-wallet is not available on the phoenixd rail (OMEGA-DELTA-0303): the node is remote and operator-managed; the waved wallet ceremony is removed",
+      { remediation: "manage the phoenixd node on the Lunanode (the API key is the access)" },
+    );
   }
 
-  /** Operator-only: unlock the Wavelength wallet (never the agent channel). */
+  /**
+   * Operator-only: the wallet unlock seam is removed with the waved ceremony
+   * (OMEGA-DELTA-0303); the phoenixd node is remote and operator-managed.
+   */
   async unlock(idempotencyKey: string, password: string): Promise<Record<string, unknown>> {
-    this.#requireWaved();
-    const stored = this.#idempotency?.fetch("unlock", idempotencyKey);
-    if (stored) return stored.result as Record<string, unknown>;
-    registerSecret(password);
-    try {
-const unlocked = await this.#waved!.client.unlockWallet(password);
-      this.#walletPassword = password;
-      this.#operatorLocked = false;
-      this.#walletState = "syncing";
-      this.#startSyncWatcher();
-      const result = { identityPubkey: unlocked.identity_pubkey, walletState: this.#walletState };
-      this.#idempotency?.store("unlock", idempotencyKey, result);
-      return result;
-    } catch (error) {
-      // Wrong password: the daemon consumed our copy; keep nothing.
-      this.#walletPassword = null;
-      throw error;
-    }
+    throw envelopeError(
+      "INTERNAL",
+      "INTERNAL: unlock is not available on the phoenixd rail (OMEGA-DELTA-0303): the node is remote and operator-managed; the waved wallet ceremony is removed",
+      { remediation: "manage the phoenixd node on the Lunanode (the API key is the access)" },
+    );
   }
 
   /** Operator-only: lock the wallet surface and the vault (design §2.2). */
   async lock(): Promise<Record<string, unknown>> {
-    // WP-3 seam: waved has no documented remote lock RPC, so the sidecar
-    // enforces the lock boundary in memory (wallet RPCs refuse until unlock).
-    // WP-4: the vault locks here too (zeroizes the master key).
-    this.#walletPassword = null;
-    this.#operatorLocked = true;
-    this.#walletState = "locked";
+    // The vault lock still applies (zeroizes the master key); the waved
+    // wallet lock boundary is removed with the rail.
     if (this.#vault) {
       this.#vault.lock();
       this.#vaultState = "locked";
     }
-    // Drop any pending identity ceremony (the show-once mnemonic never
-    // survives a lock; the operator restarts the ceremony).
     this.#pendingMnemonic = null;
-    this.#stopSyncWatcher();
-    return { walletState: this.#walletState, vaultState: this.#vaultState };
+    throw envelopeError(
+      "INTERNAL",
+      "INTERNAL: the wallet lock is not available on the phoenixd rail (OMEGA-DELTA-0303): the node is remote and operator-managed; the waved wallet ceremony is removed (the vault was locked)",
+      { remediation: "manage the phoenixd node on the Lunanode (the API key is the access)" },
+    );
   }
 
-  /** Mint a signet BOLT11 invoice (design §2.2; prefix guard §3.4). */
+  /** Mint a BOLT11 invoice via phoenixd (design §2.2/§2.4; prefix guard §3.4). */
   async makeInvoice(amtSat: number, memo: string, idempotencyKey: string): Promise<Record<string, unknown>> {
-    await this.#requireWalletReady();
+    await this.#requireNodeReady();
     const stored = this.#idempotency?.fetch("make-invoice", idempotencyKey);
     if (stored) return stored.result as Record<string, unknown>;
     if (!Number.isSafeInteger(amtSat) || amtSat <= 0) {
       throw envelopeError("INVALID_ARGS", "amtSat must be a positive integer");
     }
-    const received = await this.#waved!.client.recvInvoice(amtSat, memo);
-    assertInvoiceNetwork(this.#config.network, received.invoice);
-    const paymentHash =
-      received.entry.progress?.payment_hash ??
-      received.entry.request?.lightning_invoice?.payment_hash ??
-      null;
+    const created = await this.#phoenixd!.createInvoice(amtSat, memo);
+    assertInvoiceNetwork(this.#config.network, created.serialized);
     const result = {
-      invoice: received.invoice,
-      paymentHash,
+      invoice: created.serialized,
+      paymentHash: created.paymentHash,
       amountSat: amtSat,
       memo,
       // The invoice HRP follows the configured network (OMEGA-DELTA-0286):
       // lntbs on signet, lnbc on mainnet; the guard refuses any mismatch.
-      hrp: received.invoice.slice(0, 5),
+      hrp: created.serialized.slice(0, 5),
     };
     this.#idempotency?.store("make-invoice", idempotencyKey, result);
     return result;
   }
 
-  /** Pay a BOLT11 invoice (design §2.2; mandate gate is enforced Rust-side in WP-5). */
+  /**
+   * Pay a BOLT11 invoice via phoenixd (design §2.2/§2.5; the mandate gate is
+   * enforced Rust-side in WP-5). The loss-rule bound (OMEGA-DELTA-0300 /
+   * SEC-2026-098): the sidecar computes the expected total outflow
+   * (BOLT11 amount + phoenixd's 0.4% pay fee, rounded up) and reports the
+   * actual outflow (recipientAmountSat + routingFeeSat) + the preimage so the
+   * Rust-side expected-vs-actual settle comparison has both sides.
+   */
   async payInvoice(invoice: string, idempotencyKey: string): Promise<Record<string, unknown>> {
-    await this.#requireWalletReady();
+    await this.#requireNodeReady();
     assertInvoiceNetwork(this.#config.network, invoice);
     const stored = this.#idempotency?.fetch("pay-invoice", idempotencyKey);
     if (stored) return stored.result as Record<string, unknown>;
-    const prepared = await this.#waved!.client.prepareSend(invoice);
-    const sent = await this.#waved!.client.sendPrepared(prepared.send_intent_id);
-    const entry = sent.entry;
-    const preimage = entry.progress?.preimage ?? null;
+    const sent = await this.#phoenixd!.payInvoice(invoice);
+    const actualAmountSat = sent.recipientAmountSat + sent.routingFeeSat;
+    const { expected, known } = expectedTotalOutflowSat(invoice);
+    const preimage = sent.paymentPreimage;
     if (preimage) registerSecret(preimage);
     // SEC-2026-047: the idempotency result cache NEVER persists the preimage.
     const result = {
-      paymentHash: entry.progress?.payment_hash ?? prepared.payment_hash ?? null,
-      status: entry.status,
-      activityId: entry.id,
-      actualAmountSat: sent.actual_amount_sat,
-      expectedFeeSat: prepared.expected_fee_sat,
-      feeKnown: prepared.fee_known,
-      // OMEGA-DELTA-0300 (loss rule, SEC-2026-098): the prepared-for total
+      paymentHash: sent.paymentHash,
+      status: "settled",
+      activityId: sent.paymentId,
+      actualAmountSat: String(actualAmountSat),
+      expectedFeeSat: String(expectedFeeSat(invoice)),
+      feeKnown: known,
+      // OMEGA-DELTA-0300 (loss rule, SEC-2026-098): the expected total
       // outflow (invoice amount + expected fee) is reported so the Rust-side
       // expected-vs-actual settle comparison has the expected bound — a
       // payment settling for MORE than this auto-sets the spend kill.
-      expectedTotalOutflowSat: prepared.expected_total_outflow_sat,
-      totalOutflowKnown: prepared.total_outflow_known,
-      warning: prepared.warning,
+      expectedTotalOutflowSat: String(expected),
+      totalOutflowKnown: known,
+      warning: known ? "" : "the invoice amount is unknown (pay-any); the loss rule cannot fire (total_outflow_known=false)",
       preimage,
     };
     const cached = { ...result, preimage: null };
@@ -664,17 +646,13 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
 
   /** Merged wallet activity feed (design §2.2). */
   async activity(limit = 100, cursor?: string): Promise<Record<string, unknown>> {
-    this.#requireWaved();
-    const list = await this.#waved!.client.listActivity(limit, cursor);
-    for (const entry of list.entries) {
-      if (entry.progress?.preimage) registerSecret(entry.progress.preimage);
-    }
-    return {
-      entries: list.entries,
-      total: list.total,
-      hasMore: list.has_more,
-      nextCursor: list.next_cursor,
-    };
+    // OMEGA-DELTA-0303: the phoenixd payments-surface re-point is later-slice
+    // work; until it lands, activity fails closed with a named error.
+    throw envelopeError(
+      "INTERNAL",
+      "INTERNAL: activity is not yet wired on the phoenixd rail (OMEGA-DELTA-0303); the payments-surface re-point lands in a later C3 slice",
+      { remediation: "use the node operator surfaces (payments/incoming|outgoing) until the re-point lands" },
+    );
   }
 
   /**
@@ -822,7 +800,7 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
       const result = await this.#vault.unlock(passphrase, {
         allowPassphraseFallback: process.env[VAULT_FALLBACK_OPT_IN_ENV] === "1",
         // "Mainnet-configured" (RV6-REQ-5) reads the configured network env
-        // directly: the WavelengthNetwork enum cannot express "mainnet" until
+        // directly: the network enum cannot express "mainnet" until
         // the 0286 grammar lands (WP-3), and this seam must exist before it.
         mainnetConfigured: process.env.OMEGA_SOVEREIGN_WALLET_NETWORK === "mainnet",
         operatorConfirmed: opts?.operatorConfirmed === true,
@@ -919,24 +897,22 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
   }
 
   /**
-   * Engine-owned syncing→ready advance (design §1.4 / wallet-lifecycle docs:
-   * "automatically advances syncing to ready" by polling until ready).
-   * Lazy refresh on demand plus a 2s background watcher while syncing.
+   * Engine-owned state refresh (OMEGA-DELTA-0303): the phoenixd rail's node
+   * state derives from the getinfo probe — "ready" when the probe answers,
+   * "error" when it fails. The waved-era lifecycle states (none/locked/
+   * syncing) no longer apply to a remote operator-managed node
+   * (OMEGA-DELTA-0303).
    */
   async #refreshWalletState(): Promise<void> {
-    if (!this.#waved) return;
+    if (!this.#phoenixd) return;
     try {
-      const status = await this.#waved.status();
-      if (status.ready) {
-        this.#walletState = "ready";
-        this.#stopSyncWatcher();
-      } else if (status.unlocked) {
-        this.#walletState = "syncing";
-      } else {
-        this.#walletState = "locked";
-      }
+      const chain = await this.#phoenixd.probeChain();
+      assertNetworkMatches(this.#config.network, chain, this.#config.allowMainnet);
+      this.#walletState = "ready";
+      this.#stopSyncWatcher();
     } catch {
-      // keep the current state; the health check owns waved-failure handling
+      this.#walletState = "error";
+      // keep the current state; the health check owns node-failure handling
     }
   }
 
@@ -954,34 +930,19 @@ const unlocked = await this.#waved!.client.unlockWallet(password);
     }
   }
 
-  #requireWaved(): void {
-    if (!this.#waved) {
+  /**
+   * OMEGA-DELTA-0303: the node-ready gate for the funded verbs. The phoenixd
+   * client must be configured AND the startup probe must have answered (the
+   * rail gate, design §2.6.2); a missing rail env is the named
+   * NODE_UNCONFIGURED state, a failed probe the named node-unreachable state.
+   */
+  #requireNodeReady(): void {
+    if (!this.#phoenixd) {
       throw envelopeError(
-        "INTERNAL",
-        this.#wavedUnavailableReason || "waved is not running",
-        { retryable: false, remediation: "install the pinned waved artifact (see waved-artifact.manifest.json)" },
+        "NODE_UNCONFIGURED",
+        this.#nodeUnavailableReason || "the phoenixd rail is not connected (OMEGA-DELTA-0303)",
+        { retryable: false, remediation: "verify the phoenixd node + the Tailscale/SSH path and restart the sidecar" },
       );
-    }
-  }
-
-  async #requireWalletReady(): Promise<void> {
-    this.#requireWaved();
-    if (this.#operatorLocked || !this.#walletPassword) {
-      throw envelopeError("WALLET_LOCKED", "the wallet is locked; run unlock", {
-        remediation: "run unlock (operator-only)",
-      });
-    }
-    if (!this.#walletCreated) {
-      throw envelopeError("WALLET_NOT_CREATED", "no wallet exists yet; run create-wallet", {
-        remediation: "run create-wallet (operator-only)",
-      });
-    }
-    if (this.#walletState === "syncing") {
-      // One real poll before refusing: the daemon may have reached ready.
-      await this.#refreshWalletState();
-      if (this.#walletState === "syncing") {
-        throw envelopeError("WALLET_SYNCING", "the wallet is syncing; wait for ready", { retryable: true });
-      }
     }
   }
 
@@ -1195,22 +1156,34 @@ export function parseEnvironment(): SidecarConfig {
     throw envelopeError("INVALID_ARGS", "OMEGA_SOVEREIGN_WALLET_DATA_ROOT is required");
   }
   const loopbackToken = process.env.OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN;
-  const wavedBin = process.env.OMEGA_SOVEREIGN_WALLET_WAVED_BIN;
+  // OMEGA-DELTA-0303: the phoenixd rail envs (design §9.3). The API key is
+  // env-only and registered for redaction at load (SEC-2026-046) so it can
+  // never reach a log or an error envelope.
+  const phoenixdUrl = process.env[PHOENIXD_URL_ENV];
+  const phoenixdApiKey = process.env[PHOENIXD_API_KEY_ENV];
+  if (phoenixdApiKey) registerSecret(phoenixdApiKey);
+  // The rail gate (design §2.6.2, 0303): a MAINNET rail without a configured
+  // phoenixd connection is a configuration error, never a silent zero.
+  if (networkRaw === "mainnet" && (!phoenixdUrl || !phoenixdApiKey)) {
+    throw envelopeError(
+      "NODE_UNCONFIGURED",
+      `NODE_UNCONFIGURED: the mainnet rail requires ${PHOENIXD_URL_ENV} and ${PHOENIXD_API_KEY_ENV} (rail gate; OMEGA-DELTA-0303)`,
+      { remediation: "set the phoenixd URL + API key (env-only) for the mainnet rail" },
+    );
+  }
   const generation = Number.parseInt(process.env.OMEGA_SOVEREIGN_WALLET_GENERATION ?? "1", 10) || 1;
-  const wavedRestPortRaw = process.env.OMEGA_SOVEREIGN_WALLET_WAVED_REST_PORT;
-  const wavedRestPort = wavedRestPortRaw ? Number.parseInt(wavedRestPortRaw, 10) : undefined;
   // OMEGA-DELTA-0301 / RV6-REQ-1: "memory" is the TEST-ONLY keychain seam
   // (never set in production); the production default is the OS keychain.
   const vaultKeychainRaw = process.env.OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN;
   const vaultKeychain = vaultKeychainRaw === "memory" ? "memory" : undefined;
   return {
     dataRoot,
-    network: networkRaw as WavelengthNetwork,
+    network: networkRaw as PhoenixdNetwork,
     allowMainnet: networkRaw === "mainnet" && process.env[ALLOW_MAINNET_ENV] === "1",
     loopbackToken,
-    wavedBin,
+    phoenixdUrl,
+    phoenixdApiKey,
     generation,
-    wavedRestPort,
     vaultKeychain,
   };
 }
@@ -1236,7 +1209,7 @@ export async function main(): Promise<void> {
       try: () => core!.start(),
       catch: (error) => error as Error,
     });
-    // Health checkpoint immediately after startup: a waved network mismatch at
+    // Health checkpoint immediately after startup: a node network mismatch at
     // startup already hard-bailed in start(); this re-asserts on the live state.
     const health = yield* Effect.tryPromise({ try: () => core!.health(), catch: (error) => error as Error });
     if (!health.ok) {
@@ -1333,15 +1306,6 @@ function requireAnswers(
     answers[index - 1] = word; // 1-based labels → 0-indexed challenge indexes
   }
   return answers;
-}
-
-async function readMarker(path: string): Promise<WalletMarker | null> {
-  try {
-    const raw = await fs.readFile(path, "utf8");
-    return JSON.parse(raw) as WalletMarker;
-  } catch {
-    return null;
-  }
 }
 
 async function writeMarker(path: string, marker: WalletMarker): Promise<void> {

@@ -67,11 +67,11 @@ impl SovereignWalletSupervisor {
         decode(result, "balance result")
     }
 
-    /// WP-4b (SEC-2026-087): the observed daemon tip height, probed through
-    /// the sidecar's `wallet-height` method (waved getinfo REST surface). The
-    /// canonical tip source for the escrow `timeout_at_height` gate; on
-    /// `WAVED_HEIGHT_UNAVAILABLE` no tip exists and the escrow caller must
-    /// fail closed (never wall-clock).
+    /// WP-4b (SEC-2026-087) / OMEGA-DELTA-0303: the observed tip height,
+    /// probed through the sidecar's `wallet-height` method. THIS SLICE fails
+    /// closed with `TIP_HEIGHT_UNAVAILABLE` (the public tip API lands under
+    /// OMEGA-DELTA-0304 in the C3-2 slice); the escrow timeout gate must fail
+    /// closed on it — never wall-clock.
     pub async fn wallet_height(&mut self) -> Result<BlockHeightResult, SovereignWalletError> {
         let result = self.request("wallet-height", None, self.generation()).await?;
         decode(result, "wallet-height result")

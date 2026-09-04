@@ -1,5 +1,8 @@
-//! Unit tests: redaction, loopback token, invoice/network guards, gRPC error
-//! mapping, idempotency store, sidecar lock, ACL lockdown.
+//! Unit tests: redaction, loopback token, invoice/network guards, phoenixd
+//! error mapping, idempotency store, sidecar lock, ACL lockdown.
+//! Updated-with-citation (OMEGA-DELTA-0303): the invoice/network guards moved
+//! to the phoenixd client module (phoenixd.ts); the waved gRPC error mapping
+//! is replaced by the phoenixd HTTP error mapping.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -12,7 +15,15 @@ import { generateLoopbackToken, tokenMatches, validateLoopbackToken } from "../d
 import { IdempotencyStore } from "../dist/idempotency.js";
 import { acquireLock, LockHeldError } from "../dist/lock.js";
 import { clearRegisteredSecrets, containsSecretShape, redact, registerSecret } from "../dist/redact.js";
-import { assertInvoiceNetwork, assertNetworkMatches, WavedErrorImpl, mapGrpcError } from "../dist/wavelength.js";
+import {
+  PhoenixdErrorImpl,
+  assertInvoiceNetwork,
+  assertNetworkMatches,
+  expectedTotalOutflowSat,
+  mapPhoenixdError,
+  mapPaymentFailed,
+  PHOENIXD_PAY_FEE_BASIS_POINTS,
+} from "../dist/phoenixd.js";
 
 describe("redact", () => {
 it("redacts registered secrets and secret shapes", () => {
@@ -64,16 +75,16 @@ describe("loopback token (SEC-2026-053)", () => {
   });
 });
 
-describe("invoice/network guards (design §3.4, SEC-2026-050; OMEGA-DELTA-0286)", () => {
+describe("invoice/network guards (design §3.4, SEC-2026-050; OMEGA-DELTA-0286 — moved to the phoenixd rail by 0303)", () => {
   it("accepts signet/testnet/regtest invoices and refuses mainnet on non-mainnet configs", () => {
     assert.equal(assertInvoiceNetwork("signet", "lntbs10u1p0example"), undefined);
     assert.equal(assertInvoiceNetwork("signet", "lntb10u1p0example"), undefined);
     assert.equal(assertInvoiceNetwork("regtest", "lnbcrt10u1p0example"), undefined);
     assert.throws(() => assertInvoiceNetwork("signet", "lnbc10u1p0example"), (error) => {
-      return error instanceof WavedErrorImpl && error.envelope.code === "MAINNET_REFUSED";
+      return error instanceof PhoenixdErrorImpl && error.envelope.code === "MAINNET_REFUSED";
     });
     assert.throws(() => assertInvoiceNetwork("regtest", "lntbs10u1p0example"), (error) => {
-      return error instanceof WavedErrorImpl && error.envelope.code === "INVALID_ARGS";
+      return error instanceof PhoenixdErrorImpl && error.envelope.code === "INVALID_ARGS";
     });
   });
 
@@ -84,50 +95,72 @@ describe("invoice/network guards (design §3.4, SEC-2026-050; OMEGA-DELTA-0286)"
     // above are unchanged).
     assert.equal(assertInvoiceNetwork("mainnet", "lnbc10u1p0example"), undefined);
     assert.throws(() => assertInvoiceNetwork("mainnet", "lnbcrt10u1p0example"), (error) => {
-      return error instanceof WavedErrorImpl && error.envelope.code === "INVALID_ARGS";
+      return error instanceof PhoenixdErrorImpl && error.envelope.code === "INVALID_ARGS";
     });
     assert.throws(() => assertInvoiceNetwork("mainnet", "lntbs10u1p0example"), (error) => {
-      return error instanceof WavedErrorImpl && error.envelope.code === "INVALID_ARGS";
+      return error instanceof PhoenixdErrorImpl && error.envelope.code === "INVALID_ARGS";
     });
     assert.throws(() => assertInvoiceNetwork("mainnet", "lntb10u1p0example"), (error) => {
-      return error instanceof WavedErrorImpl && error.envelope.code === "INVALID_ARGS";
+      return error instanceof PhoenixdErrorImpl && error.envelope.code === "INVALID_ARGS";
     });
   });
 
-  it("OMEGA-DELTA-0286: the runtime assertion requires reported == configured; mainnet only when opted in", () => {
-    // SEC-2026-050 revision (0286): mainnet reported is refused UNLESS
-    // configured mainnet AND the allow-mainnet opt-in is present; any other
-    // mismatch is refused too. Assertions on the signet cases are unchanged.
+  it("OMEGA-DELTA-0286/0303: the runtime assertion requires reported == configured; mainnet only when opted in; absent report carried by the env gate + guard", () => {
+    // SEC-2026-050 revision (0286, rail form 0303): mainnet reported is
+    // refused UNLESS configured mainnet AND the allow-mainnet opt-in is
+    // present; any other mismatch is refused too. An ABSENT report (getinfo
+    // exposes no chain field) is carried by the env gate + the invoice HRP
+    // guard (design §2.6.3) — never an error on its own.
     assert.throws(() => assertNetworkMatches("signet", "mainnet", false), (error) => {
-      return error instanceof WavedErrorImpl && error.envelope.code === "MAINNET_REFUSED";
+      return error instanceof PhoenixdErrorImpl && error.envelope.code === "MAINNET_REFUSED";
     });
     assert.throws(() => assertNetworkMatches("mainnet", "mainnet", false), (error) => {
-      return error instanceof WavedErrorImpl && error.envelope.code === "MAINNET_REFUSED";
+      return error instanceof PhoenixdErrorImpl && error.envelope.code === "MAINNET_REFUSED";
     });
     assert.equal(assertNetworkMatches("mainnet", "mainnet", true), undefined);
     assert.throws(() => assertNetworkMatches("signet", "testnet", false), (error) => {
-      return error instanceof WavedErrorImpl && error.envelope.code === "INTERNAL";
+      return error instanceof PhoenixdErrorImpl && error.envelope.code === "INTERNAL";
     });
     assert.throws(() => assertNetworkMatches("mainnet", "signet", true), (error) => {
-      return error instanceof WavedErrorImpl && error.envelope.code === "INTERNAL";
+      return error instanceof PhoenixdErrorImpl && error.envelope.code === "INTERNAL";
     });
     assert.equal(assertNetworkMatches("signet", "signet", false), undefined);
+    assert.equal(assertNetworkMatches("signet", null, false), undefined);
   });
 });
 
-describe("gRPC error mapping (wavecli-style envelope)", () => {
-  it("maps lifecycle preconditions to WALLET_* codes", () => {
-    const locked = mapGrpcError(9, "wallet is locked; run unlock");
-    assert.equal(locked.code, "WALLET_LOCKED");
-    const notCreated = mapGrpcError(9, "no wallet exists");
-    assert.equal(notCreated.code, "WALLET_NOT_CREATED");
+describe("phoenixd HTTP error mapping (wavecli-style envelope; OMEGA-DELTA-0303)", () => {
+  it("maps auth failures to INTERNAL (not retryable) and connection failures to INTERNAL (retryable)", () => {
+    const auth = mapPhoenixdError(401, "Invalid authentication (use basic auth with the http password set in phoenix.conf)");
+    assert.equal(auth.code, "INTERNAL");
+    assert.equal(auth.retryable, false);
+    assert.match(auth.remediation, /OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY/);
+    const unreachable = mapPhoenixdError(null, "fetch failed");
+    assert.equal(unreachable.code, "INTERNAL");
+    assert.equal(unreachable.retryable, true);
+    assert.match(unreachable.details, /node-unreachable/);
   });
 
-  it("marks fund-moving timeout codes as non-blindly-retryable", () => {
-    const deadline = mapGrpcError(4, "deadline exceeded");
+  it("marks fund-moving pay failures as never blindly retryable", () => {
+    const deadline = mapPaymentFailed("the payment timed out while routing");
     assert.equal(deadline.code, "DEADLINE_EXCEEDED");
-    const unimplemented = mapGrpcError(12, "unknown service wavewalletrpc.WalletService");
-    assert.equal(unimplemented.code, "WAVED_WALLET_API_UNAVAILABLE");
+    assert.equal(deadline.retryable, false);
+    const aborted = mapPaymentFailed("payment aborted by the node");
+    assert.equal(aborted.code, "ABORTED");
+    const other = mapPaymentFailed("no route found");
+    assert.equal(other.code, "INTERNAL");
+    assert.equal(other.retryable, false);
+  });
+
+  it("OMEGA-DELTA-0300: the expected-outflow bound is amount + the 0.4% fee, rounded up", () => {
+    // 10u = 1,000 sats; 0.4% = 4 sats; bound = 1004.
+    const known = expectedTotalOutflowSat("lntbs10u1p0example");
+    assert.equal(known.known, true);
+    assert.equal(known.expected, 1_004);
+    assert.equal(PHOENIXD_PAY_FEE_BASIS_POINTS, 40);
+    // Pay-any invoice (no amount): the loss rule must not false-trigger.
+    const unknown = expectedTotalOutflowSat("lntbs1p0example");
+    assert.equal(unknown.known, false);
   });
 });
 

@@ -32,9 +32,14 @@ export type ErrorCode =
   | "STALE_GENERATION"
   | "ALREADY_RUNNING"
   | "EXPORT_ALREADY_CONSUMED"
-  | "WAVED_BINARY_MISSING"
-  | "WAVED_WALLET_API_UNAVAILABLE"
-  | "WAVED_HEIGHT_UNAVAILABLE"
+  // OMEGA-DELTA-0303 (rail renames; the waved codes are replaced on the rail):
+  // WAVED_BINARY_MISSING -> NODE_UNCONFIGURED (the missing phoenixd env / rail
+  // connection); WAVED_WALLET_API_UNAVAILABLE removed (the waved wallet-API
+  // probe has no phoenixd equivalent); WAVED_HEIGHT_UNAVAILABLE ->
+  // TIP_HEIGHT_UNAVAILABLE (the public tip-API fail-closed code; 0304 carries
+  // the tip client — this slice's wallet-height answers it fail-closed).
+  | "NODE_UNCONFIGURED"
+  | "TIP_HEIGHT_UNAVAILABLE"
   | "INCOMPATIBLE_VERSION"
   | "SPEND_HALTED"
   | "INTERNAL";
