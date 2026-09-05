@@ -322,9 +322,29 @@ impl SovereignWalletSupervisor {
             )));
         }
         // 2. Kill + daily ceiling on the Debits path (0300 ALL-VALUE-TOUCHING).
+        //    Design §3.4: a policy refusal or kill is answered on the 21002
+        //    channel with the spec's GFY codes (1 denied / 4 rate limited)
+        //    WITHOUT paying — the requesting peer gets a typed answer even
+        //    when the local authority refuses (SEC-2026-116 closure).
         let now = now_unix();
-        self.spend_policy
-            .check_spend(SURFACE_WALLET_L402, amount_sats, now)?;
+        if let Err(error) = self
+            .spend_policy
+            .check_spend(SURFACE_WALLET_L402, amount_sats, now)
+        {
+            let (code, label) = if matches!(error, SovereignWalletError::SpendHalted(_)) {
+                (1, "denied: rail halted")
+            } else {
+                (4, "rate limited: daily ceiling")
+            };
+            let _ = self
+                .request(
+                    "debit-refuse",
+                    Some(json!({ "debitId": debit_id, "code": code, "error": format!("{label}: {error}") })),
+                    self.generation(),
+                )
+                .await;
+            return Err(error);
+        }
         // 3. Forward the host-initiated settlement to the sidecar (the sidecar
         //    verifies principal == the verified event author and then pays).
         let result = self
@@ -343,6 +363,15 @@ impl SovereignWalletSupervisor {
                 let reason = format!(
                     "loss-rule: over-settlement on CLINK debit (actual {actual} sats > expected {expected} sats)"
                 );
+                // Design §3.4: a payment error is answered on the 21002
+                // channel (GFY 1) before the fail-closed halt propagates.
+                let _ = self
+                    .request(
+                        "debit-refuse",
+                        Some(json!({ "debitId": debit_id, "code": 1, "error": format!("denied: {reason}") })),
+                        self.generation(),
+                    )
+                    .await;
                 self.spend_policy.auto_kill_loss_rule(&reason, now)?;
                 return Err(SovereignWalletError::SpendHalted(
                     self.spend_policy.halt_message(),
