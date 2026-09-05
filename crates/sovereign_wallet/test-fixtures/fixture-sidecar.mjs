@@ -19,6 +19,11 @@ const FIXTURE_NETWORK = argNetwork ? argNetwork.slice("--network=".length) : (pr
 const FIXTURE_NO_WALLET_HEIGHT = process.argv.includes("--no-wallet-height");
 // OMEGA-DELTA-0300: over-settlement simulation for the loss rule.
 const FIXTURE_OVER_SETTLE = process.argv.includes("--over-settle");
+// OMEGA-DELTA-0306 (WP-C4): the fixture counts fund-moving calls so the Rust
+// tests can PROVE a refused CLINK Debit never reached a pay call ("zero pay
+// calls" is observable from the fixture's own counter, not asserted from
+// inside the wrapper).
+let FIXTURE_PAY_CALLS = 0;
 
 const schema = "openagents.omega.sovereign-wallet.v1";
 let generation = 1;
@@ -129,6 +134,9 @@ process.stdin.on("data", (chunk) => {
           l402GatewayState: "absent",
           httpSurface: { bound: false, port: 0 },
           dataRoot: process.env.OMEGA_SOVEREIGN_WALLET_DATA_ROOT ?? "",
+          // OMEGA-DELTA-0306 (WP-C4): the fund-moving call counter — the
+          // "zero pay calls on a refused Debit" negative is provable here.
+          fixturePayCalls: FIXTURE_PAY_CALLS,
         });
         break;
       case "balance":
@@ -206,6 +214,36 @@ process.stdin.on("data", (chunk) => {
         });
         break;
       }
+      case "pay-debit": {
+        // OMEGA-DELTA-0306 (WP-C4): the CLINK twin of pay-invoice. The
+        // fixture mirrors the wrapper's settled-pay shape; the fund-moving
+        // counter increments here so a REFUSED Debit (the wrapper refuses
+        // before forwarding) is provably zero-pay-call from the fixture.
+        FIXTURE_PAY_CALLS += 1;
+        respond(id, true, {
+          paymentHash: FIXTURE_PAYMENT_HASH,
+          status: "ENTRY_STATUS_PENDING",
+          activityId: "fixture-activity-1",
+          actualAmountSat: FIXTURE_OVER_SETTLE ? "999" : "1",
+          expectedFeeSat: "0",
+          feeKnown: true,
+          expectedTotalOutflowSat: "1",
+          totalOutflowKnown: true,
+          warning: "",
+          preimage: FIXTURE_PREIMAGE,
+          debitId: frame.params?.debitId ?? "",
+        });
+        break;
+      }
+      case "debit-refuse":
+        respond(id, true, { refused: true, debitId: frame.params?.debitId ?? "" });
+        break;
+      case "pending-debits":
+        respond(id, true, { enabled: true, pendingDebits: [], count: 0 });
+        break;
+      case "clink-status":
+        respond(id, true, { enabled: true, pendingDebits: 0, servicePubkey: "ab".repeat(32) });
+        break;
       case "mcp-identity-map-get":
         respond(id, true, { entries: {} });
         break;

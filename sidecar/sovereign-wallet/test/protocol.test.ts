@@ -439,6 +439,37 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
     await sidecar.close();
   });
 
+  it("OMEGA-DELTA-0306: the CLINK layer is OFF by default — zero Nostr interaction, methods refuse, status is honest", async () => {
+    // Default spawn has OMEGA_CLINK_LAYER unset (design §9.2: OFF by default).
+    const sidecar = await spawnSidecar({});
+    try {
+      const initialize = expectOk(await sidecar.request("initialize"));
+      // The CLINK methods are NOT advertised when the layer is OFF.
+      assert.ok(!initialize.capabilities.includes("pay-debit"), "pay-debit must not be advertised when OFF");
+      assert.ok(!initialize.capabilities.includes("pending-debits"), "pending-debits must not be advertised when OFF");
+      assert.ok(initialize.capabilities.includes("clink-status"), "clink-status is a read-only projection, always advertised");
+      // The methods refuse with METHOD_NOT_FOUND (never a silent zero).
+      const refused = expectError(await sidecar.request("pay-debit", { debitId: "x", principal: "y" }));
+      assert.equal(refused.code, "METHOD_NOT_FOUND");
+      // The status projection honestly reports the disabled layer.
+      const status = expectOk(await sidecar.request("clink-status"));
+      assert.equal(status.enabled, false);
+    } finally {
+      await sidecar.close();
+    }
+  });
+
+  it("OMEGA-DELTA-0306: OMEGA_CLINK_LAYER=1 without the relay envs is refused at startup (INVALID_ARGS)", async () => {
+    const sidecar = await spawnSidecar({
+      OMEGA_CLINK_LAYER: "1",
+      // No OMEGA_CLINK_RELAY_URL / OMEGA_CLINK_SERVICE_KEY — a config error.
+    });
+    const exitCode = await waitForExit(sidecar.child);
+    assert.notEqual(exitCode, 0);
+    assert.match(sidecar.stderrText(), /OMEGA_CLINK_RELAY_URL/);
+    await sidecar.close();
+  });
+
   it("OMEGA-DELTA-0286/0303: mainnet env WITH the opt-in + the phoenixd rail configures mainnet (reported == configured)", async () => {
     const sidecar = await spawnSidecar({
       OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",

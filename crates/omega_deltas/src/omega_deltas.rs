@@ -270,6 +270,7 @@ pub const ENFORCED_DELTAS: &[&str] = &[
     "OMEGA-DELTA-0302",
     "OMEGA-DELTA-0304",
     "OMEGA-DELTA-0305",
+    "OMEGA-DELTA-0306",
 ];
 
 /// OMEGA-DELTA-0284. The sidecar identity keygen module — the sidecar's
@@ -3801,6 +3802,14 @@ pub const SOVEREIGN_TIP_API_PATH: &str = "sidecar/sovereign-wallet/src/tip-api.t
 pub const SOVEREIGN_PROTOCOL_PATH: &str = "sidecar/sovereign-wallet/src/protocol.ts";
 /// OMEGA-DELTA-0305. The sidecar protocol test suite (mainnet-only rails).
 pub const SOVEREIGN_SIDECAR_PROTOCOL_TEST_PATH: &str = "sidecar/sovereign-wallet/test/protocol.test.ts";
+/// OMEGA-DELTA-0306. The CLINK Offers/Debits listener (transport-only).
+pub const SOVEREIGN_CLINK_PATH: &str = "sidecar/sovereign-wallet/src/clink.ts";
+/// OMEGA-DELTA-0306. The Rust supervisor client (pay_debit_invoice wrapper).
+pub const SOVEREIGN_CLIENT_PATH_0306: &str = "crates/sovereign_wallet/src/client.rs";
+/// OMEGA-DELTA-0306. The sidecar CLINK tests (listener invariants).
+pub const SOVEREIGN_CLINK_TEST_PATH: &str = "sidecar/sovereign-wallet/test/clink.test.ts";
+/// OMEGA-DELTA-0306. The fixture's fund-moving call counter (zero-pay-call proof).
+pub const SOVEREIGN_FIXTURE_PATH: &str = "crates/sovereign_wallet/test-fixtures/fixture-sidecar.mjs";
 /// OMEGA-DELTA-0286. The waved launch + guards (network type, launch args,
 /// runtime assertion, invoice guard).
 pub const SOVEREIGN_WAVELENGTH_PATH: &str = "sidecar/sovereign-wallet/src/wavelength.ts";
@@ -33521,6 +33530,153 @@ mod tests {
         assert!(
             ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0305"),
             "OMEGA-DELTA-0305: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0306. CLINK Debits are mandate-gated transport only
+    /// (design §3, WP-C4): the sidecar listener queues 21002 Debits and never
+    /// pays on its own; the Rust `pay_debit_invoice` wrapper authorizes via
+    /// MandateStore (principal = the verified event author) + the spend
+    /// policy BEFORE any phoenixd call; a refused Debit is GFY 1 denied with
+    /// zero pay calls (provable); the kill blocks the Debit path; the NIP-AC
+    /// 39243 is emitted on the `clink-debit` lane after Authorized + settled;
+    /// lnbits-clink never mirrors mandates (no rule-engine divergence).
+    #[test]
+    fn clink_debits_are_mandate_gated_transport_only() {
+        // 1. The listener is transport-only: it subscribes to kinds 21001/
+        //    21002 addressed to the service pubkey, validates + queues, and
+        //    pays ONLY through the host-initiated `payDebit` path.
+        let clink = read_repository_file(SOVEREIGN_CLINK_PATH);
+        for required in [
+            "OMEGA-DELTA-0306",
+            "CLINK_OFFER_KIND",
+            "CLINK_DEBIT_KIND",
+            "verifyEvent(event)",
+            "PENDING_DEBIT_GLOBAL_CAP",
+            "PENDING_DEBIT_PER_PUBKEY_CAP",
+            "authorPubkey",
+            "payDebit(",
+            "GFY",
+        ] {
+            assert!(
+                clink.contains(required),
+                "OMEGA-DELTA-0306: clink.ts lost `{required}`; the transport-only                  listener (subscribe/validate/queue + host-initiated settlement +                  GFY semantics) must stay present"
+            );
+        }
+        // The transport never pays on its own: the pay call lives only in the
+        // host-initiated `payDebit` method.
+        assert!(
+            clink.contains("async payDebit("),
+            "OMEGA-DELTA-0306: clink.ts must host-initiate the pay path"
+        );
+
+        // 2. The Rust wrapper: authorize (MandateStore) -> spend policy ->
+        //    forward -> loss rule -> NIP-AC on the clink-debit lane.
+        let client = read_repository_file(SOVEREIGN_CLIENT_PATH_0306);
+        for required in [
+            "pay_debit_invoice",
+            "authorize_sovereign_spend",
+            "LANE_CLINK_DEBIT",
+            "OMEGA-DELTA-0306",
+        ] {
+            assert!(
+                client.contains(required),
+                "OMEGA-DELTA-0306: client.rs lost `{required}`; the mandate-gated                  pay_debit_invoice wrapper must stay present"
+            );
+        }
+
+        // 3. The sidecar wiring: flag-gated (OFF = zero Nostr), methods refuse
+        //    when OFF, and the real relay adapter uses the pinned SDK pool.
+        //    The env-name constants are DEFINED in clink.ts (the source of
+        //    truth) and USED by reference in main.ts.
+        let clink_consts = read_repository_file(SOVEREIGN_CLINK_PATH);
+        for required in [
+            "CLINK_LAYER_ENV = \"OMEGA_CLINK_LAYER\"",
+            "CLINK_RELAY_ENV = \"OMEGA_CLINK_RELAY_URL\"",
+            "CLINK_SERVICE_KEY_ENV = \"OMEGA_CLINK_SERVICE_KEY\"",
+        ] {
+            assert!(
+                clink_consts.contains(required),
+                "OMEGA-DELTA-0306: clink.ts lost `{required}`; the env-name \
+                 constants must stay present"
+            );
+        }
+        let main_ts = read_repository_file(SOVEREIGN_SIDECAR_MAIN_PATH);
+        for required in [
+            "CLINK_LAYER_ENV",
+            "CLINK_RELAY_ENV",
+            "CLINK_SERVICE_KEY_ENV",
+            "SimplePoolClinkRelayAdapter",
+        ] {
+            assert!(
+                main_ts.contains(required),
+                "OMEGA-DELTA-0306: main.ts lost `{required}`; the flag-gated CLINK \
+                 wiring (env constants used by reference + the real relay \
+                 adapter) must stay present"
+            );
+        }
+
+        // 4. Tests: the sidecar listener invariants + the Rust wrapper tests.
+        let clink_test = read_repository_file(SOVEREIGN_CLINK_TEST_PATH);
+        for required in [
+            "principal that is NOT the verified event author",
+            "per-pubkey cap refuses additional debits",
+        ] {
+            assert!(
+                clink_test.contains(required),
+                "OMEGA-DELTA-0306: clink.test.ts lost the named invariant test                  (SEC-2026-106a author-principal / SEC-2026-106b flood cap /                  OFF = zero Nostr)"
+            );
+        }
+        let protocol_test = read_repository_file(SOVEREIGN_SIDECAR_PROTOCOL_TEST_PATH);
+        assert!(
+            protocol_test.contains("OMEGA-DELTA-0306: the CLINK layer is OFF by default"),
+            "OMEGA-DELTA-0306: protocol.test.ts must carry the flag-OFF test"
+        );
+        let fixture = read_repository_file(SOVEREIGN_FIXTURE_PATH);
+        assert!(
+            fixture.contains("fixturePayCalls"),
+            "OMEGA-DELTA-0306: the fixture must expose the fund-moving call              counter (the zero-pay-call negative is provable from it)"
+        );
+
+        // 5. The wrapper's tests exist in the owning crate.
+        let tests_rs = read_repository_file("crates/sovereign_wallet/src/tests.rs");
+        for test_name in [
+            "clink_debit_without_a_mandate_is_refused_with_zero_pay_calls",
+            "clink_debit_pays_with_a_mandate_and_emits_the_clink_lane",
+            "clink_debit_is_killed_when_the_spend_kill_is_set",
+        ] {
+            assert!(
+                tests_rs.contains(test_name),
+                "OMEGA-DELTA-0306: the owning crate lost the named test `{test_name}`"
+            );
+        }
+
+        // 6. The SDK install-gate: pinned exact version, no second nostr-tools.
+        let package_json = read_repository_file("sidecar/sovereign-wallet/package.json");
+        assert!(
+            package_json.contains("@shocknet/clink-sdk\": \"1.7.3\""),
+            "OMEGA-DELTA-0306: the clink-sdk must be pinned exactly (SEC-2026-109              install-gate)"
+        );
+        assert!(
+            !package_json.contains("nostr-tools"),
+            "OMEGA-DELTA-0306: nostr-tools must NOT be a direct dependency (the              SDK pins it — a second copy causes decrypt failures)"
+        );
+
+        // 7. The NIP-AC lane constant.
+        let nipac = read_repository_file(NIPAC_PROJECTION_PATH);
+        assert!(
+            nipac.contains("LANE_CLINK_DEBIT"),
+            "OMEGA-DELTA-0306: nipac.rs must carry the clink-debit lane constant"
+        );
+
+        // Registration is three-place.
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0306").contains("MandateStore"),
+            "OMEGA-DELTA-0306: the registry row must describe the mandate-gated              posture"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0306"),
+            "OMEGA-DELTA-0306: the delta is no longer listed in ENFORCED_DELTAS"
         );
     }
 }

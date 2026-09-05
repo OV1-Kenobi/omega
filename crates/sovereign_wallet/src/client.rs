@@ -16,6 +16,7 @@ use crate::protocol::{
 };
 use crate::spend_policy::{SURFACE_WALLET_L402, bolt11_amount_sats};
 use crate::supervisor::SovereignWalletSupervisor;
+use trading_mandate::{MandateDecision, MandateStore, SOVEREIGN_WALLET_VENUE};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SovereignWalletError {
@@ -258,6 +259,134 @@ impl SovereignWalletSupervisor {
 
     pub async fn shutdown(&mut self) -> Result<Value, SovereignWalletError> {
         self.request("shutdown", None, self.generation()).await
+    }
+
+    /// OMEGA-DELTA-0306 (design §3.4): the CLINK twin of `pay_l402_challenge`.
+    ///
+    /// Host-initiated settlement of a queued CLINK Debit. The sidecar's
+    /// `pay-debit` never pays on its own — this wrapper is the authority gate:
+    ///
+    /// 1. `authorize_sovereign_spend` — principal = the REQUESTING AGENT
+    ///    PUBKEY (the verified 21002 event author; SEC-2026-106a — never a
+    ///    content field). `Refused` → the sidecar answers GFY code 1 denied
+    ///    WITHOUT paying and NO phoenixd call happens (the negative is
+    ///    provable from the fixture call log).
+    /// 2. `spend_policy.check_spend(SURFACE_WALLET_L402, ...)` — kill + daily
+    ///    ceiling on the Debits path (ALL-VALUE-TOUCHING: a killed rail
+    ///    refuses debits too; refusal → GFY code 1/4 without paying).
+    /// 3. On `Authorized`, forwards `pay-debit` to the sidecar — which pays
+    ///    via phoenixd and publishes the 21002 success response.
+    /// 4. Loss rule (expected-vs-actual) + `record_spend` on the settled pay.
+    /// 5. NIP-AC 39243 after the local Authorized AND the settled pay (lane
+    ///    `LANE_CLINK_DEBIT`; the settled amount is the sidecar's reported
+    ///    actual — never a CLINK receipt's claim, design §3.4e).
+    pub async fn pay_debit_invoice(
+        &mut self,
+        mandate_store: &MandateStore,
+        debit_id: &str,
+        principal: &str,
+        invoice: &str,
+        // The idempotency key is accepted for interface symmetry with
+        // `pay_l402_challenge`; the CLINK debit path is idempotent by the
+        // payment hash (a duplicate 21002 is a new queue entry with a new
+        // debit id), so the sidecar does not key a replay cache on it.
+        _idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<PayResult, SovereignWalletError> {
+        let network = crate::mandate::sovereign_wallet_network(self.network())?;
+        let amount_sats = bolt11_amount_sats(invoice).unwrap_or(0);
+        // 1. The single spend gate (D2): authorize BEFORE any phoenixd call.
+        let decision = crate::mandate::authorize_sovereign_spend(
+            mandate_store,
+            amount_sats,
+            network,
+            Some(principal),
+            now_ms,
+        )?;
+        let refused_reason = match &decision {
+            MandateDecision::Authorized { .. } => None,
+            MandateDecision::Refused { reason, .. } => Some(reason),
+        };
+        if let Some(reason) = refused_reason {
+            // GFY code 1 denied on the 21002 channel, WITHOUT paying.
+            let refusal_text = serde_json::to_string(reason).unwrap_or_else(|_| "mandate refused".to_string());
+            let _ = self
+                .request(
+                    "debit-refuse",
+                    Some(json!({ "debitId": debit_id, "code": 1, "error": format!("denied: {refusal_text}") })),
+                    self.generation(),
+                )
+                .await;
+            return Err(SovereignWalletError::SpendPolicyRefused(format!(
+                "CLINK debit {debit_id} refused by the mandate gate (OMEGA-DELTA-0306): {refusal_text}"
+            )));
+        }
+        // 2. Kill + daily ceiling on the Debits path (0300 ALL-VALUE-TOUCHING).
+        let now = now_unix();
+        self.spend_policy
+            .check_spend(SURFACE_WALLET_L402, amount_sats, now)?;
+        // 3. Forward the host-initiated settlement to the sidecar (the sidecar
+        //    verifies principal == the verified event author and then pays).
+        let result = self
+            .request(
+                "pay-debit",
+                Some(json!({ "debitId": debit_id, "principal": principal })),
+                self.generation(),
+            )
+            .await?;
+        let pay: PayResult = decode(result, "pay-debit result")?;
+        // 4. Loss rule: expected-vs-actual on the settled pay.
+        if pay.total_outflow_known {
+            let actual = pay.actual_amount_sat.parse::<u64>().unwrap_or(0);
+            let expected = pay.expected_total_outflow_sat.parse::<u64>().unwrap_or(0);
+            if actual > expected {
+                let reason = format!(
+                    "loss-rule: over-settlement on CLINK debit (actual {actual} sats > expected {expected} sats)"
+                );
+                self.spend_policy.auto_kill_loss_rule(&reason, now)?;
+                return Err(SovereignWalletError::SpendHalted(
+                    self.spend_policy.halt_message(),
+                ));
+            }
+        }
+        // Count real payments only (the sidecar confirmed the payment).
+        self.spend_policy.record_spend(SURFACE_WALLET_L402, amount_sats, now)?;
+        // 5. NIP-AC 39243 after the local Authorized AND the settled pay. The
+        //    completion proof is the payment hash (the sidecar's reported
+        //    payment hash — the preimage never travels in the projection).
+        let payment_hash_digest = pay.payment_hash.as_deref().unwrap_or_default();
+        crate::nipac::emit_settled_spend_pair(
+            mandate_store,
+            SOVEREIGN_WALLET_VENUE,
+            network,
+            Some(principal),
+            &decision,
+            amount_sats,
+            Some(payment_hash_digest),
+            crate::nipac::LANE_CLINK_DEBIT,
+            pay.actual_amount_sat.parse::<u64>().ok(),
+            payment_hash_digest,
+        );
+        Ok(pay)
+    }
+
+    /// OMEGA-DELTA-0306 (design §3.4): refuse a queued CLINK Debit WITHOUT
+    /// paying (GFY on the 21002 channel). Used by the wrapper's caller when a
+    /// Debit must be dropped for a host-level reason; the wrapper itself uses
+    /// `debit-refuse` on mandate/policy refusal. Returns whether a queued
+    /// debit was found and refused.
+    pub async fn refuse_debit(&mut self, debit_id: &str, code: u32, error: &str) -> Result<bool, SovereignWalletError> {
+        let result = self
+            .request(
+                "debit-refuse",
+                Some(json!({ "debitId": debit_id, "code": code, "error": error })),
+                self.generation(),
+            )
+            .await?;
+        Ok(result
+            .get("refused")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false))
     }
 }
 

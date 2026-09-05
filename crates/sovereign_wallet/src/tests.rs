@@ -632,3 +632,159 @@ async fn construction_spawns_the_sidecar_when_flag_on(cx: &mut gpui::TestAppCont
         std::env::remove_var("FIXTURE_NETWORK");
     }
 }
+// ---------------------------------------------------------------------------
+// OMEGA-DELTA-0306 — CLINK Debits: the mandate-gated pay lane (design §3.4)
+// ---------------------------------------------------------------------------
+
+fn clink_agent() -> String {
+    "a1".repeat(32)
+}
+
+fn approve_clink_agent_mandate(
+    store: &trading_mandate::MandateStore,
+    max_payment_sat: u64,
+    now_ms: i64,
+) {
+    let candidate = crate::sovereign_wallet_mandate_candidate(
+        trading_mandate::TradingNetwork::Mainnet,
+        clink_agent().as_str(),
+        max_payment_sat,
+        now_ms + 100_000,
+    );
+    let proposal = store.propose(candidate).expect("proposal");
+    trading_mandate::apply_ui_approved_for_test(store, proposal, now_ms).expect("approved");
+}
+
+fn fixture_pay_calls(supervisor: &mut SovereignWalletSupervisor) -> u64 {
+    smol::block_on(async {
+        let status = supervisor
+            .request("status", None, supervisor.generation())
+            .await
+            .expect("fixture status");
+        status
+            .get("fixturePayCalls")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    })
+}
+
+#[test]
+fn clink_debit_without_a_mandate_is_refused_with_zero_pay_calls() {
+    // OMEGA-DELTA-0306 (WP-C4 acceptance): a Debit from an unauthorized
+    // principal is refused (GFY 1 denied) and NO phoenixd pay call happens —
+    // provable from the FIXTURE's own pay-call counter (the wrapper refuses
+    // before forwarding, so the fixture never sees a pay-debit request).
+    smol::block_on(async {
+        let store = trading_mandate::MandateStore::in_memory().expect("store");
+        let _rail = crate::test_support::hold_allow_mainnet_opt_in();
+        let mut supervisor = make_supervisor(
+            "mainnet",
+            fixture_command_with_network(&fixture_path(), "mainnet"),
+        )
+        .expect("supervisor");
+        supervisor.start().await.context("initialize").unwrap();
+        let before = fixture_pay_calls(&mut supervisor);
+
+        let refused = supervisor
+            .pay_debit_invoice(
+                &store,
+                "debit-unauthorized",
+                clink_agent().as_str(),
+                "lnbc10u1p0example",
+                "clink-key-1",
+                1,
+            )
+            .await
+            .expect_err("a Debit without a mandate must be refused");
+        assert!(
+            refused.to_string().contains("refused by the mandate gate"),
+            "the refusal must name the mandate gate: {refused}"
+        );
+        assert_eq!(
+            fixture_pay_calls(&mut supervisor),
+            before,
+            "zero phoenixd pay calls must be provable from the fixture counter"
+        );
+        supervisor.stop().await.ok();
+    });
+}
+
+#[test]
+fn clink_debit_pays_with_a_mandate_and_emits_the_clink_lane() {
+    // OMEGA-DELTA-0306 (WP-C4 acceptance): an authorized principal's Debit
+    // pays (the fixture answers pay-debit) and the NIP-AC 39243 is emitted on
+    // the CLINK_DEBIT lane after the local Authorized AND the settled pay.
+    smol::block_on(async {
+        let store = trading_mandate::MandateStore::in_memory().expect("store");
+        approve_clink_agent_mandate(&store, 50_000, 1);
+        let _rail = crate::test_support::hold_allow_mainnet_opt_in();
+        let mut supervisor = make_supervisor(
+            "mainnet",
+            fixture_command_with_network(&fixture_path(), "mainnet"),
+        )
+        .expect("supervisor");
+        supervisor.start().await.context("initialize").unwrap();
+        let before = fixture_pay_calls(&mut supervisor);
+
+        let paid = supervisor
+            .pay_debit_invoice(
+                &store,
+                "debit-authorized",
+                clink_agent().as_str(),
+                "lnbc10u1p0example",
+                "clink-key-2",
+                2,
+            )
+            .await
+            .expect("an approved mandate must authorize the Debit pay");
+        assert_eq!(paid.preimage.as_deref(), Some("b".repeat(64).as_str()));
+        assert_eq!(
+            fixture_pay_calls(&mut supervisor),
+            before + 1,
+            "exactly one pay call must reach the fixture"
+        );
+        supervisor.stop().await.ok();
+    });
+}
+
+#[test]
+fn clink_debit_is_killed_when_the_spend_kill_is_set() {
+    // OMEGA-DELTA-0306 (WP-C4 acceptance): the 0300 kill blocks the Debit
+    // path at the spend-policy choke point BEFORE any pay call.
+    smol::block_on(async {
+        let store = trading_mandate::MandateStore::in_memory().expect("store");
+        approve_clink_agent_mandate(&store, 50_000, 1);
+        let _rail = crate::test_support::hold_allow_mainnet_opt_in();
+        let mut supervisor = crate::test_support::with_spend_kill_env(|| {
+            make_supervisor(
+                "mainnet",
+                fixture_command_with_network(&fixture_path(), "mainnet"),
+            )
+            .expect("supervisor")
+        });
+        supervisor.start().await.context("initialize").unwrap();
+        let before = fixture_pay_calls(&mut supervisor);
+
+        let refused = supervisor
+            .pay_debit_invoice(
+                &store,
+                "debit-killed",
+                clink_agent().as_str(),
+                "lnbc10u1p0example",
+                "clink-key-3",
+                3,
+            )
+            .await
+            .expect_err("a killed rail must refuse the Debit path");
+        assert!(
+            matches!(refused, SovereignWalletError::SpendHalted(_)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            fixture_pay_calls(&mut supervisor),
+            before,
+            "zero phoenixd pay calls on a killed Debit"
+        );
+        supervisor.stop().await.ok();
+    });
+}

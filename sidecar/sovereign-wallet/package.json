@@ -21,6 +21,7 @@
     "@scure/base": "2.3.0",
     "@scure/bip32": "2.3.0",
     "@scure/bip39": "2.3.0",
+    "@shocknet/clink-sdk": "1.7.3",
     "effect": "3.22.1"
   },
   "devDependencies": {

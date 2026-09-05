@@ -34,6 +34,8 @@ import path from "node:path";
 
 import { getTipHeight } from "./tip-api.js";
 import { lockdownTree } from "./acl.js";
+import { ClinkListener, CLINK_LAYER_ENV, CLINK_RELAY_ENV, CLINK_SERVICE_KEY_ENV, type RelayAdapter } from "./clink.js";
+import { SimplePool } from "@shocknet/clink-sdk";
 import { LoopbackHttpServer, validateLoopbackToken } from "./http.js";
 import { IdempotencyStore } from "./idempotency.js";
 import { L402Gateway, DEMO_ECHO_PATH, DEMO_MCP_PATH_PREFIX } from "./l402.js";
@@ -110,6 +112,15 @@ export interface SidecarConfig {
    * `OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN=memory`; never set in production.
    */
   vaultKeychain?: "os" | "memory";
+  /**
+   * OMEGA-DELTA-0306 (design §3, WP-C4): the CLINK Offers/Debits layer.
+   * Enabled ONLY by `OMEGA_CLINK_LAYER=1` (default OFF = phoenixd-rail-only,
+   * zero Nostr interaction). When ON, the relay URL and the service signing
+   * key (env-injected, redaction-registered) are required.
+   */
+  clinkEnabled: boolean;
+  clinkRelayUrl: string | undefined;
+  clinkServiceKey: string | undefined;
 }
 
 export interface WalletMarker {
@@ -168,6 +179,13 @@ export class SidecarCore {
   /** WP-6: the MDK-protocol L-402 gateway (design §5; D3/D5) — the ONLY paid boundary. */
   #l402Gateway: L402Gateway | null = null;
   #l402Store: L402Store | null = null;
+  /**
+   * OMEGA-DELTA-0306 (design §3, WP-C4): the CLINK Offers/Debits listener.
+   * Constructed ONLY when `OMEGA_CLINK_LAYER=1`; the listener is transport
+   * only — it queues Debits and never pays (the Rust `pay_debit_invoice`
+   * wrapper authorizes before any phoenixd call).
+   */
+  #clink: ClinkListener | null = null;
 
   constructor(config: SidecarConfig) {
     this.#config = config;
@@ -360,6 +378,63 @@ export class SidecarCore {
         nowMs: () => Date.now(),
       });
     }
+
+    // OMEGA-DELTA-0306 (design §3, WP-C4): the CLINK Offers/Debits layer.
+    // Enabled ONLY by OMEGA_CLINK_LAYER=1; the listener is transport-only —
+    // it subscribes to kinds 21001/21002 addressed to the app's service
+    // pubkey, validates + queues Debits, and NEVER pays (the Rust
+    // `pay_debit_invoice` wrapper authorizes before any phoenixd call).
+    // OFF (default) = no Nostr pool is ever constructed (tested).
+    if (this.#config.clinkEnabled) {
+      if (!this.#config.clinkRelayUrl || !this.#config.clinkServiceKey) {
+        throw envelopeError(
+          "INVALID_ARGS",
+          `INVALID_ARGS: ${CLINK_LAYER_ENV}=1 requires ${CLINK_RELAY_ENV} and ${CLINK_SERVICE_KEY_ENV} (OMEGA-DELTA-0306)`,
+        );
+      }
+      this.#clink = new ClinkListener({
+        serviceKeyHex: this.#config.clinkServiceKey,
+        relayUrls: [this.#config.clinkRelayUrl],
+        mintInvoice: async (amtSat, memo) => {
+          // OMEGA-DELTA-0306: the Offer mint reuses the SAME one-mint-surface
+          // as the L-402 gateway (design §3.3 step 2: "the SAME make-invoice
+          // path") — the kill closure reads the environment kill BEFORE the
+          // phoenixd createinvoice call (0300 ordering anchor, re-anchored).
+          if (process.env[SPEND_KILL_ENV] === "1") {
+            throw envelopeError(
+              "SPEND_HALTED",
+              `SPEND_HALTED: the spend kill is set (${SPEND_KILL_ENV}=1); the CLINK offer mint refuses until the founder re-enables (OMEGA-DELTA-0300/0306)`,
+            );
+          }
+          const created = await this.#phoenixd!.createInvoice(amtSat, memo);
+          assertInvoiceNetwork(this.#config.network, created.serialized);
+          return { invoice: created.serialized, paymentHash: created.paymentHash ?? "" };
+        },
+        payInvoice: async (invoice) => {
+          // OMEGA-DELTA-0306: the Debit settlement calls the SAME phoenixd
+          // pay path; the 0300 kill is read here too (ALL-VALUE-TOUCHING — a
+          // halted rail refuses debits at the transport too; the Rust wrapper
+          // is the primary gate, this is defense-in-depth at the sidecar).
+          if (process.env[SPEND_KILL_ENV] === "1") {
+            throw envelopeError(
+              "SPEND_HALTED",
+              `SPEND_HALTED: the spend kill is set (${SPEND_KILL_ENV}=1); the CLINK debit settlement refuses until the founder re-enables (OMEGA-DELTA-0300/0306)`,
+            );
+          }
+          assertInvoiceNetwork(this.#config.network, invoice);
+          const sent = await this.#phoenixd!.payInvoice(invoice);
+          const preimage = sent.paymentPreimage;
+          if (preimage) registerSecret(preimage);
+          return { preimage, actualAmountSat: String(sent.recipientAmountSat + sent.routingFeeSat) };
+        },
+        isKilled: () => process.env[SPEND_KILL_ENV] === "1",
+        relay: new SimplePoolClinkRelayAdapter(this.#config.clinkRelayUrl),
+        log: (message) => {
+          console.error(`sovereign-wallet: ${redact(message)}`);
+        },
+      });
+      this.#clink.start();
+    }
   }
 
   /** Ordered teardown: rail, HTTP, idempotency, lock (OMEGA-DELTA-0303). */
@@ -390,6 +465,12 @@ export class SidecarCore {
     if (this.#l402Store) {
       this.#l402Store.close();
       this.#l402Store = null;
+    }
+    // OMEGA-DELTA-0306: stop the CLINK listener (close the relay subscription
+    // + clear the pending-debit queue) on any teardown.
+    if (this.#clink) {
+      this.#clink.stop();
+      this.#clink = null;
     }
     // OMEGA-DELTA-0303: the phoenixd rail is client-only — nothing to
     // terminate; the client object is dropped (its API key lives in the
@@ -495,6 +576,14 @@ export class SidecarCore {
         "mcp-identity-map-get",
         "mcp-identity-map-set",
         "shutdown",
+        // OMEGA-DELTA-0306 (design §9.2): the CLINK methods are advertised
+        // ONLY when the layer is enabled — OFF = zero Nostr interaction, and
+        // the stdio surface honestly does not claim them. `clink-status` is
+        // always advertised (a read-only projection that reports the layer
+        // state honestly, including disabled).
+        ...(this.#config.clinkEnabled
+          ? ["pay-debit", "debit-refuse", "pending-debits", "clink-status"]
+          : ["clink-status"]),
       ],
       dataRoot: this.#config.dataRoot,
       network: this.#config.network,
@@ -651,6 +740,84 @@ export class SidecarCore {
     const cached = { ...result, preimage: null };
     this.#idempotency?.store("pay-invoice", idempotencyKey, cached);
     return result;
+  }
+
+  /**
+   * OMEGA-DELTA-0306 (design §3.4, WP-C4): host-initiated Debit settlement.
+   * The Rust `pay_debit_invoice` wrapper runs `authorize_sovereign_spend` +
+   * the spend policy BEFORE calling this — the sidecar never pays a Debit on
+   * its own (SEC-2026-106: transport only). The principal MUST be the
+   * verified event author (the signature's pubkey — never a content field).
+   */
+  async payDebit(debitId: string, principal: string): Promise<Record<string, unknown>> {
+    if (!this.#clink) {
+      throw envelopeError(
+        "METHOD_NOT_FOUND",
+        `METHOD_NOT_FOUND: pay-debit requires the CLINK layer (${CLINK_LAYER_ENV}=1; OMEGA-DELTA-0306)`,
+      );
+    }
+    const { outcome, debit } = await this.#clink.payDebit(debitId, principal);
+    if (outcome.status === "ok") {
+      return {
+        status: "ok",
+        preimage: outcome.preimage ?? null,
+        debitId,
+        authorPubkey: debit?.authorPubkey ?? principal,
+      };
+    }
+    return {
+      status: "GFY",
+      gfyCode: outcome.gfyCode ?? 2,
+      gfyError: outcome.gfyError ?? "debit refused",
+      debitId,
+    };
+  }
+
+  /**
+   * OMEGA-DELTA-0306 (design §3.4): host-initiated refusal WITHOUT paying —
+   * the Rust wrapper calls this when `authorize_sovereign_spend` or the
+   * spend policy refuses a queued Debit (GFY code 1 denied / 4 rate limited).
+   */
+  async refuseDebit(debitId: string, code: number, error: string): Promise<Record<string, unknown>> {
+    if (!this.#clink) {
+      throw envelopeError(
+        "METHOD_NOT_FOUND",
+        `METHOD_NOT_FOUND: debit-refuse requires the CLINK layer (${CLINK_LAYER_ENV}=1; OMEGA-DELTA-0306)`,
+      );
+    }
+    const refused = await this.#clink.refuseDebit(debitId, code, error);
+    return { refused, debitId };
+  }
+
+  /** Read-only view of the pending-debit queue (the host poller's input). */
+  async pendingDebits(): Promise<Record<string, unknown>> {
+    if (!this.#clink) {
+      throw envelopeError(
+        "METHOD_NOT_FOUND",
+        `METHOD_NOT_FOUND: pending-debits requires the CLINK layer (${CLINK_LAYER_ENV}=1; OMEGA-DELTA-0306)`,
+      );
+    }
+    const status = this.#clink.status();
+    const debits = [];
+    for (const debit of this.#clink.pendingDebits()) {
+      debits.push({
+        debitId: debit.debitId,
+        authorPubkey: debit.authorPubkey,
+        invoice: debit.invoice,
+        amountSat: debit.amountSat ?? null,
+        description: debit.description ?? null,
+      });
+    }
+    return { enabled: status.enabled, pendingDebits: debits, count: debits.length };
+  }
+
+  /** Read-only CLINK layer status for the operator surface. */
+  async clinkStatus(): Promise<Record<string, unknown>> {
+    if (!this.#clink) {
+      return { enabled: false, pendingDebits: 0, servicePubkey: null, note: `CLINK layer OFF (${CLINK_LAYER_ENV} unset)` };
+    }
+    const status = this.#clink.status();
+    return { enabled: status.enabled, pendingDebits: status.pendingDebits, servicePubkey: status.servicePubkey };
   }
 
   /** Merged wallet activity feed (design §2.2). */
@@ -986,6 +1153,24 @@ export class SidecarCore {
         );
       case "pay-invoice":
         return this.payInvoice(requireString(params, "invoice"), requireString(params, "idempotencyKey"));
+      case "pay-debit":
+        // OMEGA-DELTA-0306 (design §3.4): host-initiated Debit settlement.
+        // The Rust wrapper authorizes BEFORE calling; the sidecar verifies the
+        // principal is the verified event author and then pays.
+        return this.payDebit(requireString(params, "debitId"), requireString(params, "principal"));
+      case "debit-refuse":
+        // OMEGA-DELTA-0306: host-initiated refusal WITHOUT paying (GFY).
+        return this.refuseDebit(
+          requireString(params, "debitId"),
+          requireNumber(params, "code"),
+          requireString(params, "error"),
+        );
+      case "pending-debits":
+        // OMEGA-DELTA-0306: read-only queue view (the host poller's input).
+        return this.pendingDebits();
+      case "clink-status":
+        // OMEGA-DELTA-0306: read-only CLINK layer state.
+        return this.clinkStatus();
       case "activity":
         return this.activity(numberOr(params, "limit", 100), stringOr(params, "cursor", undefined));
 case "identity-status":
@@ -1026,6 +1211,46 @@ case "identity-status":
       default:
         throw envelopeError("METHOD_NOT_FOUND", `unknown method ${method}`);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CLINK relay transport (OMEGA-DELTA-0306, design §3.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * The real relay adapter: subscribes to kinds 21001/21002 addressed to the
+ * service pubkey and publishes service replies via nostr-tools SimplePool
+ * (re-exported by the pinned @shocknet/clink-sdk — never a second copy).
+ * Tests inject a fake adapter (CI never touches a live relay).
+ */
+export class SimplePoolClinkRelayAdapter implements RelayAdapter {
+  readonly #pool = new SimplePool();
+  readonly #relayUrls: string[];
+
+  constructor(relayUrl: string) {
+    this.#relayUrls = [relayUrl];
+  }
+
+  subscribe(
+    kinds: number[],
+    toPubkey: string,
+    onEvent: (event: import("nostr-tools").Event) => void,
+  ): () => void {
+    const sub = this.#pool.subscribeMany(
+      this.#relayUrls,
+      [{ kinds, "#p": [toPubkey] }],
+      { onevent: onEvent },
+    );
+    return () => sub.close();
+  }
+
+  async publish(event: import("nostr-tools").Event): Promise<void> {
+    await Promise.allSettled(this.#pool.publish(this.#relayUrls, event));
+  }
+
+  close(): void {
+    this.#pool.close(this.#relayUrls);
   }
 }
 
@@ -1191,6 +1416,13 @@ export function parseEnvironment(): SidecarConfig {
   // (never set in production); the production default is the OS keychain.
   const vaultKeychainRaw = process.env.OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN;
   const vaultKeychain = vaultKeychainRaw === "memory" ? "memory" : undefined;
+  // OMEGA-DELTA-0306 (design §9.2/§9.3): the CLINK layer flag + envs. Default
+  // OFF; ON requires the relay URL + the service signing key (env-injected,
+  // redaction-registered — the 64-hex shape is already covered by redact.ts).
+  const clinkEnabled = process.env[CLINK_LAYER_ENV] === "1";
+  const clinkRelayUrl = process.env[CLINK_RELAY_ENV];
+  const clinkServiceKey = process.env[CLINK_SERVICE_KEY_ENV];
+  if (clinkEnabled && clinkServiceKey) registerSecret(clinkServiceKey);
   return {
     dataRoot,
     network: networkRaw as PhoenixdNetwork,
@@ -1200,6 +1432,9 @@ export function parseEnvironment(): SidecarConfig {
     phoenixdApiKey,
     generation,
     vaultKeychain,
+    clinkEnabled,
+    clinkRelayUrl,
+    clinkServiceKey,
   };
 }
 

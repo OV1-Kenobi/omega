@@ -208,6 +208,11 @@ pub const RAIL_LIGHTNING: &str = "lightning";
 pub const LANE_L402_REDEMPTION: &str = "l402-redemption";
 pub const LANE_ESCROW_ARBITRATION_FEE: &str = "escrow-arbitration-fee";
 pub const LANE_WALLET_PAYMENT: &str = "wallet-payment";
+/// OMEGA-DELTA-0306 (design §3.4): the CLINK Debits lane — the NIP-AC 39243
+/// spend-authorization emission after the local Authorized decision AND the
+/// settled phoenixd pay (the settled amount is the sidecar's reported actual,
+/// never a CLINK receipt's claim).
+pub const LANE_CLINK_DEBIT: &str = "clink-debit";
 
 /// The closed NIP-AC kind set as a type: every emitter reaches signing
 /// through a `NipacEventKind`, so the compiler-level surface only admits

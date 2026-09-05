@@ -11037,6 +11037,16 @@ re-deriving the preserved hardening design.
 
 - **Enforced by:** `escrow_venue_and_ledger_kinds_are_registered` in `omega_deltas`.
 
+### OMEGA-DELTA-0306 - CLINK Offers/Debits layer: spend authorized ONLY via MandateStore (no rule-engine divergence; design §3, WP-C4)
+
+Upstream Zed has no sovereign-wallet surface. Omega-before-this (the waved era, before WP-C4) had no Nostr-native payment layer: the L-402 gateway was the only paid boundary, and there was no CLINK Offers/Debits surface.
+
+Omega now adds the CLINK layer (`sidecar/sovereign-wallet/src/clink.ts`, enabled ONLY by `OMEGA_CLINK_LAYER=1` — default OFF, zero Nostr interaction when OFF): the sidecar is the app's CLINK node-service endpoint, subscribing to kinds 21001 (Offers) and 21002 (Debits) addressed to its service pubkey over the configured strfry relay(s), NIP-44 decrypting, validating with the @shocknet/clink-sdk validators (pinned 1.7.3; nostr-tools 2.15.1 pinned by the SDK — never a second copy, per the SDK's decrypt-failure warning). Offers mint via the SAME one-mint-surface as the L-402 gateway (phoenixd createinvoice, kill closure before mint) and reply with the BOLT11; Debits are QUEUED (bounded global + per-pubkey caps — SEC-2026-106b flood control) and NEVER paid by the transport. Settlement is host-initiated: the Rust wrapper `pay_debit_invoice` (client.rs — the CLINK twin of `pay_l402_challenge`) runs `authorize_sovereign_spend` with principal = the VERIFIED 21002 event author (SEC-2026-106a — never a content field), then the spend policy (kill + daily ceiling, ALL-VALUE-TOUCHING), then forwards `pay-debit` to the sidecar which pays via phoenixd and publishes the 21002 success response; the loss rule + `record_spend` run on the settled pay, and the NIP-AC 39243 is emitted after the local Authorized AND the settled pay on the `clink-debit` lane (the settled amount is the sidecar's reported actual, never a CLINK receipt's claim). A refused Debit answers GFY code 1 denied WITHOUT any phoenixd call (provable from the fixture call counter). LNbits rule budgets are never configured to mirror MandateStore (that would be the forbidden rule-engine divergence); lnbits-clink stays founder/ops-only. The CLINK layer is additive and transport-only — it never becomes an authority, never mints outside the phoenixd make path, and never pays outside the mandate-gated pay path.
+
+Why: D2 (founder decision) — the sidecar runs `authorize_sovereign_spend` before phoenixd pays; CLINK Debits are transport only; no LNbits rule-engine divergence.
+
+- **Enforced by:** `clink_debits_are_mandate_gated_transport_only` in `omega_deltas`.
+
 ### OMEGA-DELTA-0305 - Payments-rail network posture: mainnet operative; signet/regtest rail configuration refused at startup; mainnet still requires the allow-mainnet opt-in; unset never defaults to mainnet; scope-limited (LN Markets/Nautilus signet deltas untouched)
 
 Upstream Zed has no sovereign-wallet surface. Omega-before-this (0286/0303 era) ran the payments rail on a `signet | regtest | mainnet` grammar: signet/regtest fixture rails were constructible, and the waved-era D4 posture kept signet as a first-class rail network.
