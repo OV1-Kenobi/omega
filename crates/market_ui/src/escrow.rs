@@ -889,10 +889,11 @@ pub fn timeout_window_open(session: &EscrowSession, observed_height: u32) -> boo
     u64::from(observed_height) < session.timeout_at_height
 }
 
-/// Read the observed signet tip through the sanctioned seam — the sidecar's
-/// `wallet-height` probe of the waved getinfo surface (the WP-3b decision:
-/// ONE tip source). Any probe failure propagates: the escrow timeout gate
-/// fails closed and never falls back to wall-clock (SEC-2026-087).
+/// Read the observed chain tip through the sanctioned seam — the sidecar's
+/// `wallet-height` probe of the public tip API (OMEGA-DELTA-0304; the WP-3b
+/// decision: ONE tip source). Any probe failure propagates: the escrow
+/// timeout gate fails closed and never falls back to wall-clock
+/// (SEC-2026-087; safe-direction staleness per 0304).
 pub async fn observe_wallet_height(
     supervisor: &mut sovereign_wallet::SovereignWalletSupervisor,
 ) -> Result<u32> {
@@ -965,9 +966,8 @@ pub async fn pay_arbitration_fee_and_request_arbitration(
     // OMEGA-DELTA-0286: the mandate instruction carries the SESSION's
     // network, so a mainnet escrow fee is gated by a
     // (sovereign-wallet, mainnet, principal) mandate (mainnet-only rail,
-    // OMEGA-DELTA-0305).
-    // OMEGA-DELTA-0305). OMEGA-DELTA-0302: the decision is kept for the projection’s
-    // spend-authorization emission.
+    // OMEGA-DELTA-0305). OMEGA-DELTA-0302: the decision is kept for the
+    // projection's spend-authorization emission.
     let decision = sovereign_wallet::authorize_sovereign_spend(
         mandates,
         fee_sats,
