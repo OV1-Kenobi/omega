@@ -564,7 +564,7 @@ impl EscrowSession {
             | EscrowState::VerifiedFail => {
                 let observed = observed_height.context(
                     "timeout refund requires the observed tip height (never wall-clock)",
-                )?;;
+                )?;
                 if u64::from(observed) < self.timeout_at_height {
                     bail!(
                         "escrow refund refused: HTLC window open (observed {observed} < timeout_at_height {})",
