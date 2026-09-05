@@ -5,7 +5,7 @@
 //!   client-supplied; spec-vector verified).
 //! - Challenge issuance: HTTP 402 + `WWW-Authenticate: L402 macaroon="…",
 //!   invoice="…"` + challenge JSON body.
-//! - pay -> proof -> protected response end-to-end on signet (the demo paid
+//! - pay -> proof -> protected response end-to-end on mainnet (the demo paid
 //!   echo route, immediate settlement).
 //! - Double redemption refused (`credential_consumed`).
 //! - Payment-hash mismatch refused (`invalid_payment_proof`).
@@ -16,9 +16,8 @@
 //! - Mandate-gated pay is Rust-side (crates/sovereign_wallet/src/l402.rs);
 //!   the Node tests drive the pay step over the stdio `pay-invoice` method
 //!   exactly as the mandate-gated Rust path does (see the Rust tests).
-//! - Mainnet follows the configured network (OMEGA-DELTA-0287): the
-//!   signet-configured gateway still refuses lnbc; a mainnet-configured
-//!   gateway mints lnbc challenges and refuses mismatched-HRP invoices.
+//! - Mainnet-only rail (OMEGA-DELTA-0305): the gateway mints lnbc challenges;
+//!   non-mainnet invoices are refused as configuration errors.
 //! - Concurrency single-winner: parallel redemptions -> exactly one settles.
 //! - Deferred-settlement crash-window recovery (SEC-2026-048): a `checked`
 //!   redemption without a settle is recoverable after a restart; exactly one
@@ -46,7 +45,7 @@ import { buildTestBolt11 } from "./fixtures/build-bolt11.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "..", "..");
 const MAIN_JS = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "dist", "main.js");
-const FAKE_PHOENIXD_CMD = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "test", "fixtures", "fake-phoenixd.cmd");
+const FAKE_PHOENIXD_SCRIPT = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "test", "fixtures", "fake-phoenixd.mjs");
 /** The fixture's Basic-auth password (RV-C1: the username is not validated). */
 const FAKE_PHOENIXD_API_KEY = "fixture-phoenixd-api-key";
 
@@ -70,7 +69,7 @@ interface TestWallet {
 function makeWallet(): TestWallet {
   const wallet: TestWallet = {
     locked: false,
-    mintInvoice: async () => ({ invoice: buildTestBolt11(PAYMENT_HASH), entryPaymentHash: PAYMENT_HASH }),
+    mintInvoice: async () => ({ invoice: buildTestBolt11(PAYMENT_HASH, "lnbc100u"), entryPaymentHash: PAYMENT_HASH }),
   };
   return wallet;
 }
@@ -80,12 +79,12 @@ async function makeGateway(opts: {
   store: L402Store;
   wallet?: TestWallet;
   nowMs?: () => number;
-  network?: "signet" | "regtest" | "mainnet";
+  network?: "mainnet";
   mintInvoiceOverride?: () => Promise<{ invoice: string; entryPaymentHash: string | null }>;
 }): Promise<L402Gateway> {
   const wallet = opts.wallet ?? makeWallet();
   return new L402Gateway({
-    network: opts.network ?? "signet",
+    network: opts.network ?? "mainnet",
     store: opts.store,
     vault: opts.vault,
     walletReady: async () => {
@@ -146,9 +145,9 @@ function redeem(
 // ---------------------------------------------------------------------------
 
 describe("bolt11 payment-hash parsing (SEC-2026-055)", () => {
-  it("parses the `p` field from a signet invoice with a digit-containing hrp", () => {
-    const invoice = buildTestBolt11(PAYMENT_HASH);
-    assert.ok(invoice.startsWith("lntbs100u1"), "hrp with digits must be handled: " + invoice.slice(0, 16));
+  it("parses the `p` field from a mainnet invoice with a digit-containing hrp", () => {
+    const invoice = buildTestBolt11(PAYMENT_HASH, "lnbc100u");
+    assert.ok(invoice.startsWith("lnbc100u1"), "hrp with digits must be handled: " + invoice.slice(0, 16));
     assert.equal(bolt11PaymentHash(invoice), PAYMENT_HASH);
   });
 
@@ -164,7 +163,7 @@ describe("bolt11 payment-hash parsing (SEC-2026-055)", () => {
   });
 
   it("returns null for malformed or non-BOLT11 strings", () => {
-    assert.equal(bolt11PaymentHash("lntbs10u1p0example"), null); // not real bech32 data
+    assert.equal(bolt11PaymentHash("lnbc10u1p0example"), null); // not real bech32 data
     assert.equal(bolt11PaymentHash("not-an-invoice"), null);
     assert.equal(bolt11PaymentHash(""), null);
   });
@@ -184,13 +183,13 @@ describe("L-402 gateway unit", () => {
       assert.equal(challenge.status, 402);
       assert.match(
         challenge.headers["www-authenticate"] ?? "",
-        /^L402 macaroon="v1\..+", invoice="lntbs/,
+        /^L402 macaroon="v1\..+", invoice="lnbc/,
       );
       const body = challenge.body;
       assert.equal((body.error as { code: string }).code, "payment_required");
       assert.equal(typeof body.challengeId, "string");
       assert.equal(typeof body.macaroon, "string");
-      assert.match(String(body.invoice), /^lntbs/);
+      assert.match(String(body.invoice), /^lnbc/);
       // SEC-2026-055: the paymentHash is the minted invoice's `p` field.
       assert.equal(body.paymentHash, PAYMENT_HASH);
       assert.equal(body.amountSats, 1);
@@ -355,7 +354,7 @@ describe("L-402 gateway unit", () => {
           const preimage = preimages[mintCount % N]!;
           mintCount += 1;
           const hash = createHash("sha256").update(Buffer.from(preimage, "hex")).digest("hex");
-          return { invoice: buildTestBolt11(hash), entryPaymentHash: hash };
+          return { invoice: buildTestBolt11(hash, "lnbc100u"), entryPaymentHash: hash };
         },
       });
 
@@ -432,25 +431,6 @@ describe("L-402 gateway unit", () => {
     }
   });
 
-  it("OMEGA-DELTA-0287: mainnet is refused on a signet-configured gateway — an lnbc invoice from the wallet never mints a challenge", async () => {
-    const { vault, dir } = await makeVault();
-    const { store } = await makeStore();
-    try {
-      const gateway = await makeGateway({
-        vault,
-        store,
-        mintInvoiceOverride: async () => ({ invoice: "lnbc10u1p0example", entryPaymentHash: null }),
-      });
-      const result = await issueChallenge(gateway);
-      assert.equal(result.status, 500);
-      assert.equal((result.body.error as { code: string }).code, "mainnet_refused");
-    } finally {
-      vault.lock();
-      store.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   it("OMEGA-DELTA-0287: a mainnet-configured gateway mints an lnbc challenge and redeems it", async () => {
     const { vault, dir } = await makeVault();
     const { store } = await makeStore();
@@ -490,9 +470,10 @@ describe("L-402 gateway unit", () => {
         vault,
         store,
         network: "mainnet",
-        // The wallet engine mints a SIGNET invoice on the mainnet gateway.
+        // The wallet engine mints a non-mainnet invoice on the mainnet
+        // gateway — a configuration error, refused.
         mintInvoiceOverride: async () => ({
-          invoice: buildTestBolt11(PAYMENT_HASH, "lntbs100u"),
+          invoice: buildTestBolt11(PAYMENT_HASH, "xx100u"),
           entryPaymentHash: PAYMENT_HASH,
         }),
       });
@@ -617,13 +598,13 @@ function nextPort(): number {
 
 /** Start the fake phoenixd node and wait for its "listening" line. */
 async function startFakePhoenixd(port: number, overrides: Record<string, string>): Promise<ChildProcess> {
-  const fakeNode = spawn(FAKE_PHOENIXD_CMD, [], {
+  const fakeNode = spawn(process.execPath, [FAKE_PHOENIXD_SCRIPT], {
     env: {
       FAKE_PHOENIXD_PORT: String(port),
       FAKE_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
-      FAKE_PHOENIXD_CHAIN: overrides.FAKE_PHOENIXD_CHAIN ?? "signet",
+      FAKE_PHOENIXD_CHAIN: overrides.FAKE_PHOENIXD_CHAIN ?? "mainnet",
       FAKE_PHOENIXD_MODE: overrides.FAKE_PHOENIXD_MODE ?? "normal",
-      FAKE_PHOENIXD_INVOICE_HRP: overrides.FAKE_PHOENIXD_INVOICE_HRP ?? "lntbs100u",
+      FAKE_PHOENIXD_INVOICE_HRP: overrides.FAKE_PHOENIXD_INVOICE_HRP ?? "lnbc100u",
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
@@ -635,11 +616,11 @@ async function startFakePhoenixd(port: number, overrides: Record<string, string>
     const onData = (chunk: string): void => {
       if (chunk.includes("listening")) {
         clearTimeout(timer);
-        fakeNode.stdout?.removeListener("data", onData);
+        fakeNode.stderr?.removeListener("data", onData);
         resolve();
       }
     };
-    fakeNode.stdout?.on("data", onData);
+    fakeNode.stderr?.on("data", onData);
     fakeNode.once("exit", (code) => {
       clearTimeout(timer);
       reject(new Error(`fake-phoenixd exited early with code ${code}`));
@@ -657,7 +638,10 @@ async function spawnSidecar(overrides: Record<string, string>): Promise<Sidecar>
   const fakeNode = await startFakePhoenixd(port, overrides);
   const env: Record<string, string> = {
     OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot,
-    OMEGA_SOVEREIGN_WALLET_NETWORK: "signet",
+    // OMEGA-DELTA-0305: the payments rail is mainnet-only — the suite
+    // constructs mainnet rails (with the opt-in) against the fake node.
+    OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
+    OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
     OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN: token,
     OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: `http://127.0.0.1:${port}`,
     OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
@@ -816,7 +800,7 @@ async function payInvoice(sidecar: Sidecar, invoice: string): Promise<string> {
 }
 
 describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
-  it("402 -> pay -> proof -> protected response on signet; double redemption refused", async () => {
+  it("402 -> pay -> proof -> protected response on mainnet; double redemption refused", async () => {
     const { sidecar } = await readySidecar();
     try {
       const port = await httpPort(sidecar);
@@ -827,7 +811,7 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
       const first = await fetch(`${base}${DEMO_ECHO_PATH}`, { method: "POST", headers, body: "{}" });
       assert.equal(first.status, 402);
       const www = first.headers.get("www-authenticate") ?? "";
-      assert.match(www, /^L402 macaroon="v1\..+", invoice="lntbs/);
+      assert.match(www, /^L402 macaroon="v1\..+", invoice="lnbc/);
       const challenge = (await first.json()) as {
         error: { code: string };
         challengeId: string;
@@ -839,7 +823,7 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
       assert.equal(challenge.error.code, "payment_required");
       assert.equal(challenge.amountSats, 1);
       assert.equal(challenge.paymentHash, PAYMENT_HASH, "payment hash must equal the minted invoice's p field");
-      assert.match(challenge.invoice, /^lntbs/);
+      assert.match(challenge.invoice, /^lnbc/);
 
       // 2. Pay through the sidecar wallet (the mandate-gated Rust path's
       //    sidecar half; the mandate gate itself is Rust-side — see
@@ -950,7 +934,7 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
       assert.equal(challenge.status, 402);
       const body = (await challenge.json()) as { error: { code: string }; invoice: string };
       assert.equal(body.error.code, "payment_required");
-      assert.match(body.invoice, /^lntbs/);
+      assert.match(body.invoice, /^lnbc/);
     } finally {
       await live.sidecar.close();
     }
@@ -993,7 +977,7 @@ describe("L-402 gateway end-to-end over the loopback HTTP surface", () => {
         // gateway's HMAC key is re-loaded from the vault entry). The node
         // rail is client-only — no wallet unlock step exists on the phoenixd
         // rail (OMEGA-DELTA-0303).
-        const vaultUnlock = expectOk(await restarted.request("vault-unlock", { passphrase: PASSPHRASE }));
+        const vaultUnlock = expectOk(await restarted.request("vault-unlock", { passphrase: PASSPHRASE, operatorConfirmed: true }));
         assert.equal(vaultUnlock.wrapMethod, "passphrase-fallback", "restart unlock uses the degraded path (RV6-REQ-5)");
         const port2 = await httpPort(restarted);
         const base2 = `http://127.0.0.1:${port2}`;

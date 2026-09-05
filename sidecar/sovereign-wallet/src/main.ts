@@ -18,8 +18,9 @@
 //!
 //! Environment (injected by the supervisor; never secrets in args):
 //!   OMEGA_SOVEREIGN_WALLET_DATA_ROOT        (required)
-//!   OMEGA_SOVEREIGN_WALLET_NETWORK          signet | regtest | mainnet
-//!     (mainnet requires OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1 — 0286)
+//!   OMEGA_SOVEREIGN_WALLET_NETWORK          mainnet (the payments rail is
+//!     mainnet-operative — OMEGA-DELTA-0305; signet/regtest rail config is
+//!     refused at startup. mainnet requires OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1 — 0286)
 //!   OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET    the explicit mainnet opt-in (=1)
 //!   OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN   32-byte hex, per launch
 //!   OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL     the phoenixd REST base over
@@ -32,6 +33,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { getTipHeight } from "./tip-api.js";
+import { lockdownTree } from "./acl.js";
 import { LoopbackHttpServer, validateLoopbackToken } from "./http.js";
 import { IdempotencyStore } from "./idempotency.js";
 import { L402Gateway, DEMO_ECHO_PATH, DEMO_MCP_PATH_PREFIX } from "./l402.js";
@@ -88,17 +90,15 @@ export interface SidecarConfig {
   /**
    * OMEGA-DELTA-0286: the allow-mainnet authority. True only when the
    * configured network is mainnet AND the explicit opt-in env is set at the
-   * process level (parseEnvironment). signet/regtest never set this.
+   * process level (parseEnvironment). The rail accepts no other network.
    */
   allowMainnet: boolean;
   loopbackToken: string | undefined;
   /**
    * OMEGA-DELTA-0303: the phoenixd REST base over Tailscale/SSH (design
    * §9.3) and the full-access API key (the http-password; env-only,
-   * redaction-registered). A mainnet rail WITHOUT both is a configuration
-   * error refused at startup (the rail gate, design §2.6.2). On
-   * signet/regtest (fixture rails) the absence is a named unavailable state
-   * (`NODE_UNCONFIGURED`), never a silent zero.
+   * redaction-registered). A rail without both is a configuration
+   * error refused at startup (the rail gate, design §2.6.2).
    */
   phoenixdUrl: string | undefined;
   phoenixdApiKey: string | undefined;
@@ -333,7 +333,7 @@ export class SidecarCore {
         network,
         store: this.#l402Store,
         vault: this.#vault,
-        walletReady: () => this.#requireNodeReady(),
+        walletReady: async () => this.#requireNodeReady(),
         mintInvoice: async (amtSat, memo) => {
           // OMEGA-DELTA-0300 (kill closure): the gateway mint is
           // sidecar-internal (a direct phoenixd createinvoice) and does not
@@ -531,8 +531,19 @@ export class SidecarCore {
    * `observe_wallet_height` -> `timeout_window_open`.
    */
   async walletHeight(): Promise<Record<string, unknown>> {
-    const height = await getTipHeight();
-    return { block_height: height };
+    try {
+      const height = await getTipHeight();
+      return { block_height: height };
+    } catch (error) {
+      // The tip client already shapes the fail-closed error; re-throw with
+      // the typed envelope so the Rust side observes TIP_HEIGHT_UNAVAILABLE
+      // (never a bare INTERNAL and never a guessed height).
+      throw envelopeError(
+        "TIP_HEIGHT_UNAVAILABLE",
+        `TIP_HEIGHT_UNAVAILABLE: ${(error as Error)?.message ?? String(error)} (OMEGA-DELTA-0304)`,
+        { retryable: true, remediation: "check public tip API reachability (mempool.space / blockstream.info); the escrow timeout gate fails closed on this error" },
+      );
+    }
   }
 
 /**
@@ -595,7 +606,7 @@ export class SidecarCore {
       amountSat: amtSat,
       memo,
       // The invoice HRP follows the configured network (OMEGA-DELTA-0286):
-      // lntbs on signet, lnbc on mainnet; the guard refuses any mismatch.
+      // lnbc on mainnet; the guard refuses any mismatch.
       hrp: created.serialized.slice(0, 5),
     };
     this.#idempotency?.store("make-invoice", idempotencyKey, result);
@@ -1143,10 +1154,16 @@ export function parseEnvironment(): SidecarConfig {
       `MAINNET_REFUSED: OMEGA_SOVEREIGN_WALLET_NETWORK=mainnet requires ${ALLOW_MAINNET_ENV}=1 (OMEGA-DELTA-0286)`,
     );
   }
-  if (networkRaw !== "signet" && networkRaw !== "regtest" && networkRaw !== "mainnet") {
+  if (networkRaw !== "mainnet") {
+    if (networkRaw === "signet" || networkRaw === "regtest") {
+      throw envelopeError(
+        "INVALID_ARGS",
+        "INVALID_ARGS: the payments rail is mainnet-operative (CLINK/phoenixd); signet/regtest rail configuration is refused at startup (OMEGA-DELTA-0305)",
+      );
+    }
     throw envelopeError(
       "INVALID_ARGS",
-      `INVALID_ARGS: OMEGA_SOVEREIGN_WALLET_NETWORK must be signet, regtest, or mainnet (mainnet only with ${ALLOW_MAINNET_ENV}=1); an unset network never defaults to mainnet (design §3.2)`,
+      `INVALID_ARGS: OMEGA_SOVEREIGN_WALLET_NETWORK must be mainnet (mainnet only with ${ALLOW_MAINNET_ENV}=1); an unset network never defaults to mainnet (design §3.2)`,
     );
   }
   const dataRoot = process.env.OMEGA_SOVEREIGN_WALLET_DATA_ROOT;

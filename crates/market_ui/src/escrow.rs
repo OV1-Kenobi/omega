@@ -563,8 +563,8 @@ impl EscrowSession {
             | EscrowState::ReceiptSubmitted
             | EscrowState::VerifiedFail => {
                 let observed = observed_height.context(
-                    "timeout refund requires the observed signet tip height (never wall-clock)",
-                )?;
+                    "timeout refund requires the observed tip height (never wall-clock)",
+                )?;;
                 if u64::from(observed) < self.timeout_at_height {
                     bail!(
                         "escrow refund refused: HTLC window open (observed {observed} < timeout_at_height {})",
@@ -681,7 +681,7 @@ impl EscrowSession {
 // Slice B — the receipt digest gate + the pay-first fee flow
 // ---------------------------------------------------------------------------
 
-/// The demo's receipt gate environment variable: real signet invoice minting
+/// The demo's receipt gate environment variable: real invoice minting
 /// for arbitration fees stays OFF until this is explicitly set (honestly
 /// labeled — no real funds move by default).
 pub const ARBITRATION_LIVE_FEES_ENVIRONMENT_VARIABLE: &str = "OMEGA_ARBITRATION_LIVE_FEES";
@@ -860,13 +860,13 @@ pub fn record_fee_payment(
     Ok(digest)
 }
 
-/// Honest gate: real signet invoice minting for arbitration fees is disabled
+/// Honest gate: real invoice minting for arbitration fees is disabled
 /// unless the demo operator opts in explicitly. Called BEFORE any sidecar
 /// contact, so the default posture cannot touch funds.
 pub fn ensure_live_fees_allowed(allow_live_mint: bool) -> Result<()> {
     if !allow_live_mint {
         bail!(
-            "arbitration fee minting is gated for the demo (no real signet invoice); \
+            "arbitration fee minting is gated for the demo (no real invoice); \
              set {ARBITRATION_LIVE_FEES_ENVIRONMENT_VARIABLE}=1 to opt in"
         );
     }
@@ -964,9 +964,9 @@ pub async fn pay_arbitration_fee_and_request_arbitration(
     // mandate gates it (SEC-2026-043), separately from the escrow mandate.
     // OMEGA-DELTA-0286: the mandate instruction carries the SESSION's
     // network, so a mainnet escrow fee is gated by a
-    // (sovereign-wallet, mainnet, principal) mandate; signet behavior is
-    // unchanged. OMEGA-DELTA-0302: the decision is kept for the projection's
-    // after-decision constructor — a Refused decision can never produce a
+    // (sovereign-wallet, mainnet, principal) mandate (mainnet-only rail,
+    // OMEGA-DELTA-0305).
+    // OMEGA-DELTA-0305). OMEGA-DELTA-0302: the decision is kept for the projection’s
     // spend-authorization emission.
     let decision = sovereign_wallet::authorize_sovereign_spend(
         mandates,
@@ -1059,7 +1059,7 @@ mod tests {
     fn escrow_mandate(store: &MandateStore) {
         let candidate = trading_mandate::TradingMandate {
             venue: MKT_SWP_ESCROW_VENUE.to_string(),
-            network: TradingNetwork::Signet,
+            network: TradingNetwork::Mainnet,
             principal_pubkey: Some(CUSTOMER.to_string()),
             collateral_asset: AssetId::sats(),
             objective: "Minimal arbitration demo escrow".to_string(),
@@ -1146,7 +1146,7 @@ mod tests {
             &ledger,
             &mandates,
             open_params,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             OBSERVED_HEIGHT,
             NOW,
         )
@@ -1162,7 +1162,7 @@ mod tests {
             &ledger,
             &mandates,
             params(),
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             OBSERVED_HEIGHT,
             NOW,
         )
@@ -1219,7 +1219,7 @@ mod tests {
             &ledger,
             &mandates,
             params(),
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             OBSERVED_HEIGHT,
             NOW,
         )
@@ -1242,7 +1242,7 @@ mod tests {
         let mut bad = params();
         bad.principal_pubkey = STRANGER.to_string();
         assert!(
-            EscrowSession::open(&ledger, &mandates, bad, TradingNetwork::Signet, OBSERVED_HEIGHT, NOW)
+            EscrowSession::open(&ledger, &mandates, bad, TradingNetwork::Mainnet, OBSERVED_HEIGHT, NOW)
                 .is_err(),
             "a different principal is not authorized"
         );
@@ -1250,18 +1250,18 @@ mod tests {
         let mut bad = params();
         bad.amount_sats = AMOUNT + 1;
         assert!(
-            EscrowSession::open(&ledger, &mandates, bad, TradingNetwork::Signet, OBSERVED_HEIGHT, NOW)
+            EscrowSession::open(&ledger, &mandates, bad, TradingNetwork::Mainnet, OBSERVED_HEIGHT, NOW)
                 .is_err(),
             "over-cap escrow refused"
         );
 
         let mut bad = params();
         bad.hash_lock_digest = "nothex".to_string();
-        assert!(EscrowSession::open(&ledger, &mandates, bad, TradingNetwork::Signet, OBSERVED_HEIGHT, NOW).is_err());
+        assert!(EscrowSession::open(&ledger, &mandates, bad, TradingNetwork::Mainnet, OBSERVED_HEIGHT, NOW).is_err());
 
         let mut bad = params();
         bad.timeout_blocks = Some(35);
-        assert!(EscrowSession::open(&ledger, &mandates, bad, TradingNetwork::Signet, OBSERVED_HEIGHT, NOW).is_err());
+        assert!(EscrowSession::open(&ledger, &mandates, bad, TradingNetwork::Mainnet, OBSERVED_HEIGHT, NOW).is_err());
     }
 
     #[test]
@@ -1826,7 +1826,7 @@ mod tests {
             &ledger,
             &mandates,
             params_b,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             OBSERVED_HEIGHT,
             NOW,
         )
@@ -1995,7 +1995,7 @@ mod tests {
             &ledger,
             &mandates,
             open_params,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             OBSERVED_HEIGHT,
             NOW,
         )
@@ -2023,7 +2023,7 @@ mod tests {
                 &ledger,
                 &mandates,
                 open_params,
-                TradingNetwork::Signet,
+                TradingNetwork::Mainnet,
                 OBSERVED_HEIGHT,
                 NOW,
             )
@@ -2043,7 +2043,7 @@ mod tests {
                 &ledger,
                 &mandates,
                 open_params,
-                TradingNetwork::Signet,
+                TradingNetwork::Mainnet,
                 OBSERVED_HEIGHT,
                 NOW,
             )
@@ -2068,7 +2068,7 @@ mod tests {
             &ledger,
             &mandates,
             open_params,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             OBSERVED_HEIGHT,
             NOW,
         )
@@ -2087,7 +2087,7 @@ mod tests {
             &ledger,
             &mandates,
             zero,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             OBSERVED_HEIGHT,
             NOW
         )

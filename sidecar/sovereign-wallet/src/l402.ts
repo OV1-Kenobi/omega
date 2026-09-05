@@ -1,8 +1,8 @@
 //! MDK-protocol L-402 gateway (design §5; founder decision D3/D5) — the ONLY
-//! paid boundary in this phase (WP-6 acceptance). Signet/testnet only by
-//! default; the gateway mints and accepts mainnet ONLY when the configured
-//! network is mainnet (OMEGA-DELTA-0287) — no path mints a mainnet invoice on
-//! a signet-configured gateway and vice versa (HRP-mismatch defense in depth).
+//! paid boundary in this phase (WP-6 acceptance). Mainnet-only by
+//! OMEGA-DELTA-0305; the gateway mints mainnet invoices on the
+//! mainnet rail (OMEGA-DELTA-0287) - a non-lnbc mint is a
+//! configuration error, refused (HRP-match defense in depth).
 //!
 //! The protocol shape is verified from the OpenAgents MDK/L-402 audit
 //! (`apps/openagents.com/docs/2026-06-02-mdk-l402-agent-checkout-audit.md`):
@@ -44,10 +44,8 @@
 //! - Entitlement scoping: the credential freezes `resource = METHOD:/path` and
 //!   the amount; redemption re-checks the current endpoint price and the
 //!   request's method/path against the frozen values.
-//! - Network follows the configured network (OMEGA-DELTA-0287): the minted
-//!   invoice's HRP must match the configured network — mainnet (`lnbc`, never
-//!   `lnbcrt`) only when configured mainnet; the signet-configured refusal is
-//!   kept exactly (D4); redemption is network-independent.
+//! - Network is mainnet-only (OMEGA-DELTA-0287 + OMEGA-DELTA-0305): the minted
+//!   invoice's HRP must be `lnbc` (never `lnbcrt`); redemption is network-independent.
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { bech32 } from "@scure/base";
@@ -70,8 +68,8 @@ export interface MintedInvoice {
 }
 
 export interface L402GatewayDeps {
-  /** OMEGA-DELTA-0287: the configured network. `mainnet` only when the wallet is mainnet-configured. */
-  network: "signet" | "regtest" | "mainnet";
+  /** OMEGA-DELTA-0287: the configured network — mainnet only (OMEGA-DELTA-0305). */
+  network: "mainnet";
   store: L402Store;
   vault: Vault | null;
   /**
@@ -270,14 +268,12 @@ export class L402Gateway {
   }
 
   /**
-   * OMEGA-DELTA-0287: the network-aware demo label. The "never mainnet"
-   * wording is removed ONLY for the mainnet-configured state and kept
-   * otherwise (honesty: no claim of mainnet readiness when not configured).
+   * OMEGA-DELTA-0287: the network-aware demo label. The rail is
+   * mainnet-only (OMEGA-DELTA-0305), so the label is always the
+   * mainnet state — no other network is constructible.
    */
   #demoLabel(): string {
-    return this.#deps.network === "mainnet"
-      ? "mainnet demo"
-      : `${this.#deps.network} demo — never mainnet`;
+    return "mainnet demo";
   }
 
   /**
@@ -294,10 +290,9 @@ export class L402Gateway {
       state: this.#deps.vault && this.#deps.vault.isUnlocked() ? "ready" : "locked",
       note:
         this.#deps.vault && this.#deps.vault.isUnlocked()
-          ? // OMEGA-DELTA-0287: the state note names the configured network.
-            this.#deps.network === "mainnet"
-            ? "L-402 gateway ready (mainnet-configured)"
-            : `L-402 gateway ready (${this.#deps.network}-configured; mainnet refused)`
+          ? // OMEGA-DELTA-0287: the state note names the configured network
+            // (mainnet-only rail, OMEGA-DELTA-0305).
+            "L-402 gateway ready (mainnet-configured)"
           : "L-402 gateway locked: unlock the identity vault to enable challenge minting",
     };
   }
@@ -445,22 +440,16 @@ export class L402Gateway {
         // at the HTTP surface (the sidecar's env read on this mint path).
         return errorResult(503, "spend_halted", envelope.message);
       }
-      return errorResult(502, "invoice_mint_failed", `Wavelength receive failed: ${envelope?.message ?? String(error)}`);
+      return errorResult(502, "invoice_mint_failed", `phoenixd receive failed: ${envelope?.message ?? String(error)}`);
     }
 
     // Invoice binding (SEC-2026-055): paymentHash parsed from the BOLT11 `p`
     // field — never from the request — and cross-checked against the wallet
     // entry's payment hash when present.
-    // OMEGA-DELTA-0287: the minted invoice's HRP must match the configured
-    // network (defense in depth — a wallet engine that mints a mismatched-HRP
-    // invoice on a mainnet-configured gateway is a configuration error,
-    // refused). The signet-configured refusal is kept exactly (D4); a
-    // mainnet-configured gateway accepts `lnbc` (never `lnbcrt`).
-    if (this.#deps.network !== "mainnet") {
-      if (minted.invoice.startsWith("lnbc") && !minted.invoice.startsWith("lnbcrt")) {
-        return errorResult(500, "mainnet_refused", "mainnet invoices are never minted (D4; OMEGA-DELTA-0287)");
-      }
-    } else if (!minted.invoice.startsWith("lnbc") || minted.invoice.startsWith("lnbcrt")) {
+// OMEGA-DELTA-0287 + OMEGA-DELTA-0305: the rail is mainnet-only — an
+    // invoice minted on a mainnet-configured gateway that is not `lnbc`
+    // (or is `lnbcrt`) is a configuration error, refused.
+    if (!minted.invoice.startsWith("lnbc") || minted.invoice.startsWith("lnbcrt")) {
       return errorResult(
         500,
         "configuration_error",

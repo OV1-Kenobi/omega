@@ -12,8 +12,8 @@
 //! (create-wallet/unlock/lock) and the waved lifecycle are REMOVED with the
 //! rail — those verbs answer named fail-closed errors; balance/activity fail
 //! closed until their phoenixd re-point lands in a later C3 slice;
-//! wallet-height fails closed with TIP_HEIGHT_UNAVAILABLE until the C3-2
-//! slice wires the public tip API (OMEGA-DELTA-0304).
+//! wallet-height reads the public tip API (OMEGA-DELTA-0304) and fails closed
+//! with TIP_HEIGHT_UNAVAILABLE when disabled/unreachable.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -28,7 +28,7 @@ import { generateLoopbackToken } from "../dist/http.js";
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "..", "..");
 const MAIN_JS = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "dist", "main.js");
-const FAKE_PHOENIXD_CMD = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "test", "fixtures", "fake-phoenixd.cmd");
+const FAKE_PHOENIXD_SCRIPT = path.join(REPO_ROOT, "sidecar", "sovereign-wallet", "test", "fixtures", "fake-phoenixd.mjs");
 /** The fixture's Basic-auth password (RV-C1: the username is not validated). */
 const FAKE_PHOENIXD_API_KEY = "fixture-phoenixd-api-key";
 
@@ -51,13 +51,13 @@ interface Sidecar {
 
 /** Start the fake phoenixd node and wait for its "listening" line. */
 async function startFakePhoenixd(port: number, overrides: Record<string, string>): Promise<ChildProcess> {
-  const fakeNode = spawn(FAKE_PHOENIXD_CMD, [], {
+  const fakeNode = spawn(process.execPath, [FAKE_PHOENIXD_SCRIPT], {
     env: {
       FAKE_PHOENIXD_PORT: String(port),
       FAKE_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
-      FAKE_PHOENIXD_CHAIN: overrides.FAKE_PHOENIXD_CHAIN ?? "signet",
+      FAKE_PHOENIXD_CHAIN: overrides.FAKE_PHOENIXD_CHAIN ?? "mainnet",
       FAKE_PHOENIXD_MODE: overrides.FAKE_PHOENIXD_MODE ?? "normal",
-      FAKE_PHOENIXD_INVOICE_HRP: overrides.FAKE_PHOENIXD_INVOICE_HRP ?? "lntbs100u",
+      FAKE_PHOENIXD_INVOICE_HRP: overrides.FAKE_PHOENIXD_INVOICE_HRP ?? "lnbc100u",
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
@@ -69,11 +69,11 @@ async function startFakePhoenixd(port: number, overrides: Record<string, string>
     const onData = (chunk: string): void => {
       if (chunk.includes("listening")) {
         clearTimeout(timer);
-        fakeNode.stdout?.removeListener("data", onData);
+        fakeNode.stderr?.removeListener("data", onData);
         resolve();
       }
     };
-    fakeNode.stdout?.on("data", onData);
+    fakeNode.stderr?.on("data", onData);
     fakeNode.once("exit", (code) => {
       clearTimeout(timer);
       reject(new Error(`fake-phoenixd exited early with code ${code}`));
@@ -94,7 +94,10 @@ async function spawnSidecar(overrides: Record<string, string>): Promise<Sidecar>
   const fakeNode = await startFakePhoenixd(port, overrides);
   const env: Record<string, string> = {
     OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot,
-    OMEGA_SOVEREIGN_WALLET_NETWORK: "signet",
+    // OMEGA-DELTA-0305: the payments rail is mainnet-only — the suite
+    // constructs mainnet rails (with the opt-in) against the fake node.
+    OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
+    OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
     OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN: token,
     OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: `http://127.0.0.1:${port}`,
     OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
@@ -102,6 +105,10 @@ async function spawnSidecar(overrides: Record<string, string>): Promise<Sidecar>
     // the e2e process must never touch the real OS keychain. Production never
     // sets this; the default is the OS-keychain binding.
     OMEGA_SOVEREIGN_WALLET_VAULT_KEYCHAIN: "memory",
+    // OMEGA-DELTA-0305: the TEST-ONLY fixture seam — the suite constructs
+    // signet fixture rails; production never sets this (real signet/regtest
+    // rail config is refused at startup).
+    OMEGA_SOVEREIGN_WALLET_FIXTURE: "1",
     ...overrides,
   };
   const child = spawn(process.execPath, [MAIN_JS], {
@@ -235,16 +242,16 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
     try {
       const initialize = expectOk(await sidecar.request("initialize"));
       assert.equal(initialize.schema, "openagents.omega.sovereign-wallet.v1");
-      assert.equal(initialize.network, "signet");
+      assert.equal(initialize.network, "mainnet");
       assert.equal(initialize.nodeState, "connected");
-      assert.equal(initialize.nodeNetwork, "signet"); // SEC-2026-050 (rail form): actual runtime network
+      assert.equal(initialize.nodeNetwork, "mainnet"); // SEC-2026-050 (rail form): actual runtime network
 
       const health = expectOk(await sidecar.request("health"));
       assert.equal(health.ok, true);
       assert.equal(health.nodeConnected, true);
 
       const status = expectOk(await sidecar.request("status"));
-      assert.equal(status.network, "signet");
+      assert.equal(status.network, "mainnet");
       assert.equal(status.nodeConnected, true);
       // WP-4 (OMEGA-DELTA-0284): the vault is now a real surface. In a fresh
       // data root it is "none" (no vault initialized), not the WP-3 "absent"
@@ -276,10 +283,10 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
         memo: "test",
         idempotencyKey: "33333333-3333-4333-8333-333333333333",
       }));
-      assert.equal(invoice.hrp, "lntbs"); // signet HRP (RV-3)
+      assert.equal(invoice.hrp, "lnbc1"); // mainnet HRP prefix (OMEGA-DELTA-0305: no signet rail)
 
       const paid = expectOk(await sidecar.request("pay-invoice", {
-        invoice: "lntbs10u1p0example",
+        invoice: "lnbc10u1p0example",
         idempotencyKey: "44444444-4444-4444-8444-444444444444",
       }));
       assert.equal(paid.status, "settled"); // phoenixd payment_sent
@@ -330,14 +337,14 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
       await sidecar.request("initialize");
       const first = expectOk(
         await sidecar.request("pay-invoice", {
-          invoice: "lntbs10u1p0example",
+          invoice: "lnbc10u1p0example",
           idempotencyKey: "44444444-4444-4444-8444-444444444444",
         }),
       );
       assert.equal(first.preimage, "b".repeat(64)); // fresh call returns the preimage
       const second = expectOk(
         await sidecar.request("pay-invoice", {
-          invoice: "lntbs10u1p0example",
+          invoice: "lnbc10u1p0example",
           idempotencyKey: "44444444-4444-4444-8444-444444444444",
         }),
       );
@@ -372,8 +379,8 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
     }
   });
 
-  it("OMEGA-DELTA-0303: wallet-height fails closed with TIP_HEIGHT_UNAVAILABLE (the C3-2 slice wires the tip API)", async () => {
-    const sidecar = await spawnSidecar({});
+  it("OMEGA-DELTA-0304: wallet-height fails closed with TIP_HEIGHT_UNAVAILABLE when the tip API is disabled (fail-closed, never wall-clock)", async () => {
+    const sidecar = await spawnSidecar({ OMEGA_TIP_API_DISABLE: "1" });
     try {
       await sidecar.request("initialize");
       const refused = expectError(await sidecar.request("wallet-height"));
@@ -384,22 +391,22 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
     }
   });
 
-  it("OMEGA-DELTA-0303: a node without a working getinfo is a named node-unreachable state", async () => {
+  it("OMEGA-DELTA-0303/0305: a node that does not answer the startup getinfo probe is refused at startup on the mainnet rail (rail gate, NODE_UNCONFIGURED)", async () => {
+    // Rail gate (design §2.6.2): mainnet refuses to start without an
+    // answering node connection — a silent no-getinfo node is a
+    // configuration error, never a runtime unavailable state.
     const sidecar = await spawnSidecar({ FAKE_PHOENIXD_MODE: "no-getinfo" });
-    try {
-      const initialize = expectOk(await sidecar.request("initialize"));
-      assert.equal(initialize.nodeState, "unavailable");
-      const health = expectOk(await sidecar.request("health"));
-      assert.equal(health.nodeConnected, false);
-      const status = expectOk(await sidecar.request("status"));
-      assert.match(String(status.nodeUnavailableReason ?? ""), /phoenixd node unreachable/);
-    } finally {
-      await sidecar.close();
-    }
+    const exitCode = await waitForExit(sidecar.child);
+    assert.notEqual(exitCode, 0);
+    assert.match(sidecar.stderrText(), /NODE_UNCONFIGURED/);
+    await sidecar.close();
   });
 
   it("OMEGA-DELTA-0286: mainnet env WITHOUT the opt-in is refused at startup (MAINNET_REFUSED)", async () => {
-    const sidecar = await spawnSidecar({ OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet" });
+    const sidecar = await spawnSidecar({
+      OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
+      OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "",
+    });
     const exitCode = await waitForExit(sidecar.child);
     assert.notEqual(exitCode, 0);
     assert.match(sidecar.stderrText(), /MAINNET_REFUSED/);
@@ -417,6 +424,18 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
     const exitCode = await waitForExit(sidecar.child);
     assert.notEqual(exitCode, 0);
     assert.match(sidecar.stderrText(), /NODE_UNCONFIGURED/);
+    await sidecar.close();
+  });
+
+  it("OMEGA-DELTA-0305: signet rail config is refused at startup (mainnet-only rail)", async () => {
+    // The payments rail is mainnet-operative — no signet payments ever travel
+    // it, in production or in tests. A signet config dies here, no exceptions.
+    const sidecar = await spawnSidecar({
+      OMEGA_SOVEREIGN_WALLET_NETWORK: "signet",
+    });
+    const exitCode = await waitForExit(sidecar.child);
+    assert.notEqual(exitCode, 0);
+    assert.match(sidecar.stderrText(), /OMEGA-DELTA-0305/);
     await sidecar.close();
   });
 
@@ -446,31 +465,28 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
     const sidecar = await spawnSidecar({ OMEGA_SOVEREIGN_WALLET_NETWORK: "" });
     const exitCode = await waitForExit(sidecar.child);
     assert.notEqual(exitCode, 0);
-    assert.match(sidecar.stderrText(), /must be signet, regtest, or mainnet/);
+    assert.match(sidecar.stderrText(), /must be mainnet/);
     await sidecar.close();
   });
 
-  it("SEC-2026-050 (OMEGA-DELTA-0286/0303): the node reporting mainnet at runtime is refused when not configured mainnet (MAINNET_REFUSED)", async () => {
-    const sidecar = await spawnSidecar({ FAKE_PHOENIXD_CHAIN: "mainnet" });
+  it("SEC-2026-050 (OMEGA-DELTA-0286/0303): a node reporting a non-mainnet chain is refused as a mismatch", async () => {
+    // Mainnet-only rail: a fake reporting any other chain fails the
+    // reported==configured assertion (the mismatch branch, never MAINNET_REFUSED).
+    const sidecar = await spawnSidecar({ FAKE_PHOENIXD_CHAIN: "regtest" });
     const exitCode = await waitForExit(sidecar.child);
     assert.notEqual(exitCode, 0);
-    assert.match(sidecar.stderrText(), /MAINNET_REFUSED/);
     await sidecar.close();
   });
 
-  it("OMEGA-DELTA-0303: a missing phoenixd rail env is a named unavailable state, not a silent zero", async () => {
+  it("OMEGA-DELTA-0303/0305: a missing phoenixd rail env is refused at startup on the mainnet rail (rail gate, named NODE_UNCONFIGURED — never a silent zero)", async () => {
+    // Rail gate (design §2.6.2): mainnet without a configured node
+    // connection is a configuration error — the sidecar refuses to start,
+    // named, never a silent zero.
     const sidecar = await spawnSidecar({ OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: "" });
-    try {
-      const initialize = expectOk(await sidecar.request("initialize"));
-      assert.equal(initialize.nodeState, "unavailable");
-      const health = expectOk(await sidecar.request("health"));
-      assert.equal(health.ok, true);
-      assert.equal(health.nodeConnected, false);
-      const status = expectOk(await sidecar.request("status"));
-      assert.match(String(status.nodeUnavailableReason ?? ""), /NODE_UNCONFIGURED/);
-    } finally {
-      await sidecar.close();
-    }
+    const exitCode = await waitForExit(sidecar.child);
+    assert.notEqual(exitCode, 0);
+    assert.match(sidecar.stderrText(), /NODE_UNCONFIGURED/);
+    await sidecar.close();
   });
 
   it("an oversized frame is refused (frame bound)", async () => {
@@ -495,22 +511,6 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
       });
       assert.equal(response.ok, false);
       assert.equal((response.error as { code: string }).code, "INVALID_ARGS");
-    } finally {
-      await sidecar.close();
-    }
-  });
-
-  it("OMEGA-DELTA-0286: mainnet invoices are refused on pay on a signet-configured rail (lnbc prefix guard)", async () => {
-    const sidecar = await spawnSidecar({});
-    try {
-      await sidecar.request("initialize");
-      const refused = expectError(
-        await sidecar.request("pay-invoice", {
-          invoice: "lnbc10u1p0example",
-          idempotencyKey: "55555555-5555-4555-8555-555555555555",
-        }),
-      );
-      assert.equal(refused.code, "MAINNET_REFUSED");
     } finally {
       await sidecar.close();
     }
@@ -546,10 +546,10 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
       );
       assert.equal(paid.status, "settled");
 
-      // Mismatched HRP refused on PAY (a signet invoice on mainnet config).
+      // Mismatched HRP refused on PAY (a non-mainnet invoice on the rail).
       const payMismatch = expectError(
         await sidecar.request("pay-invoice", {
-          invoice: "lntbs10u1p0example",
+          invoice: "not-a-bolt11-invoice",
           idempotencyKey: "55555555-5555-4555-8555-555555555555",
         }),
       );
@@ -559,13 +559,14 @@ describe("protocol round-trip against the fake phoenixd node (OMEGA-DELTA-0303)"
     }
   });
 
-  it("OMEGA-DELTA-0286/0303: mismatched HRP refused on MINT on a mainnet-configured rail (signet invoice from the node)", async () => {
+  it("OMEGA-DELTA-0286/0303: mismatched HRP refused on MINT on the mainnet rail (node serves a non-lnbc invoice)", async () => {
     const sidecar = await spawnSidecar({
       OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
       OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
       FAKE_PHOENIXD_CHAIN: "mainnet",
-      // The fake phoenixd serves its default signet-shaped invoice — the
+      // The fake phoenixd serves a non-mainnet-shaped invoice — the
       // node guard must refuse it (configuration mismatch).
+      FAKE_PHOENIXD_INVOICE_HRP: "xx100u",
     });
     try {
       await sidecar.request("initialize");
@@ -616,7 +617,8 @@ describe("loopback HTTP surface (SEC-2026-053)", () => {
     const child = spawn(process.execPath, [MAIN_JS], {
       env: {
         OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot,
-        OMEGA_SOVEREIGN_WALLET_NETWORK: "signet",
+        OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
+        OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
         OMEGA_SOVEREIGN_WALLET_LOOPBACK_TOKEN: token,
         OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: `http://127.0.0.1:${port}`,
         OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
@@ -673,7 +675,8 @@ describe("loopback HTTP surface (SEC-2026-053)", () => {
     const child = spawn(process.execPath, [MAIN_JS], {
       env: {
         OMEGA_SOVEREIGN_WALLET_DATA_ROOT: dataRoot,
-        OMEGA_SOVEREIGN_WALLET_NETWORK: "signet",
+        OMEGA_SOVEREIGN_WALLET_NETWORK: "mainnet",
+        OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET: "1",
         OMEGA_SOVEREIGN_WALLET_PHOENIXD_URL: `http://127.0.0.1:${port}`,
         OMEGA_SOVEREIGN_WALLET_PHOENIXD_API_KEY: FAKE_PHOENIXD_API_KEY,
       },

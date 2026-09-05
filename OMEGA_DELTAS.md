@@ -11037,6 +11037,26 @@ re-deriving the preserved hardening design.
 
 - **Enforced by:** `escrow_venue_and_ledger_kinds_are_registered` in `omega_deltas`.
 
+### OMEGA-DELTA-0305 - Payments-rail network posture: mainnet operative; signet/regtest rail configuration refused at startup; mainnet still requires the allow-mainnet opt-in; unset never defaults to mainnet; scope-limited (LN Markets/Nautilus signet deltas untouched)
+
+Upstream Zed has no sovereign-wallet surface. Omega-before-this (0286/0303 era) ran the payments rail on a `signet | regtest | mainnet` grammar: signet/regtest fixture rails were constructible, and the waved-era D4 posture kept signet as a first-class rail network.
+
+Omega now fixes the rail to mainnet-only per the founder instruction (2026-09-04, "we have migrated to mainnet and all signet references, including signet tests, should've been removed"; "NO signet payments will EVER BE USED as a 'payments rail'"): `OMEGA_SOVEREIGN_WALLET_NETWORK` accepts `mainnet` only; a signet/regtest rail config is refused at startup with a named `INVALID_ARGS` citing the delta; mainnet STILL requires `OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1` (0286 unchanged); an unset network never defaults to mainnet (design §3.2 unchanged); the phoenixd client network type is the single `"mainnet"` literal; the L-402 gateway network type is `"mainnet"`; `SUPPORTED_NETWORKS` is `["mainnet"]`; the Rust supervisor grammar accepts mainnet only; sidecar tests construct mainnet rails and refuse signet configs (new OMEGA-DELTA-0305 refusal test). The scope is the PAYMENTS RAIL ONLY: the `TradingNetwork` enum stays (the mandate store, LN Markets, and Nautilus lanes still carry their own network states), and the LN Markets/Nautilus signet deltas are untouched. Inherited 0286/0287/0303 checks are re-anchored to the mainnet-only grammar with 0305 citations.
+
+Why: the founder's explicit instruction — the rail migrated to mainnet and no signet payments ever travel the payments rail, in production or in tests.
+
+- **Enforced by:** `payments_rail_is_mainnet_operative` in `omega_deltas`.
+
+### OMEGA-DELTA-0304 - Public tip-API replaces the waved getinfo probe as the wallet-height source (SEC-2026-087 revision): mempool.space primary / blockstream.info fallback, TTL cache (30s default), fail-closed `TIP_HEIGHT_UNAVAILABLE` (code renamed from `WAVED_HEIGHT_UNAVAILABLE`), sanity cap + safe-direction staleness for the escrow gate
+
+Upstream Zed has no sovereign-wallet surface. Omega-before-this (waved era) probed the local waved daemon's getinfo for the wallet-height; the escrow timeout gate consumed `observe_wallet_height` → `timeout_window_open` and failed closed with `WAVED_HEIGHT_UNAVAILABLE`.
+
+Omega now reads the observed chain tip height from the PUBLIC tip API (mempool.space `/api/blocks/tip/height` primary, blockstream.info `/api/blocks/tip/height` fallback; both plain-integer text/plain) with a 30s TTL cache and a sanity cap (0x7fffffff); any failure — both sources down, non-integer body, out-of-range height, disabled seam — surfaces the typed `TIP_HEIGHT_UNAVAILABLE` envelope (renamed from `WAVED_HEIGHT_UNAVAILABLE` with citation) and the escrow timeout gate fails closed on it (never wall-clock, never a guessed height). Staleness is safe-direction: a stale cached height only delays a timeout refund, never causes a premature release/refund. The seam signature (`wallet_height` → `BlockHeightResult`) is unchanged; the sidecar's `walletHeight` re-throws the typed envelope so the Rust side never observes a bare INTERNAL.
+
+Why: SEC-2026-087 closure — the waved daemon no longer exists on the rail (0303), so the wallet-height source is the public chain-tip API with a fail-closed, safe-direction-stale contract the escrow gate can trust.
+
+- **Enforced by:** `public_tip_api_is_the_wallet_height_source` in `omega_deltas`.
+
 ### OMEGA-DELTA-0302 - The NIP-AC authority projection exists, is flag-gated OFF, and never gates (WP-11 design note §10; the four-part check)
 
 Upstream Zed has no NIP-AC projection. Omega-before-this had no portable-proof layer: the authority economy (LedgerStore; MandateStore + `authorize_sovereign_spend`) was local-only, so an approved mandate, an authorized spend, a settled engagement, or a revocation left no verifiable trace on the Nostr layer the satnam node speaks.

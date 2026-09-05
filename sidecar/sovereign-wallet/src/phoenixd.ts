@@ -44,9 +44,10 @@
 //!   seam fails closed (the C3-2 slice wires the tip API under 0304).
 //!
 //! Non-negotiables enforced here:
-//! - The network grammar union `"signet" | "regtest" | "mainnet"` (0286
-//!   re-anchored to this module by 0303); mainnet requires the explicit
-//!   allow-mainnet opt-in; unset never defaults to mainnet.
+//! - The rail is mainnet-operative (OMEGA-DELTA-0305): the only accepted
+//!   network is `mainnet`, which additionally requires the explicit
+//!   allow-mainnet opt-in; unset never defaults to mainnet; signet/regtest
+//!   rail configuration is refused at startup.
 //! - SEC-2026-050 (revised by OMEGA-DELTA-0286, re-anchored to the rail by
 //!   0303): the REPORTED network (the getinfo `chain` field when present)
 //!   must equal the configured network; `mainnet` reported is refused UNLESS
@@ -54,8 +55,9 @@
 //!   exposes no chain field, the assertion is carried by the env gate + the
 //!   invoice HRP guard (design §2.6.3) — the honest state is "rail network =
 //!   configured network, enforced at the grammar + guard".
-//! - The BOLT11 HRP guard (0286, moved here with the rail): configured mainnet
-//!   accepts `lnbc` (never `lnbcrt`); signet/regtest refuse `lnbc`.
+//! - The BOLT11 HRP guard (0286, moved here with the rail): the rail accepts
+//!   `lnbc` (never `lnbcrt`) and refuses every other prefix — no signet
+//!   payments ever travel this rail.
 //! - The API key never leaves the process pair: env -> client memory ->
 //!   Authorization header; the caller registers it for redaction (SEC-2026-046).
 //! - The pay path's expected-outflow bound (design §2.5; OMEGA-DELTA-0300
@@ -64,7 +66,7 @@
 //!   Rust-side expected-vs-actual settle comparison has its bound; a payment
 //!   settling for MORE than expected auto-sets the spend kill fail-closed.
 
-export type PhoenixdNetwork = "signet" | "regtest" | "mainnet";
+export type PhoenixdNetwork = "mainnet";
 
 import { errorEnvelope, type ErrorCode } from "./protocol.js";
 import { redact } from "./redact.js";
@@ -253,7 +255,7 @@ export class PhoenixdClient {
           authorization: this.#authHeader(),
           ...(formBody ? { "content-type": "application/x-www-form-urlencoded" } : {}),
         },
-        ...(formBody ? { body: new URLSearchParams(Object.entries(formBody).map(([k, v]) => [k, String(v)])) } : {}),
+        ...(formBody ? { body: new URLSearchParams(Object.fromEntries(Object.entries(formBody).map(([k, v]) => [k, String(v)]))) } : {}),
         signal: controller.signal,
       });
     } catch (error) {
@@ -381,32 +383,21 @@ export function assertNetworkMatches(
 
 /**
  * BOLT11 HRP guard (design §3.4; OMEGA-DELTA-0286, moved to the phoenixd rail
- * by 0303): the invoice prefix must match the configured network on mint AND
- * pay. signet/regtest behavior is unchanged (`lnbc` refused); a
- * mainnet-configured wallet accepts `lnbc` (still excluding `lnbcrt`) and
- * refuses `lntbs`/`lntb` as mismatched-HRP.
+ * by 0303; mainnet-only by OMEGA-DELTA-0305): the rail accepts `lnbc`
+ * (excluding `lnbcrt`) and refuses every other prefix — no signet payments
+ * ever travel this rail.
  */
 export function assertInvoiceNetwork(configured: string, invoice: string): void {
-  if (configured === "mainnet") {
-    // lnbc = mainnet; lnbcrt = regtest (starts with lnbc too, so exclude it).
-    if (!invoice.startsWith("lnbc") || invoice.startsWith("lnbcrt")) {
-      throw new PhoenixdErrorImpl(
-        errorEnvelope(
-          "INVALID_ARGS",
-          `invoice prefix ${invoice.slice(0, 5)} does not match the configured network ${configured}`,
-        ),
-      );
-    }
-    return;
-  }
-  // lnbc = mainnet; lnbcrt = regtest (starts with lnbc too, so exclude it).
-  if (invoice.startsWith("lnbc") && !invoice.startsWith("lnbcrt")) {
+  if (configured !== "mainnet") {
     throw new PhoenixdErrorImpl(
-      errorEnvelope("MAINNET_REFUSED", "mainnet BOLT11 invoices are never paid or minted"),
+      errorEnvelope(
+        "INVALID_ARGS",
+        `the payments rail is mainnet-operative (OMEGA-DELTA-0305); configured network ${configured} is refused`,
+      ),
     );
   }
-  const expectedPrefixes = configured === "regtest" ? ["lnbcrt"] : ["lntbs", "lntb"];
-  if (!expectedPrefixes.some((p) => invoice.startsWith(p))) {
+  // lnbc = mainnet; lnbcrt = regtest (starts with lnbc too, so exclude it).
+  if (!invoice.startsWith("lnbc") || invoice.startsWith("lnbcrt")) {
     throw new PhoenixdErrorImpl(
       errorEnvelope(
         "INVALID_ARGS",

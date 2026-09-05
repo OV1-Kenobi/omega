@@ -11,38 +11,37 @@
  * timeout refund, never causes a premature release/refund.
  */
 
-import { TIP_HEIGHT_UNAVAILABLE } from "./protocol.js";
-import { redact } from "./redact.js";
+export const TIP_API_TTL_MS_DEFAULT = 30_000;
+export const TIP_HEIGHT_MAX = 0x7fffffff; // sanity cap ~2B blocks
 
-const TIP_API_TTL_MS_DEFAULT = 30_000;
-const TIP_HEIGHT_MAX = 0x7fffffff; // sanity cap ~2B blocks
+export const PRIMARY_URL = "https://mempool.space/api/blocks/tip/height";
+export const FALLBACK_URL = "https://blockstream.info/api/blocks/tip/height";
 
-const PRIMARY_URL = "https://mempool.space/api/blocks/tip/height";
-const FALLBACK_URL = "https://blockstream.info/api/blocks/tip/height";
+export const TTL_MS: number =
+  Number.parseInt(process.env.OMEGA_TIP_API_TTL_MS ?? "", 10) || TIP_API_TTL_MS_DEFAULT;
+export const PRIMARY_URL_OVERRIDE: string =
+  process.env.OMEGA_TIP_API_PRIMARY_URL || PRIMARY_URL;
+export const FALLBACK_URL_OVERRIDE: string =
+  process.env.OMEGA_TIP_API_FALLBACK_URL || FALLBACK_URL;
 
-const TTL_MS = parseInt(process.env.OMEGA_TIP_API_TTL_MS ?? "") || TIP_API_TTL_MS_DEFAULT;
-const PRIMARY_URL_OVERRIDE = process.env.OMEGA_TIP_API_PRIMARY_URL || PRIMARY_URL;
-const FALLBACK_URL_OVERRIDE = process.env.OMEGA_TIP_API_FALLBACK_URL || FALLBACK_URL;
+/** Fail-closed tip error (the escrow gate substitutes nothing on this). */
+export const TIP_HEIGHT_UNAVAILABLE = "TIP_HEIGHT_UNAVAILABLE";
 
 let cachedTip: { height: number; expiresAt: number } | null = null;
-
-export interface BlockHeightResult {
-  block_height: number;
-}
 
 export function tipHeightUnavailable(message?: string): Error {
-  const env = TIP_HEIGHT_UNAVAILABLE;
   const msg = message || "observed tip height unavailable from public API";
-  return new Error(JSON.stringify({
-    code: TIP_HEIGHT_UNAVAILABLE,
-    message,
-    details: "",
-    retryable: false,
-    remediation: "check public tip API reachability (mempool.space / blockstream.info); the escrow timeout gate fails closed on this error",
-  }));
+  return new Error(
+    JSON.stringify({
+      code: TIP_HEIGHT_UNAVAILABLE,
+      message: msg,
+      details: "",
+      retryable: false,
+      remediation:
+        "check public tip API reachability (mempool.space / blockstream.info); the escrow timeout gate fails closed on this error",
+    }),
+  );
 }
-
-let cachedTip: { height: number; expiresAt: number } | null = null;
 
 async function fetchTipHeight(url: string): Promise<number> {
   const controller = new AbortController();
@@ -59,42 +58,44 @@ async function fetchTipHeight(url: string): Promise<number> {
     const text = await response.text();
     const trimmed = text.trim();
     if (!/^\d+$/.test(trimmed)) {
-      throw new Error(`non-integer response: ${trimmed}`);
+      throw new Error(`non-integer response body`);
     }
-    const height = parseInt(trimmed, 10);
-    if (height < 0 || height > 0x7fffffff) {
-      throw new Error(`height out of sanity range: ${height}`);
+    const height = Number.parseInt(trimmed, 10);
+    if (!Number.isSafeInteger(height) || height < 0 || height > TIP_HEIGHT_MAX) {
+      throw new Error(`height out of sanity range`);
     }
     return height;
-  } catch (err) {
+  } catch (error) {
     clearTimeout(timeout);
-    throw err;
+    throw error;
   }
 }
 
 async function getTipHeightInternal(): Promise<number> {
-  // Try primary
+  // Try primary first; fall back once before failing closed.
   try {
     return await fetchTipHeight(PRIMARY_URL_OVERRIDE);
-  } catch (e) {
-    // Try fallback
+  } catch (primaryError) {
     try {
       return await fetchTipHeight(FALLBACK_URL_OVERRIDE);
-    } catch (e2) {
+    } catch (fallbackError) {
       throw tipHeightUnavailable(
-        `primary: ${(e as Error).message}; fallback: ${(e2 as Error).message}`
+        `primary and fallback tip endpoints failed (${(primaryError as Error).message}; ${(fallbackError as Error).message})`,
       );
     }
   }
 }
 
 export async function getTipHeight(): Promise<number> {
+  // Test seam (design §4.1): force the fail-closed path without network.
+  // Never set in production; shipped defaults always attempt the endpoints.
+  if (process.env.OMEGA_TIP_API_DISABLE === "1") {
+    throw tipHeightUnavailable("tip API disabled by OMEGA_TIP_API_DISABLE (test seam)");
+  }
   const now = Date.now();
-  // Check cache
-  if (cachedTip && cachedTip.expiresAt > Date.now()) {
+  if (cachedTip && cachedTip.expiresAt > now) {
     return cachedTip.height;
   }
-  // Fetch fresh
   const height = await getTipHeightInternal();
   cachedTip = { height, expiresAt: Date.now() + TTL_MS };
   return height;
@@ -104,17 +105,13 @@ export function resetTipCacheForTesting(): void {
   cachedTip = null;
 }
 
-export function getTipCacheInfo(): { cached: boolean; height: number | null; expiresAt: number | null } {
+export function getTipCacheInfo(): {
+  cached: boolean;
+  height: number | null;
+  expiresAt: number | null;
+} {
   if (cachedTip) {
     return { cached: true, height: cachedTip.height, expiresAt: cachedTip.expiresAt };
   }
   return { cached: false, height: null, expiresAt: null };
 }
-
-// Config constants (exported for tests)
-export const PRIMARY_URL_OVERRIDE = PRIMARY_URL_OVERRIDE;
-export const FALLBACK_URL_OVERRIDE = FALLBACK_URL_OVERRIDE;
-export const TTL_MS = TTL_MS;
-export const TIP_HEIGHT_MAX = TIP_HEIGHT_MAX;
-export const PRIMARY_URL = PRIMARY_URL;
-export const FALLBACK_URL = FALLBACK_URL;

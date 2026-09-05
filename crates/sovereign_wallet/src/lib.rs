@@ -60,10 +60,11 @@ use smol::lock::Mutex as AsyncMutex;
 
 /// Environment gate for the sovereign wallet lane (market_ui precedent).
 pub const SOVEREIGN_WALLET_ENVIRONMENT_VARIABLE: &str = "OMEGA_SOVEREIGN_WALLET";
-/// The sidecar runs on signet, regtest, or mainnet — mainnet ONLY with the
-/// explicit allow-mainnet opt-in (OMEGA-DELTA-0286); the supervisor config
-/// gate and the sidecar env gate both enforce it.
-pub const SUPPORTED_NETWORKS: &[&str] = &["signet", "regtest", "mainnet"];
+/// The sidecar runs on mainnet ONLY with the explicit allow-mainnet opt-in
+/// (OMEGA-DELTA-0286 + OMEGA-DELTA-0305: the payments rail is
+/// mainnet-operative — signet/regtest rail configuration is refused); the
+/// supervisor config gate and the sidecar env gate both enforce it.
+pub const SUPPORTED_NETWORKS: &[&str] = &["mainnet"];
 /// OMEGA-DELTA-0286: the explicit mainnet opt-in env name (mirrors waved's
 /// `--allow-mainnet`). `OMEGA_SOVEREIGN_WALLET_NETWORK=mainnet` is refused
 /// without this at the supervisor config gate AND the sidecar env gate.
@@ -76,7 +77,8 @@ pub const ALLOW_MAINNET_ENVIRONMENT_VARIABLE: &str = "OMEGA_SOVEREIGN_WALLET_ALL
 pub const SPEND_KILL_ENVIRONMENT_VARIABLE: &str = spend_policy::SPEND_KILL_ENVIRONMENT_VARIABLE;
 /// Optional override for the node binary used to launch the sidecar.
 pub const NODE_BIN_ENVIRONMENT_VARIABLE: &str = "OMEGA_SOVEREIGN_WALLET_NODE_BIN";
-/// Optional override for the sidecar network (defaults to signet).
+/// Optional override for the sidecar network (defaults to mainnet, which
+/// still requires the allow-mainnet opt-in to construct).
 pub const NETWORK_ENVIRONMENT_VARIABLE: &str = "OMEGA_SOVEREIGN_WALLET_NETWORK";
 /// Optional override for the sidecar data root (defaults to
 /// `<paths::data_dir()>/sovereign-wallet`).
@@ -112,7 +114,7 @@ pub fn init(cx: &mut App) {
     if cx.has_global::<SovereignWalletRuntime>() {
         return;
     }
-    let network = std::env::var(NETWORK_ENVIRONMENT_VARIABLE).unwrap_or_else(|_| "signet".to_owned());
+    let network = std::env::var(NETWORK_ENVIRONMENT_VARIABLE).unwrap_or_else(|_| "mainnet".to_owned());
     let data_root = std::env::var_os(DATA_ROOT_ENVIRONMENT_VARIABLE)
         .map(PathBuf::from)
         .unwrap_or_else(|| paths::data_dir().join("sovereign-wallet"));
@@ -154,7 +156,7 @@ pub fn init(cx: &mut App) {
             .spawn(async move {
                 match shared.lock().await.ensure_started().await {
                     Ok(_) => log::info!(
-                        "sovereign wallet sidecar started under supervision (network signet/regtest only)"
+                        "sovereign wallet sidecar started under supervision (mainnet rail)"
                     ),
                     Err(error) => log::error!("sovereign wallet sidecar failed to start: {error:#}"),
                 }
@@ -223,6 +225,36 @@ pub(crate) mod test_support {
             std::env::remove_var(crate::ALLOW_MAINNET_ENVIRONMENT_VARIABLE);
         }
         run()
+    }
+
+    /// Hold the allow-mainnet opt-in env for the caller's whole scope
+    /// (OMEGA-DELTA-0305: the mainnet-only rail needs the opt-in present at
+    /// BOTH construction and start, since the runtime assertion re-checks
+    /// it). Serialized on the same mutex as the closure helpers — do not
+    /// nest with them. Dropping removes the var.
+    pub(crate) struct MainnetRailGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn hold_allow_mainnet_opt_in() -> MainnetRailGuard {
+        let guard = MAINNET_OPT_IN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::set_var(crate::ALLOW_MAINNET_ENVIRONMENT_VARIABLE, "1");
+        }
+        // Reborrow the guard with a 'static lifetime: the statics outlive
+        // every test, and the guard is released (var removed) on drop.
+        let guard: std::sync::MutexGuard<'static, ()> = unsafe { std::mem::transmute(guard) };
+        MainnetRailGuard { _lock: guard }
+    }
+
+    impl Drop for MainnetRailGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(crate::ALLOW_MAINNET_ENVIRONMENT_VARIABLE);
+            }
+        }
     }
 
     /// Run `run` with OMEGA_SPEND_KILL=1 set (serialized), then remove it.

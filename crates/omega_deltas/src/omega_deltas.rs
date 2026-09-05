@@ -268,6 +268,8 @@ pub const ENFORCED_DELTAS: &[&str] = &[
     "OMEGA-DELTA-0300",
     "OMEGA-DELTA-0301",
     "OMEGA-DELTA-0302",
+    "OMEGA-DELTA-0304",
+    "OMEGA-DELTA-0305",
 ];
 
 /// OMEGA-DELTA-0284. The sidecar identity keygen module — the sidecar's
@@ -3793,6 +3795,12 @@ pub const SOVEREIGN_VAULT_IDENTITY_TEST_PATH: &str = "sidecar/sovereign-wallet/t
 
 /// OMEGA-DELTA-0286. The sidecar entry — env grammar + allow-mainnet opt-in.
 pub const SOVEREIGN_SIDECAR_MAIN_PATH: &str = "sidecar/sovereign-wallet/src/main.ts";
+/// OMEGA-DELTA-0304. The public tip-API client (wallet-height source).
+pub const SOVEREIGN_TIP_API_PATH: &str = "sidecar/sovereign-wallet/src/tip-api.ts";
+/// OMEGA-DELTA-0304. The protocol code table (fail-closed tip code).
+pub const SOVEREIGN_PROTOCOL_PATH: &str = "sidecar/sovereign-wallet/src/protocol.ts";
+/// OMEGA-DELTA-0305. The sidecar protocol test suite (mainnet-only rails).
+pub const SOVEREIGN_SIDECAR_PROTOCOL_TEST_PATH: &str = "sidecar/sovereign-wallet/test/protocol.test.ts";
 /// OMEGA-DELTA-0286. The waved launch + guards (network type, launch args,
 /// runtime assertion, invoice guard).
 pub const SOVEREIGN_WAVELENGTH_PATH: &str = "sidecar/sovereign-wallet/src/wavelength.ts";
@@ -32587,10 +32595,12 @@ mod tests {
         );
 
         // 2. phoenixd.ts: network type, launch flag, gated assertion,
-        //    parameterized guard, citation (OMEGA-DELTA-0303).
+        //    parameterized guard, citation (OMEGA-DELTA-0303). OMEGA-DELTA-0305
+        //    (re-anchored by 0305, founder 2026-09-04): the rail network type
+        //    is the single mainnet literal — no signet/regtest rail type.
         let phoenixd = read_repository_file(SOVEREIGN_PHOENIXD_PATH);
         for required in [
-            "PhoenixdNetwork = \"signet\" | \"regtest\" | \"mainnet\"",
+            "PhoenixdNetwork = \"mainnet\"",
             "allowMainnet",
             "OMEGA-DELTA-0303",
         ] {
@@ -32612,9 +32622,12 @@ mod tests {
         );
 
         // 3. lib.rs: the grammar includes mainnet; the opt-in env name is bound.
+        //    OMEGA-DELTA-0305 (re-anchored by 0305, founder 2026-09-04): the
+        //    payments rail accepts only mainnet — SUPPORTED_NETWORKS is the
+        //    single mainnet element.
         let lib_rs = read_repository_file("crates/sovereign_wallet/src/lib.rs");
         for required in [
-            "[\"signet\", \"regtest\", \"mainnet\"]",
+            "[\"mainnet\"]",
             "OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET",
             "OMEGA-DELTA-0286",
         ] {
@@ -32674,15 +32687,18 @@ mod tests {
     #[test]
     fn l402_gateway_mainnet_follows_the_configured_network() {
         let gateway = read_repository_file(SOVEREIGN_L402_GATEWAY_PATH);
+        // OMEGA-DELTA-0305 (re-anchored by 0305, founder 2026-09-04): the
+        // payments rail is mainnet-only — the network type is the single
+        // literal, and the refusal branches stay.
         for required in [
-            "network: \"signet\" | \"regtest\" | \"mainnet\"",
+            "network: \"mainnet\"",
             "mainnet-configured gateway",
             "mainnet demo",
             "OMEGA-DELTA-0287",
         ] {
             assert!(
                 gateway.contains(required),
-                "OMEGA-DELTA-0287: l402.ts lost `{required}`; the mainnet network \
+                "OMEGA-DELTA-0287/0305: l402.ts lost `{required}`; the mainnet network \
                  type, the HRP-match mint check, the network-aware labels, and \
                  the delta citation must stay present"
             );
@@ -33375,6 +33391,136 @@ mod tests {
         assert!(
             ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0302"),
             "OMEGA-DELTA-0302: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0304. The public tip-API is the wallet-height source
+    /// (SEC-2026-087 revision): mempool.space primary / blockstream.info
+    /// fallback, TTL cache, fail-closed `TIP_HEIGHT_UNAVAILABLE` (renamed
+    /// from `WAVED_HEIGHT_UNAVAILABLE`), sanity cap, safe-direction
+    /// staleness. The waved getinfo probe no longer feeds the seam.
+    #[test]
+    fn public_tip_api_is_the_wallet_height_source() {
+        let tip_api = read_repository_file(SOVEREIGN_TIP_API_PATH);
+        for required in [
+            "OMEGA-DELTA-0304",
+            "mempool.space",
+            "blockstream.info",
+            "TIP_HEIGHT_UNAVAILABLE",
+            "TIP_API_TTL_MS_DEFAULT = 30_000",
+            "TIP_HEIGHT_MAX",
+        ] {
+            assert!(
+                tip_api.contains(required),
+                "OMEGA-DELTA-0304: tip-api.ts lost `{required}`; the public tip                  client (primary/fallback URLs, TTL, fail-closed code, sanity                  cap) must stay present"
+            );
+        }
+        // (a) the sidecar's wallet-height seam carries no waved/getinfo
+        //     reference and calls the public tip client fail-closed. The
+        //     seam is the method body only (the next method's doc comment may
+        //     legitimately narrate the waved removal history).
+        let main_ts = read_repository_file(SOVEREIGN_SIDECAR_MAIN_PATH);
+        let wallet_height_body = main_ts
+            .split("async walletHeight")
+            .nth(1)
+            .and_then(|after| after.split("OMEGA-DELTA-0303: the waved wallet ceremony").next())
+            .unwrap_or_default();
+        assert!(
+            wallet_height_body.contains("getTipHeight")
+                && wallet_height_body.contains("TIP_HEIGHT_UNAVAILABLE"),
+            "OMEGA-DELTA-0304: the wallet-height seam must call the public tip \
+             client and re-throw the typed fail-closed envelope"
+        );
+        assert!(
+            !wallet_height_body.contains("waved") && !wallet_height_body.contains("getinfo"),
+            "OMEGA-DELTA-0304: the wallet-height seam must carry no waved/getinfo \
+             reference"
+        );
+        // (b) the protocol code carries the renamed fail-closed code.
+        let protocol_ts = read_repository_file(SOVEREIGN_PROTOCOL_PATH);
+        assert!(
+            protocol_ts.contains("TIP_HEIGHT_UNAVAILABLE"),
+            "OMEGA-DELTA-0304: protocol.ts must carry the renamed              TIP_HEIGHT_UNAVAILABLE code"
+        );
+        // (c) the escrow timeout gate consumes the seam (observe_wallet_height).
+        let escrow_source_raw = read_repository_file(MARKET_UI_ESCROW_PATH);
+        let escrow_source = outside_the_tests(&escrow_source_raw);
+        assert!(
+            escrow_source.contains("observe_wallet_height"),
+            "OMEGA-DELTA-0304: the escrow timeout gate must consume the              wallet-height seam"
+        );
+        // Registration is three-place.
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0304").contains("SEC-2026-087"),
+            "OMEGA-DELTA-0304: the registry row must name the finding it closes"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0304"),
+            "OMEGA-DELTA-0304: the delta is no longer listed in ENFORCED_DELTAS"
+        );
+    }
+
+    /// OMEGA-DELTA-0305. The payments rail is mainnet-operative: signet/
+    /// regtest rail configuration is refused at startup; mainnet still
+    /// requires the allow-mainnet opt-in; unset never defaults to mainnet;
+    /// scope-limited to the payments rail (LN Markets/Nautilus untouched).
+    #[test]
+    fn payments_rail_is_mainnet_operative() {
+        // (a) the signet/regtest refusal text exists in main.ts.
+        let main_ts = read_repository_file(SOVEREIGN_SIDECAR_MAIN_PATH);
+        for required in [
+            "OMEGA-DELTA-0305",
+            "signet/regtest rail configuration is refused at startup",
+            "OMEGA_SOVEREIGN_WALLET_NETWORK must be mainnet",
+        ] {
+            assert!(
+                main_ts.contains(required),
+                "OMEGA-DELTA-0305: main.ts lost `{required}`; the mainnet-only                  grammar and the signet/regtest startup refusal must stay"
+            );
+        }
+        // (b) the mainnet-without-opt-in refusal (0286) still exists.
+        assert!(
+            main_ts.contains("MAINNET_REFUSED: OMEGA_SOVEREIGN_WALLET_NETWORK=mainnet requires"),
+            "OMEGA-DELTA-0305: the 0286 mainnet-without-opt-in refusal must stay"
+        );
+        // (c) the phoenixd network type is the single mainnet literal.
+        let phoenixd = read_repository_file(SOVEREIGN_PHOENIXD_PATH);
+        assert!(
+            phoenixd.contains("PhoenixdNetwork = \"mainnet\""),
+            "OMEGA-DELTA-0305: phoenixd.ts must carry the mainnet-only network type"
+        );
+        // (d) the L-402 gateway network type is the single mainnet literal.
+        let gateway = read_repository_file(SOVEREIGN_L402_GATEWAY_PATH);
+        assert!(
+            gateway.contains("network: \"mainnet\""),
+            "OMEGA-DELTA-0305: l402.ts must carry the mainnet-only network type"
+        );
+        // (e) the Rust side is mainnet-only at the grammar.
+        let lib_rs = read_repository_file("crates/sovereign_wallet/src/lib.rs");
+        assert!(
+            lib_rs.contains("&[\"mainnet\"]"),
+            "OMEGA-DELTA-0305: SUPPORTED_NETWORKS must be the single mainnet element"
+        );
+        let supervisor = read_repository_file(SOVEREIGN_SUPERVISOR_PATH);
+        assert!(
+            supervisor.contains("OMEGA-DELTA-0286/0305")
+                && supervisor.contains("supervisor_refuses_non_mainnet_networks_at_config"),
+            "OMEGA-DELTA-0305: the supervisor must refuse non-mainnet rail configs              with the named test"
+        );
+        // (f) sidecar tests construct mainnet rails and refuse signet configs.
+        let protocol_test = read_repository_file(SOVEREIGN_SIDECAR_PROTOCOL_TEST_PATH);
+        assert!(
+            protocol_test.contains("OMEGA-DELTA-0305: signet rail config is refused at startup"),
+            "OMEGA-DELTA-0305: the sidecar test suite must carry the signet              refusal test"
+        );
+        // Registration is three-place.
+        assert!(
+            wp4_registry_row("OMEGA-DELTA-0305").contains("payments rail"),
+            "OMEGA-DELTA-0305: the registry row must describe the payments-rail              scope limitation"
+        );
+        assert!(
+            ENFORCED_DELTAS.contains(&"OMEGA-DELTA-0305"),
+            "OMEGA-DELTA-0305: the delta is no longer listed in ENFORCED_DELTAS"
         );
     }
 }

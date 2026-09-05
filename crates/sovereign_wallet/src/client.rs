@@ -55,7 +55,7 @@ fn decode<T: serde::de::DeserializeOwned>(result: Value, what: &str) -> Result<T
 /// Typed access to the sidecar's methods. Mirrors the effectd supervisor's
 /// `request` discipline: generation-fenced, bounded, timeout-bounded. The
 /// `initialize` handshake lives on the supervisor (`SovereignWalletSupervisor::start`),
-/// where the signet/regtest hard-bail is enforced (SEC-2026-050).
+/// where the mainnet-only rail gate is enforced (SEC-2026-050, OMEGA-DELTA-0305).
 impl SovereignWalletSupervisor {
     pub async fn status(&mut self) -> Result<StatusResult, SovereignWalletError> {
         let result = self.request("status", None, self.generation()).await?;

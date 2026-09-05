@@ -1210,13 +1210,13 @@ mod tests {
     }
 
     fn candidate(max_payment_sat: u64) -> TradingMandate {
-        crate::sovereign_wallet_mandate_candidate(TradingNetwork::Signet, AGENT, max_payment_sat, 1_000_000)
+        crate::sovereign_wallet_mandate_candidate(TradingNetwork::Mainnet, AGENT, max_payment_sat, 1_000_000)
     }
 
     fn approve_mandate(store: &MandateStore, max_payment_sat: u64) -> String {
         let proposal = store.propose(candidate(max_payment_sat)).expect("proposal");
         trading_mandate::apply_ui_approved_for_test(store, proposal, 2).expect("approved");
-        observe_approved_mandate(store, SOVEREIGN_WALLET_VENUE, TradingNetwork::Signet, Some(AGENT))
+        observe_approved_mandate(store, SOVEREIGN_WALLET_VENUE, TradingNetwork::Mainnet, Some(AGENT))
             .expect("history readable")
             .expect("the approval is observed")
             .approval_digest
@@ -1260,7 +1260,7 @@ mod tests {
         );
         // 39243 before any approval: no envelope id exists to reference.
         assert_eq!(
-            observe_last_approved_envelope_id(&store, SOVEREIGN_WALLET_VENUE, TradingNetwork::Signet, Some(AGENT))
+            observe_last_approved_envelope_id(&store, SOVEREIGN_WALLET_VENUE, TradingNetwork::Mainnet, Some(AGENT))
                 .expect("history readable"),
             None,
             "no envelope id may exist before the approval decision"
@@ -1269,7 +1269,7 @@ mod tests {
         let outcome = projection.emit_envelope_for_approved_mandate(
             &store,
             SOVEREIGN_WALLET_VENUE,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             Some(AGENT),
             10,
         );
@@ -1282,7 +1282,7 @@ mod tests {
         let outcome = projection.emit_envelope_for_approved_mandate(
             &store,
             SOVEREIGN_WALLET_VENUE,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             Some(AGENT),
             10,
         );
@@ -1323,7 +1323,7 @@ mod tests {
             projection.emit_envelope_for_approved_mandate(
                 &store,
                 SOVEREIGN_WALLET_VENUE,
-                TradingNetwork::Signet,
+                TradingNetwork::Mainnet,
                 Some(AGENT),
                 10,
             ),
@@ -1367,7 +1367,7 @@ mod tests {
         let _ = projection.emit_envelope_for_approved_mandate(
             &store,
             SOVEREIGN_WALLET_VENUE,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             Some(AGENT),
             10,
         );
@@ -1376,7 +1376,7 @@ mod tests {
         let _ = projection.emit_revocation_for_revoked_mandate(
             &store,
             SOVEREIGN_WALLET_VENUE,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             None,
             10,
         );
@@ -1447,7 +1447,7 @@ mod tests {
         let outcome = projection.emit_envelope_for_approved_mandate(
             &store,
             SOVEREIGN_WALLET_VENUE,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             Some(AGENT),
             10,
         );
@@ -1533,7 +1533,7 @@ mod tests {
         let observation = observe_approved_mandate(
             &store,
             SOVEREIGN_WALLET_VENUE,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             Some(AGENT),
         )
         .expect("history readable")
@@ -1721,7 +1721,7 @@ mod tests {
         let outcome = projection.emit_revocation_for_revoked_mandate(
             &store,
             trading_mandate::LEGACY_VENUE,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             None,
             10,
         );
@@ -1737,7 +1737,7 @@ mod tests {
         // ITS envelope id.
         let venue_wide_candidate = TradingMandate {
             venue: trading_mandate::LEGACY_VENUE.to_string(),
-            network: TradingNetwork::Signet,
+            network: TradingNetwork::Mainnet,
             principal_pubkey: None,
             collateral_asset: trading_mandate::AssetId::sats(),
             objective: "venue-wide revocation-mapping fixture".to_string(),
@@ -1760,12 +1760,12 @@ mod tests {
         let proposal = store.propose(venue_wide_candidate).expect("proposal");
         trading_mandate::apply_ui_approved_for_test(&store, proposal, 2).expect("approved");
         store
-            .revoke(trading_mandate::LEGACY_VENUE, TradingNetwork::Signet, 20)
+            .revoke(trading_mandate::LEGACY_VENUE, TradingNetwork::Mainnet, 20)
             .expect("revoked");
         let outcome = projection.emit_revocation_for_revoked_mandate(
             &store,
             trading_mandate::LEGACY_VENUE,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             Some("operator revocation"),
             21,
         );
@@ -1795,12 +1795,12 @@ mod tests {
         let sovereign_store = MandateStore::in_memory().expect("store");
         approve_mandate(&sovereign_store, 50_000);
         sovereign_store
-            .revoke(SOVEREIGN_WALLET_VENUE, TradingNetwork::Signet, 20)
+            .revoke(SOVEREIGN_WALLET_VENUE, TradingNetwork::Mainnet, 20)
             .expect("the venue-wide revoke call itself succeeds");
         let outcome = projection.emit_revocation_for_revoked_mandate(
             &sovereign_store,
             SOVEREIGN_WALLET_VENUE,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             None,
             21,
         );
@@ -1877,9 +1877,11 @@ mod tests {
             .insert(format!("{}_alt", crate::SOVEREIGN_WALLET_STRATEGY));
         let widened = scope_constraints_hash(&base);
         assert_ne!(widened, first, "a different scope digests differently");
-        // A different network is a different scope.
+        // A different network is a different scope (Testnet used purely as
+        // the contrast value — it is not a rail; the enum variant stays for
+        // other lanes).
         let mut other_network = candidate(50_000);
-        other_network.network = TradingNetwork::Mainnet;
+        other_network.network = TradingNetwork::Testnet;
         assert_ne!(scope_constraints_hash(&other_network), first);
         // A different principal is a different scope.
         let mut other_principal = candidate(50_000);
@@ -2118,7 +2120,7 @@ mod tests {
         let outcome = projection.emit_envelope_for_approved_mandate(
             &store,
             SOVEREIGN_WALLET_VENUE,
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             Some(AGENT),
             10,
         );

@@ -75,32 +75,16 @@ describe("loopback token (SEC-2026-053)", () => {
   });
 });
 
-describe("invoice/network guards (design §3.4, SEC-2026-050; OMEGA-DELTA-0286 — moved to the phoenixd rail by 0303)", () => {
-  it("accepts signet/testnet/regtest invoices and refuses mainnet on non-mainnet configs", () => {
-    assert.equal(assertInvoiceNetwork("signet", "lntbs10u1p0example"), undefined);
-    assert.equal(assertInvoiceNetwork("signet", "lntb10u1p0example"), undefined);
-    assert.equal(assertInvoiceNetwork("regtest", "lnbcrt10u1p0example"), undefined);
-    assert.throws(() => assertInvoiceNetwork("signet", "lnbc10u1p0example"), (error) => {
-      return error instanceof PhoenixdErrorImpl && error.envelope.code === "MAINNET_REFUSED";
-    });
-    assert.throws(() => assertInvoiceNetwork("regtest", "lntbs10u1p0example"), (error) => {
-      return error instanceof PhoenixdErrorImpl && error.envelope.code === "INVALID_ARGS";
-    });
-  });
-
-  it("OMEGA-DELTA-0286: a mainnet-configured wallet accepts lnbc (never lnbcrt) and refuses lntbs/lntb", () => {
-    // The guard follows the configured network: mainnet accepts `lnbc`,
-    // still excluding `lnbcrt`, and refuses signet/testnet HRPs as
-    // mismatched (assertion added by 0286; the signet/regtest assertions
-    // above are unchanged).
+describe("invoice/network guards (design §3.4, SEC-2026-050; OMEGA-DELTA-0286 — moved to the phoenixd rail by 0303; mainnet-only by OMEGA-DELTA-0305)", () => {
+  it("OMEGA-DELTA-0286/0305: the mainnet-only rail accepts lnbc (never lnbcrt) and refuses everything else", () => {
+    // The guard follows the rail, which is mainnet-only: `lnbc` passes
+    // (still excluding the shared-prefix `lnbcrt` edge), and any other
+    // prefix is refused. No signet payments ever travel this rail.
     assert.equal(assertInvoiceNetwork("mainnet", "lnbc10u1p0example"), undefined);
     assert.throws(() => assertInvoiceNetwork("mainnet", "lnbcrt10u1p0example"), (error) => {
       return error instanceof PhoenixdErrorImpl && error.envelope.code === "INVALID_ARGS";
     });
-    assert.throws(() => assertInvoiceNetwork("mainnet", "lntbs10u1p0example"), (error) => {
-      return error instanceof PhoenixdErrorImpl && error.envelope.code === "INVALID_ARGS";
-    });
-    assert.throws(() => assertInvoiceNetwork("mainnet", "lntb10u1p0example"), (error) => {
+    assert.throws(() => assertInvoiceNetwork("mainnet", "not-a-bolt11-invoice"), (error) => {
       return error instanceof PhoenixdErrorImpl && error.envelope.code === "INVALID_ARGS";
     });
   });
@@ -110,22 +94,17 @@ describe("invoice/network guards (design §3.4, SEC-2026-050; OMEGA-DELTA-0286 �
     // refused UNLESS configured mainnet AND the allow-mainnet opt-in is
     // present; any other mismatch is refused too. An ABSENT report (getinfo
     // exposes no chain field) is carried by the env gate + the invoice HRP
-    // guard (design §2.6.3) — never an error on its own.
-    assert.throws(() => assertNetworkMatches("signet", "mainnet", false), (error) => {
-      return error instanceof PhoenixdErrorImpl && error.envelope.code === "MAINNET_REFUSED";
-    });
+    // guard (design §2.6.3) — never an error on its own. The rail is
+    // mainnet-only (OMEGA-DELTA-0305): only the mainnet-configured shape
+    // is constructible.
     assert.throws(() => assertNetworkMatches("mainnet", "mainnet", false), (error) => {
       return error instanceof PhoenixdErrorImpl && error.envelope.code === "MAINNET_REFUSED";
     });
     assert.equal(assertNetworkMatches("mainnet", "mainnet", true), undefined);
-    assert.throws(() => assertNetworkMatches("signet", "testnet", false), (error) => {
+    assert.throws(() => assertNetworkMatches("mainnet", "regtest", true), (error) => {
       return error instanceof PhoenixdErrorImpl && error.envelope.code === "INTERNAL";
     });
-    assert.throws(() => assertNetworkMatches("mainnet", "signet", true), (error) => {
-      return error instanceof PhoenixdErrorImpl && error.envelope.code === "INTERNAL";
-    });
-    assert.equal(assertNetworkMatches("signet", "signet", false), undefined);
-    assert.equal(assertNetworkMatches("signet", null, false), undefined);
+    assert.equal(assertNetworkMatches("mainnet", null, true), undefined);
   });
 });
 
@@ -154,12 +133,12 @@ describe("phoenixd HTTP error mapping (wavecli-style envelope; OMEGA-DELTA-0303)
 
   it("OMEGA-DELTA-0300: the expected-outflow bound is amount + the 0.4% fee, rounded up", () => {
     // 10u = 1,000 sats; 0.4% = 4 sats; bound = 1004.
-    const known = expectedTotalOutflowSat("lntbs10u1p0example");
+    const known = expectedTotalOutflowSat("lnbc10u1p0example");
     assert.equal(known.known, true);
     assert.equal(known.expected, 1_004);
     assert.equal(PHOENIXD_PAY_FEE_BASIS_POINTS, 40);
     // Pay-any invoice (no amount): the loss rule must not false-trigger.
-    const unknown = expectedTotalOutflowSat("lntbs1p0example");
+    const unknown = expectedTotalOutflowSat("lnbc1p0example");
     assert.equal(unknown.known, false);
   });
 });
@@ -188,8 +167,8 @@ describe("idempotency store (SEC-2026-047)", () => {
 
   it("ignores duplicate keys (idempotent replay)", () => {
     const key = "22222222-2222-4222-8222-222222222222";
-    assert.equal(store.store("make-invoice", key, { invoice: "lntbs1" }), true);
-    assert.equal(store.store("make-invoice", key, { invoice: "lntbs1" }), false);
+    assert.equal(store.store("make-invoice", key, { invoice: "lnbc1" }), true);
+    assert.equal(store.store("make-invoice", key, { invoice: "lnbc1" }), false);
   });
 });
 

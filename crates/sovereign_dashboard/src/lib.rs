@@ -4,7 +4,7 @@
 //!
 //! WP-5 (OA-P2-WALLET-2026-08-26) wired the real surfaces behind
 //! `OMEGA_SOVEREIGN_WALLET=1` (default OFF):
-//! - Wallet: real read-only signet balance from the sidecar; operator-only
+//! - Wallet: real read-only mainnet balance from the sidecar; operator-only
 //!   Create/Unlock/Lock; a real Fund flow (BOLT11 + QR via `ui::QrCodeCanvas`,
 //!   the existing deposit-UI pattern from `command_center_ui::transfer_flow`).
 //! - Agent Nostr ID: the REAL derived npub from the sidecar `identity-status`,
@@ -356,8 +356,8 @@ pub struct SovereignDashboardPanel {
     /// WP-5b: the persisted escrow sessions (HTLC 2-of-3 limbo, digest-only
     /// state) loaded from the escrow store on refresh.
     escrow_sessions: Vec<market_ui::EscrowSession>,
-    /// WP-5b: the observed signet tip for the timeout countdown (fail-closed
-    /// when the probe is unavailable — never wall-clock).
+    /// WP-5b: the observed tip for the timeout countdown (fail-closed
+    /// when the probe is unavailable - never wall-clock).
     escrow_height: Option<u32>,
     /// WP-5b: an escrow action error surfaced next to the section.
     escrow_error: Option<SharedString>,
@@ -514,7 +514,7 @@ impl SovereignDashboardPanel {
             } else {
                 std::collections::HashMap::new()
             };
-            // WP-5b: the observed signet tip for the escrow timeout countdown.
+            // WP-5b: the observed tip for the escrow timeout countdown.
             // Fail-closed: when the probe fails the countdown shows the
             // unavailable state and never substitutes wall-clock.
             let escrow_height = if status.is_some() {
@@ -585,7 +585,7 @@ impl SovereignDashboardPanel {
     fn create_wallet_flow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Create the Wavelength wallet (signet)?",
+            "Create the wallet (mainnet)?",
             Some(
                 "The wallet DB password you enter is shown nowhere after creation. If the vault \
                  is unlocked it is captured there; otherwise the aezeed shown next is your only \
@@ -661,7 +661,7 @@ impl SovereignDashboardPanel {
             .status
             .as_ref()
             .map(|status| status.network.clone())
-            .unwrap_or_else(|| "signet".to_string());
+            .unwrap_or_else(|| "mainnet".to_string());
         self.pending_input = Some(PendingInput {
             request: InputRequest::FundAmount,
             label: "Amount (sats)".into(),
@@ -1529,8 +1529,8 @@ impl SovereignDashboardPanel {
         self.pending_input = Some(PendingInput {
             request: InputRequest::MandateAmount,
             label: "Maximum payment (sats)".into(),
-            detail: "Maximum PAYMENT SIZE in sats for the sovereign-wallet venue (signet test \
-                     coins only). The authorization is keyed to this agent's Nostr pubkey \
+            detail: "Maximum PAYMENT SIZE in sats for the sovereign-wallet venue (mainnet \
+                     - real funds). The authorization is keyed to this agent's Nostr pubkey \
                      (principal-only, SEC-2026-043)."
                 .into(),
         });
@@ -1555,12 +1555,11 @@ impl SovereignDashboardPanel {
         let expiry_ms = now_ms.saturating_add(
             (expiry_hours.clamp(1, 24 * 365) * 3_600 * 1_000) as i64,
         );
-        // OMEGA-DELTA-0286: the mandate builder is network-aware; the
-        // dashboard's New Authorization flow keeps creating signet mandates
-        // (unchanged behavior — the network-aware operator surface is WP-7's
-        // scope; mainnet mandates are constructed by the escrow/L-402 lanes).
+        // OMEGA-DELTA-0286/0305: the mandate builder is network-aware; the
+        // dashboard's New Authorization flow creates mainnet mandates (the
+        // rail is mainnet-only — no signet mandates exist).
         let candidate = sovereign_wallet::sovereign_wallet_mandate_candidate(
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             &pubkey_hex,
             amount_sat,
             expiry_ms,
@@ -1574,7 +1573,7 @@ impl SovereignDashboardPanel {
                     .and_then(|snapshot| {
                         snapshot.mandate_for_principal(
                             trading_mandate::SOVEREIGN_WALLET_VENUE,
-                            TradingNetwork::Signet,
+                            TradingNetwork::Mainnet,
                             Some(&pubkey_hex),
                         )
                     })
@@ -1951,7 +1950,7 @@ impl SovereignDashboardPanel {
             .status
             .as_ref()
             .map(|status| status.network.as_str())
-            .unwrap_or("signet");
+            .unwrap_or("mainnet");
         let body = if self.supervisor.is_none() {
             v_flex()
                 .child(Label::new("Wallet unavailable").size(LabelSize::Small).color(Color::Error))
@@ -2057,7 +2056,7 @@ impl SovereignDashboardPanel {
                 .child(
                     Button::new("fund-wallet", "Fund")
                         .style(ButtonStyle::Subtle)
-                        .tooltip(ui::Tooltip::text("Mint a real signet receive invoice"))
+                            .tooltip(ui::Tooltip::text("Mint a real mainnet receive invoice"))
                         .on_click(cx.listener(|this, _, _, cx| this.fund_flow(cx))),
                 )
                 .into_any_element(),
@@ -2101,10 +2100,10 @@ impl SovereignDashboardPanel {
                                 "{} sats · {} · {}",
                                 invoice.amount_sat,
                                 invoice.hrp,
-                                if network_label == "regtest" {
-                                    "regtest — local test coins only"
+                                if network_label == "mainnet" {
+                                    "mainnet - real funds (self-custody node, server-side)"
                                 } else {
-                                    "signet test coins — never mainnet"
+                                    "test coins only - never mainnet"
                                 }
                             ))
                             .size(LabelSize::XSmall)
@@ -2796,7 +2795,7 @@ impl SovereignDashboardPanel {
             .as_ref()
             .map(|status| status.l402_gateway_state.clone())
             .unwrap_or_else(|| "absent".into());
-        let gateway_line = format!("L-402 gateway: {gateway_state} — signet/testnet only (D4)");
+        let gateway_line = format!("L-402 gateway: {gateway_state} — mainnet rail (OMEGA-DELTA-0305)");
         let mapping_error = self.mapping_error.clone();
         let rows_elements: Vec<AnyElement> = rows
             .iter()
@@ -3140,15 +3139,15 @@ impl SovereignDashboardPanel {
             // simulated — the dashboard never claims on-chain settlement.
             // OMEGA-DELTA-0294: the label is network-aware — it names the
             // wallet's configured network (the same reported == configured
-            // network the escrow lane inherits; the "signet" fallback is the
-            // wallet section's existing honest-default posture).
+            // network the escrow lane inherits).
+            // wallet section renders the configured network honestly).
             .child(
                 Label::new(escrow_honesty_footer(
                     self.wallet
                         .status
                         .as_ref()
                         .map(|status| status.network.as_str())
-                        .unwrap_or("signet"),
+                        .unwrap_or("mainnet"),
                 ))
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
@@ -3373,7 +3372,7 @@ impl SovereignDashboardPanel {
     /// without backing (C7 honesty law).
     fn operator_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let configured_network = std::env::var(sovereign_wallet::NETWORK_ENVIRONMENT_VARIABLE)
-            .unwrap_or_else(|_| "signet".to_string());
+            .unwrap_or_else(|_| "mainnet".to_string());
         let reported_network = self
             .wallet
             .status
@@ -3901,10 +3900,10 @@ fn wallet_balance_label(balance: Option<&BalanceResult>, network: &str) -> (Stri
     let confirmed = balance.confirmed_sat.parse::<u64>().unwrap_or(0);
     let pending_in = balance.pending_in_sat.parse::<u64>().unwrap_or(0);
     let pending_out = balance.pending_out_sat.parse::<u64>().unwrap_or(0);
-    let network_note = if network == "regtest" {
-        "regtest — local test coins only"
+    let network_note = if network == "mainnet" {
+        "mainnet - real funds (self-custody node, server-side)"
     } else {
-        "signet test coins — never mainnet"
+        "test coins only - never mainnet"
     };
     if pending_in == 0 && pending_out == 0 {
         (
@@ -4009,7 +4008,7 @@ fn escrow_honesty_footer(network: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// WP-7: the honest network note for the Fund flow's detail line — the REAL
-/// configured network's caution. Signet/regtest keep the long-standing
+/// configured network's caution. Any non-mainnet label keeps the long-standing
 /// "test coins only" wording; a mainnet-configured wallet (reachable only
 /// through the 0286 gate: explicit network env AND the allow-mainnet opt-in)
 /// is labeled as the real-funds network it is.
@@ -4483,12 +4482,12 @@ mod tests {
             credit_available_sat: "0".into(),
             credit_reserved_sat: "0".into(),
         };
-        let (primary, secondary) = wallet_balance_label(Some(&balance), "signet");
+        let (primary, secondary) = wallet_balance_label(Some(&balance), "mainnet");
         assert_eq!(primary, "12345 sats");
         assert!(secondary.contains("read-only"), "{secondary}");
-        assert!(secondary.contains("signet"), "{secondary}");
-        assert!(secondary.contains("never mainnet"), "{secondary}");
-        let (primary, secondary) = wallet_balance_label(None, "signet");
+        assert!(secondary.contains("mainnet"), "{secondary}");
+        assert!(secondary.contains("real funds"), "{secondary}");
+        let (primary, secondary) = wallet_balance_label(None, "mainnet");
         assert_eq!(primary, "Balance unavailable");
         assert!(secondary.contains("read-only"), "{secondary}");
     }
@@ -4502,17 +4501,18 @@ mod tests {
             credit_available_sat: "0".into(),
             credit_reserved_sat: "0".into(),
         };
-        let (_, secondary) = wallet_balance_label(Some(&balance), "regtest");
+        let (_, secondary) = wallet_balance_label(Some(&balance), "mainnet");
         assert!(secondary.contains("+50 in"), "{secondary}");
         assert!(secondary.contains("-20 out"), "{secondary}");
     }
 
     #[test]
     fn mandate_scope_label_distinguishes_venue_wide_from_principal_keyed() {
-        // OMEGA-DELTA-0286: the candidate builder gained the network
-        // parameter; the label assertions are unchanged (signet candidate).
+        // OMEGA-DELTA-0286/0305: the candidate builder gained the network
+        // parameter; the label assertions use a mainnet candidate (the rail
+        // is mainnet-only — no signet mandates exist).
         let mut venue_wide = sovereign_wallet::sovereign_wallet_mandate_candidate(
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
             1_000,
             1,
@@ -4520,7 +4520,7 @@ mod tests {
         venue_wide.principal_pubkey = None;
         assert!(mandate_scope_label(&venue_wide).contains("venue-wide"));
         let principal_keyed = sovereign_wallet::sovereign_wallet_mandate_candidate(
-            TradingNetwork::Signet,
+            TradingNetwork::Mainnet,
             "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
             1_000,
             1,
@@ -5041,32 +5041,31 @@ mod tests {
 
     #[test]
     fn wallet_network_gate_line_renders_the_real_0286_gate_state() {
-        // Lane off: the honest unconfigured posture — never a "signet" claim.
+        // Lane off: the honest unconfigured posture.
         let line = wallet_network_gate_line(None, None, false);
         assert!(line.contains("lane off"), "{line}");
         assert!(line.contains("unset"), "{line}");
         assert!(line.contains("allow-mainnet opt-in"), "{line}");
-        // Configured signet, sidecar reporting: the opt-in state is named.
-        let line = wallet_network_gate_line(Some("signet"), Some("signet"), false);
-        assert!(line.contains("configured signet"), "{line}");
-        assert!(line.contains("reported signet"), "{line}");
+        // Configured mainnet without the opt-in: the refusal state is named.
+        let line = wallet_network_gate_line(Some("mainnet"), Some("mainnet"), false);
+        assert!(line.contains("configured mainnet"), "{line}");
+        assert!(line.contains("reported mainnet"), "{line}");
         assert!(line.contains("opt-in absent (mainnet refused)"), "{line}");
-        // Opted-in mainnet (the only way mainnet renders as configured).
+        // Opted-in mainnet (the only way the rail renders as configured).
         let line = wallet_network_gate_line(Some("mainnet"), Some("mainnet"), true);
         assert!(line.contains("configured mainnet"), "{line}");
         assert!(line.contains("opt-in present"), "{line}");
         // Sidecar not reporting yet is stated, never fabricated.
-        let line = wallet_network_gate_line(Some("signet"), None, false);
+        let line = wallet_network_gate_line(Some("mainnet"), None, false);
         assert!(line.contains("sidecar not reporting yet"), "{line}");
     }
 
     #[test]
     fn wallet_network_note_matches_the_real_network() {
         assert_eq!(
-            wallet_network_note("signet"),
+            wallet_network_note("bogus-network"),
             "Test coins only — never mainnet."
         );
-        assert_eq!(wallet_network_note("regtest"), "Test coins only — never mainnet.");
         let mainnet = wallet_network_note("mainnet");
         assert!(mainnet.contains("real-funds"), "{mainnet}");
         assert!(mainnet.contains("0286"), "{mainnet}");

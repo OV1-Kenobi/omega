@@ -1,5 +1,6 @@
 //! Agent L-402 call path (design §5.7; WP-6) — the demo's paid-MCP lane on
-//! signet, mandate-gated. OMEGA-DELTA-0287: the client follows the
+//! L-402 client pay flow: the mandate-gated pay step on the mainnet-only
+//! rail. OMEGA-DELTA-0287: the client follows the
 //! configured network — the mandate instruction is built with the
 //! supervisor's configured network (0286), so a mainnet-configured wallet
 //! pays under a `(sovereign-wallet, mainnet, principal)` mandate.
@@ -84,7 +85,7 @@ pub async fn pay_l402_challenge(
     idempotency_key: &str,
     now_ms: i64,
 ) -> Result<L402Proof, L402PayError> {
-    let network = sovereign_wallet_network(supervisor.network());
+    let network = sovereign_wallet_network(supervisor.network())?;
     // OMEGA-DELTA-0302: the decision is kept for the projection's
     // after-decision constructor — a Refused decision can never produce a
     // spend-authorization emission (the gate is the ONLY authority; the
@@ -187,7 +188,6 @@ pub fn parse_l402_challenge_body(body: &str) -> Result<L402Challenge> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::SovereignWalletError;
     use crate::{
         SovereignWalletCommand, SovereignWalletSupervisor, SovereignWalletSupervisorOptions,
         fixture_command, fixture_command_with_network,
@@ -225,7 +225,7 @@ mod tests {
             // OMEGA-DELTA-0300: the invoice amount is what the spend ceiling
             // counts — 10u = 1,000 sats sits exactly AT the first-phase
             // ceiling so the mandate-gated tests stay under it.
-            invoice: "lntbs10u1pfixture".into(),
+            invoice: "lnbc10u1pfixture".into(),
             payment_hash: FIXTURE_PAYMENT_HASH.into(),
             amount_sats,
             expires_at: 1_893_456_000,
@@ -245,16 +245,19 @@ mod tests {
             .expect("approved mandate");
     }
 
-    fn approve_signet_agent_mandate(store: &MandateStore, max_payment_sat: u64, now: i64) {
-        approve_agent_mandate(store, trading_mandate::TradingNetwork::Signet, max_payment_sat, now);
+    fn approve_mainnet_agent_mandate(store: &MandateStore, max_payment_sat: u64, now: i64) {
+        approve_agent_mandate(store, trading_mandate::TradingNetwork::Mainnet, max_payment_sat, now);
     }
 
     #[test]
     fn the_l402_pay_path_refuses_without_a_mandate_and_pays_with_one() {
         smol::block_on(async {
             let store = MandateStore::in_memory().expect("store");
+            // OMEGA-DELTA-0305: mainnet-only rail — the opt-in guard covers
+            // construction AND start.
+            let _rail = crate::test_support::hold_allow_mainnet_opt_in();
             let mut supervisor =
-                make_supervisor("signet", fixture_command(&fixture_path())).expect("supervisor");
+                make_supervisor("mainnet", fixture_command_with_network(&fixture_path(), "mainnet")).expect("supervisor");
             supervisor.start().await.context("initialize").unwrap();
 
             // No mandate -> the gate REFUSES and no payment is attempted
@@ -279,7 +282,7 @@ mod tests {
 
             // With an approved principal mandate the payment goes through and
             // the preimage proof is returned.
-            approve_signet_agent_mandate(&store, 50_000, 1);
+            approve_mainnet_agent_mandate(&store, 50_000, 1);
             let proof = pay_l402_challenge(
                 &mut supervisor,
                 &store,
@@ -324,7 +327,7 @@ mod tests {
         smol::block_on(async {
             let store = MandateStore::in_memory().expect("store");
             let mut supervisor =
-                make_supervisor("signet", fixture_command(&fixture_path())).expect("supervisor");
+                make_supervisor("mainnet", fixture_command_with_network(&fixture_path(), "mainnet")).expect("supervisor");
             supervisor.start().await.context("initialize").unwrap();
 
             // Refusal for a None principal (the venue is principal-only).
@@ -367,9 +370,9 @@ mod tests {
     fn the_l402_pay_path_respects_the_mandate_limit() {
         smol::block_on(async {
             let store = MandateStore::in_memory().expect("store");
-            approve_signet_agent_mandate(&store, 50_000, 1);
+            approve_mainnet_agent_mandate(&store, 50_000, 1);
             let mut supervisor =
-                make_supervisor("signet", fixture_command(&fixture_path())).expect("supervisor");
+                make_supervisor("mainnet", fixture_command_with_network(&fixture_path(), "mainnet")).expect("supervisor");
             supervisor.start().await.context("initialize").unwrap();
 
             // A challenge above the approved per-payment cap is refused by the
@@ -401,7 +404,7 @@ mod tests {
             "error": { "code": "payment_required", "message": "Payment required" },
             "challengeId": "l402_challenge_fixture",
             "macaroon": "v1.payload.signature",
-            "invoice": "lntbs100u1qftest",
+            "invoice": "lnbc100u1qftest",
             "paymentHash": "4ca14526b2751b640d549ce7caf8ac39438592211a0ec370064d57666a682ad6",
             "amountSats": 1,
             "expiresAt": 1893456000
@@ -410,42 +413,6 @@ mod tests {
         assert_eq!(parsed.challenge_id, "l402_challenge_fixture");
         assert_eq!(parsed.amount_sats, 1);
         assert_eq!(parsed.payment_hash, FIXTURE_PAYMENT_HASH);
-    }
-
-    #[test]
-    fn protocol_errors_map_to_the_pay_error() {
-        smol::block_on(async {
-            let store = MandateStore::in_memory().expect("store");
-            approve_signet_agent_mandate(&store, 50_000, 1);
-            let mut supervisor =
-                make_supervisor("signet", fixture_command(&fixture_path())).expect("supervisor");
-            supervisor.start().await.context("initialize").unwrap();
-
-            // OMEGA-DELTA-0287 (updated-with-citation): a mainnet invoice is
-            // refused by a SIGNET-configured sidecar with MAINNET_REFUSED
-            // (the sidecar's guard), surfaced as a Protocol error — the
-            // signet-configured refusal is kept; the mainnet-configured
-            // acceptance is covered by
-            // `mainnet_configured_l402_pay_is_accepted` below.
-            let mut mainnet_challenge = challenge(1);
-            mainnet_challenge.invoice = "lnbc10u1p0example".into();
-            let err = pay_l402_challenge(
-                &mut supervisor,
-                &store,
-                &mainnet_challenge,
-                Some(AGENT),
-                "l402-key-7",
-                2,
-            )
-            .await
-            .expect_err("a mainnet invoice must be refused on a signet-configured wallet");
-            match err {
-                L402PayError::Protocol(SovereignWalletError::MainnetRefused) => {}
-                other => panic!("expected MainnetRefused, got {other:?}"),
-            }
-
-            supervisor.stop().await.ok();
-        });
     }
 
     #[test]

@@ -88,8 +88,8 @@ impl SovereignWalletSupervisor {
         // sidecar, so the check lives here once.
         if !crate::SUPPORTED_NETWORKS.contains(&options.network.as_str()) {
             bail!(
-                "sovereign wallet network {:?} is refused; only signet/regtest/mainnet are \
-                 permitted (mainnet requires the allow-mainnet opt-in — OMEGA-DELTA-0286)",
+                "sovereign wallet network {:?} is refused; the payments rail is mainnet-only \
+                 (mainnet requires the allow-mainnet opt-in - OMEGA-DELTA-0286/0305)",
                 options.network
             );
         }
@@ -621,13 +621,14 @@ pub fn fixture_command_with_network(fixture: &Path, network: &str) -> SovereignW
 mod tests {
     use super::*;
 
-    /// OMEGA-DELTA-0286 (updated-with-citation): the refusal remains for the
-    /// UN-OPTED-IN case — `mainnet` construction is refused without
-    /// OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1, and signet construction stays
-    /// accepted. The gated-mainnet construction path is covered by
+    /// OMEGA-DELTA-0286/0305 (updated-with-citation): the refusal remains for
+    /// the UN-OPTED-IN case - `mainnet` construction is refused without
+    /// OMEGA_SOVEREIGN_WALLET_ALLOW_MAINNET=1 - and non-mainnet networks are
+    /// refused outright (the payments rail is mainnet-only; no signet rail).
+    /// The gated-mainnet construction path is covered by
     /// `supervisor_accepts_opted_in_mainnet_at_config` in tests.rs.
     #[test]
-    fn supervisor_refuses_non_signet_networks_at_config() {
+    fn supervisor_refuses_non_mainnet_networks_at_config() {
         crate::test_support::assert_allow_mainnet_opt_in_absent(|| {
             let options = default_options(
                 PathBuf::from(std::env::temp_dir()),
@@ -642,35 +643,42 @@ mod tests {
                 .err()
                 .expect("construction with mainnet must fail");
             assert!(error.to_string().contains("mainnet"), "{error}");
+            for network in ["signet", "regtest", "testnet", ""] {
+                let options = default_options(
+                    PathBuf::from(std::env::temp_dir()),
+                    SovereignWalletCommand {
+                        program: PathBuf::from("node"),
+                        args: Vec::new(),
+                    },
+                    network,
+                )
+                .unwrap();
+                assert!(
+                    SovereignWalletSupervisor::new(options).is_err(),
+                    "non-mainnet rail network must be refused: {network:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn loopback_token_is_32_hex_bytes() {
+        crate::test_support::with_allow_mainnet_opt_in(|| {
             let options = default_options(
                 PathBuf::from(std::env::temp_dir()),
                 SovereignWalletCommand {
                     program: PathBuf::from("node"),
                     args: Vec::new(),
                 },
-                "signet",
+                "mainnet",
             )
             .unwrap();
-            assert!(SovereignWalletSupervisor::new(options).is_ok());
+            let supervisor = SovereignWalletSupervisor::new(options).unwrap();
+            assert_eq!(supervisor.loopback_token.len(), 64);
+            assert!(supervisor
+                .loopback_token
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()));
         });
-    }
-
-    #[test]
-    fn loopback_token_is_32_hex_bytes() {
-        let options = default_options(
-            PathBuf::from(std::env::temp_dir()),
-            SovereignWalletCommand {
-                program: PathBuf::from("node"),
-                args: Vec::new(),
-            },
-            "signet",
-        )
-        .unwrap();
-        let supervisor = SovereignWalletSupervisor::new(options).unwrap();
-        assert_eq!(supervisor.loopback_token.len(), 64);
-        assert!(supervisor
-            .loopback_token
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit()));
     }
 }

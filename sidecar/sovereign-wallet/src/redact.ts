@@ -24,10 +24,7 @@ export function clearRegisteredSecrets(): void {
 const SHAPE_PATTERNS: RegExp[] = [
   /nsec1[02-9ac-hj-np-z]{58,62}/g, // bech32 nsec (NIP-19)
   /\b[0-9a-f]{64}\b/g, // 64-hex (preimage, payment preimage, macaroon, keys)
-  /lnbc[a-z0-9]+/gi, // mainnet BOLT11 (never minted here; redact if ever seen)
-  /lntbs[a-z0-9]+/gi, // signet BOLT11 (contains no secret, but keep invoices out of logs)
-  /lntb[a-z0-9]+/gi,
-  /lnbcrt[a-z0-9]+/gi,
+  /lnbc[a-z0-9]+/gi, // mainnet BOLT11 (redact invoices from logs)
 ];
 
 /** Redact every registered secret and secret-shaped string from a line. */

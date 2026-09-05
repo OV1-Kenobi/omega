@@ -103,21 +103,28 @@ fn supervisor_accepts_opted_in_mainnet_at_config() {
 
 #[test]
 fn initialize_health_balance_round_trip() {
+    // OMEGA-DELTA-0305: mainnet-only rail — the opt-in covers construction
+    // AND start (the runtime assertion re-checks it); the fixture reports
+    // mainnet.
+    crate::test_support::with_allow_mainnet_opt_in(|| {
     smol::block_on(async {
-        let mut supervisor = make_supervisor("signet", fixture_command(&fixture_path()))
+        let mut supervisor = make_supervisor(
+                "mainnet",
+                fixture_command_with_network(&fixture_path(), "mainnet"),
+            )
             .expect("supervisor");
         let initialize = supervisor.start().await.context("initialize handshake").unwrap();
-        assert_eq!(initialize.network, "signet");
-        assert_eq!(initialize.node_network.as_deref(), Some("signet"));
+        assert_eq!(initialize.network, "mainnet");
+        assert_eq!(initialize.node_network.as_deref(), Some("mainnet"));
         assert_eq!(initialize.protocol_version, 1);
 
         let health = supervisor.health().await.context("health").unwrap();
         assert!(health.ok);
-        assert_eq!(health.network, "signet");
+        assert_eq!(health.network, "mainnet");
         assert!(health.node_connected);
 
         let status = supervisor.status().await.context("status").unwrap();
-        assert_eq!(status.network, "signet");
+        assert_eq!(status.network, "mainnet");
         assert_eq!(status.vault_state, "absent");
 
         let balance = supervisor.balance().await.context("balance").unwrap();
@@ -130,35 +137,6 @@ fn initialize_health_balance_round_trip() {
         );
         supervisor.stop().await.context("stop").unwrap();
     });
-}
-
-#[test]
-fn mainnet_runtime_report_is_a_hard_bail() {
-    smol::block_on(async {
-        // SEC-2026-050 (OMEGA-DELTA-0286, rail form OMEGA-DELTA-0303): the
-        // supervisor refuses the initialize-reported network (the node's
-        // ACTUAL runtime network from the rail's getinfo probe), not just the
-        // env value. A mainnet report on a SIGNET-configured supervisor is
-        // still a hard bail — mainnet is accepted only when configured
-        // mainnet AND opted in (covered by
-        // `mainnet_runtime_report_is_accepted_when_configured_and_opted_in`).
-        let mut supervisor =
-            make_supervisor("signet", fixture_command_with_network(&fixture_path(), "mainnet"))
-                .expect("supervisor");
-        let result = supervisor.start().await;
-        let error = result.unwrap_err();
-        let text = format!("{error:#}");
-        assert!(
-            text.contains("MAINNET_REFUSED") || text.contains("mainnet"),
-            "expected a mainnet refusal, got: {text}"
-        );
-        // The child must be torn down after the bail: ensure_started cannot
-        // silently keep a running child (it would re-spawn the same mainnet
-        // fixture and refuse again).
-        assert!(
-            supervisor.ensure_started().await.is_err(),
-            "no sidecar may be running after a mainnet hard-bail"
-        );
     });
 }
 
@@ -185,21 +163,25 @@ fn mainnet_runtime_report_is_accepted_when_configured_and_opted_in() {
 
 #[test]
 fn unsupported_runtime_network_is_refused() {
-    smol::block_on(async {
-        // OMEGA-DELTA-0286 (updated-with-citation to 0303): the assertion is
-        // now "reported MUST equal configured" — `testnet` remains
-        // unsupported (a testnet report on a signet-configured supervisor is
-        // a mismatch, refused; a testnet-configured supervisor cannot even be
-        // constructed — the config gate refuses it).
-        let mut supervisor =
-            make_supervisor("signet", fixture_command_with_network(&fixture_path(), "testnet"))
-                .expect("supervisor");
-        let result = supervisor.start().await;
-        assert!(
-            result.is_err(),
-            "a non-configured runtime network must be refused"
-        );
-        supervisor.stop().await.ok();
+    // OMEGA-DELTA-0286/0305 (updated-with-citation): the assertion is
+    // "reported MUST equal configured" — a non-mainnet report on the
+    // mainnet-only rail is a mismatch, refused. (The old signet-configured
+    // premise is gone with the rail: no signet supervisor can be
+    // constructed.)
+    crate::test_support::with_allow_mainnet_opt_in(|| {
+        smol::block_on(async {
+            let mut supervisor = make_supervisor(
+                "mainnet",
+                fixture_command_with_network(&fixture_path(), "testnet"),
+            )
+            .expect("supervisor");
+            let result = supervisor.start().await;
+            assert!(
+                result.is_err(),
+                "a non-configured runtime network must be refused"
+            );
+            supervisor.stop().await.ok();
+        })
     });
 }
 
@@ -213,8 +195,15 @@ fn the_spend_kill_refuses_mint_and_pay_before_forwarding() {
         // The env is set ONLY for the construction window (the supervisor
         // reads OMEGA_SPEND_KILL once at construction); the policy snapshot
         // stays killed for the assertions.
+        // OMEGA-DELTA-0305: mainnet-only rail — the opt-in guard covers
+        // construction AND start (the runtime assertion re-checks it).
+        let _rail = crate::test_support::hold_allow_mainnet_opt_in();
         let mut supervisor = crate::test_support::with_spend_kill_env(|| {
-            make_supervisor("signet", fixture_command(&fixture_path())).expect("supervisor")
+            make_supervisor(
+                "mainnet",
+                fixture_command_with_network(&fixture_path(), "mainnet"),
+            )
+            .expect("supervisor")
         });
         supervisor.start().await.context("initialize").unwrap();
 
@@ -226,7 +215,7 @@ fn the_spend_kill_refuses_mint_and_pay_before_forwarding() {
         assert!(mint.to_string().contains("SPEND_HALTED"), "{mint}");
 
         let pay = supervisor
-            .pay_invoice("lntbs10u1p0example", "kill-key-2")
+            .pay_invoice("lnbc10u1p0example", "kill-key-2")
             .await
             .expect_err("a killed surface must refuse paying");
         assert!(matches!(pay, SovereignWalletError::SpendHalted(_)), "{pay:?}");
@@ -242,8 +231,12 @@ fn the_daily_ceiling_refuses_an_over_limit_mint_and_allows_under_ceiling_flows()
     // phase, reversible assumption) counts mints + payments on
     // `wallet-l402` and refuses BEFORE forwarding.
     smol::block_on(async {
+        // OMEGA-DELTA-0305: mainnet-only rail — the opt-in guard covers
+        // construction AND start (the runtime assertion re-checks it).
+        let _rail = crate::test_support::hold_allow_mainnet_opt_in();
         let mut supervisor =
-            make_supervisor("signet", fixture_command(&fixture_path())).expect("supervisor");
+            make_supervisor("mainnet", fixture_command_with_network(&fixture_path(), "mainnet"))
+                .expect("supervisor");
         supervisor.start().await.context("initialize").unwrap();
 
         let over = supervisor
@@ -283,23 +276,31 @@ fn over_settlement_auto_kills_the_surface_fail_closed() {
     // flow (mint AND pay) until the founder re-enables.
     smol::block_on(async {
         let dir = tempdir().context("create temp data root").expect("tempdir");
-        let options = SovereignWalletSupervisorOptions {
-            data_root: dir.path().to_path_buf(),
+        // OMEGA-DELTA-0305: mainnet-only rail — the opt-in guard covers
+        // construction AND start (the runtime assertion re-checks it).
+        let _rail = crate::test_support::hold_allow_mainnet_opt_in();
+        let mut supervisor = {
+            let options = SovereignWalletSupervisorOptions {
+                data_root: dir.path().to_path_buf(),
             command: {
                 let mut command = fixture_command(&fixture_path());
                 command.args.push("--over-settle".to_owned());
+                // OMEGA-DELTA-0305: the fixture reports mainnet to match the
+                // mainnet-only rail configuration.
+                command.args.push("--network=mainnet".to_owned());
                 command
             },
-            network: "signet".to_string(),
-            initial_generation: 1,
-            request_timeout: Duration::from_secs(10),
-            node_require_minor: None,
+                network: "mainnet".to_string(),
+                initial_generation: 1,
+                request_timeout: Duration::from_secs(10),
+                node_require_minor: None,
+            };
+            SovereignWalletSupervisor::new(options).expect("supervisor")
         };
-        let mut supervisor = SovereignWalletSupervisor::new(options).expect("supervisor");
         supervisor.start().await.context("initialize").unwrap();
 
         let over = supervisor
-            .pay_invoice("lntbs10u1p0example", "loss-key-1")
+            .pay_invoice("lnbc10u1p0example", "loss-key-1")
             .await
             .expect_err("an over-settled payment must trip the loss rule");
         assert!(matches!(over, SovereignWalletError::SpendHalted(_)), "{over:?}");
@@ -334,7 +335,7 @@ fn over_settlement_auto_kills_the_surface_fail_closed() {
             .expect_err("a killed surface must refuse minting after the loss rule");
         assert!(matches!(mint, SovereignWalletError::SpendHalted(_)));
         let pay = supervisor
-            .pay_invoice("lntbs10u1p0example", "loss-key-3")
+            .pay_invoice("lnbc10u1p0example", "loss-key-3")
             .await
             .expect_err("a killed surface must refuse paying after the loss rule");
         assert!(matches!(pay, SovereignWalletError::SpendHalted(_)));
@@ -352,8 +353,13 @@ fn wallet_height_round_trips_the_observed_tip() {
     // sidecar suite; the C3-2 slice wires the tip API (0304) and the fixture
     // keeps answering.
     smol::block_on(async {
-        let mut supervisor = make_supervisor("signet", fixture_command(&fixture_path()))
-            .expect("supervisor");
+        // OMEGA-DELTA-0305: mainnet-only rail.
+        let _rail = crate::test_support::hold_allow_mainnet_opt_in();
+        let mut supervisor = make_supervisor(
+            "mainnet",
+            fixture_command_with_network(&fixture_path(), "mainnet"),
+        )
+        .expect("supervisor");
         supervisor.start().await.context("initialize handshake").unwrap();
         let height = supervisor.wallet_height().await.context("wallet height").unwrap();
         assert_eq!(height.block_height, 250_000);
@@ -370,9 +376,13 @@ fn wallet_height_unavailable_is_a_typed_fail_closed_error() {
         let command = {
             let mut command = fixture_command(&fixture_path());
             command.args.push("--no-wallet-height".to_owned());
+            command.args.push("--network=mainnet".to_owned());
             command
         };
-        let mut supervisor = make_supervisor("signet", command).expect("supervisor");
+        // OMEGA-DELTA-0305: mainnet-only rail — the opt-in guard covers
+        // construction AND start (the runtime assertion re-checks it).
+        let _rail = crate::test_support::hold_allow_mainnet_opt_in();
+        let mut supervisor = make_supervisor("mainnet", command).expect("supervisor");
         supervisor.start().await.context("initialize handshake").unwrap();
         let error = supervisor
             .wallet_height()
@@ -391,8 +401,13 @@ fn wallet_height_unavailable_is_a_typed_fail_closed_error() {
 #[test]
 fn protocol_error_mapping_is_typed() {
     smol::block_on(async {
-        let mut supervisor = make_supervisor("signet", fixture_command(&fixture_path()))
-            .expect("supervisor");
+        // OMEGA-DELTA-0305: mainnet-only rail.
+        let _rail = crate::test_support::hold_allow_mainnet_opt_in();
+        let mut supervisor = make_supervisor(
+            "mainnet",
+            fixture_command_with_network(&fixture_path(), "mainnet"),
+        )
+        .expect("supervisor");
         supervisor.start().await.context("initialize handshake").unwrap();
         let result = supervisor
             .request("status", None, 999)
@@ -412,8 +427,13 @@ fn crash_respawn_recovers_the_sidecar_and_increments_generation() {
     // sidecar process mid-run BY PID, assert the supervisor respawns it, the
     // generation increments, and the protocol state is intact afterwards.
     smol::block_on(async {
-        let mut supervisor = make_supervisor("signet", fixture_command(&fixture_path()))
-            .expect("supervisor");
+        // OMEGA-DELTA-0305: mainnet-only rail.
+        let _rail = crate::test_support::hold_allow_mainnet_opt_in();
+        let mut supervisor = make_supervisor(
+            "mainnet",
+            fixture_command_with_network(&fixture_path(), "mainnet"),
+        )
+        .expect("supervisor");
         let initialize = supervisor.start().await.context("initialize").unwrap();
         assert_eq!(initialize.generation, 1);
         assert_eq!(supervisor.generation(), 1);
@@ -446,7 +466,7 @@ fn crash_respawn_recovers_the_sidecar_and_increments_generation() {
         // The supervisor's restart path: stop the dead child handle, bump the
         // generation, spawn a fresh child, and re-run the initialize handshake.
         let restarted = supervisor.restart().await.context("restart after crash").unwrap();
-        assert_eq!(restarted.network, "signet");
+        assert_eq!(restarted.network, "mainnet");
         assert_eq!(supervisor.generation(), 2, "the crash->respawn must increment the generation");
         assert_eq!(restarted.generation, 2);
 
@@ -465,7 +485,7 @@ fn crash_respawn_recovers_the_sidecar_and_increments_generation() {
         assert!(pid_alive(second_pid), "the respawned fixture must be alive");
         let health = supervisor.health().await.context("health after respawn").unwrap();
         assert!(health.ok, "the respawned sidecar must report healthy");
-        assert_eq!(health.network, "signet");
+        assert_eq!(health.network, "mainnet");
         let balance = supervisor.balance().await.context("balance after respawn").unwrap();
         assert_eq!(balance.confirmed_sat, "12345", "state is intact after respawn");
 
@@ -556,13 +576,22 @@ fn construction_is_inert_when_flag_off(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 async fn construction_spawns_the_sidecar_when_flag_on(cx: &mut gpui::TestAppContext) {
     let data_root = tempdir().expect("data root");
+    // OMEGA-DELTA-0305: the default network is mainnet, which still requires
+    // the opt-in to construct — held under the shared env mutex like every
+    // other gated test (an unlocked writer would race refusal tests).
+    let _rail = crate::test_support::hold_allow_mainnet_opt_in();
     cx.update(|cx| {
         unset_construction_env();
         unsafe {
             std::env::set_var(crate::SOVEREIGN_WALLET_ENVIRONMENT_VARIABLE, "1");
             std::env::set_var(crate::NODE_BIN_ENVIRONMENT_VARIABLE, fixture_node());
             std::env::set_var(crate::DATA_ROOT_ENVIRONMENT_VARIABLE, data_root.path());
+            // (allow-mainnet opt-in held by _rail above for the whole test)
             std::env::set_var("OMEGA_SOVEREIGN_WALLET_FIXTURE", "1");
+            // The fixture must report mainnet to match the mainnet-only rail
+            // configuration (a signet-reporting fixture would trip the
+            // reported==configured assertion at start).
+            std::env::set_var("FIXTURE_NETWORK", "mainnet");
         }
         crate::init(cx);
         assert!(
@@ -599,4 +628,7 @@ async fn construction_spawns_the_sidecar_when_flag_on(cx: &mut gpui::TestAppCont
     drop(supervisor);
     drop(data_root);
     unset_construction_env();
+    unsafe {
+        std::env::remove_var("FIXTURE_NETWORK");
+    }
 }
