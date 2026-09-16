@@ -26,8 +26,8 @@
 
 use anyhow::{bail, Result};
 use dvm_plugin_core::{
-    CatalogEntry, OmegaDelta, PluginInfo, artifact_bytes, catalog_dir, effective_tier,
-    load_manifest, validate_json_schema, validate_plugin, verify_digest,
+    CatalogEntry, HOST_MAX_MEMORY_MIB, HOST_MAX_TIMEOUT_MS, OmegaDelta, PluginInfo, artifact_bytes,
+    catalog_dir, effective_tier, load_manifest, validate_json_schema, validate_plugin, verify_digest,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -122,7 +122,9 @@ pub struct RunRequest {
     pub approval: Approval,
     /// Optional host-level ceilings overriding the manifest's declared values
     /// (host caps are the ceiling regardless of manifest claims, per 03 §2.5).
-    /// `None` fields fall back to the manifest values.
+    /// `None` fields fall back to the manifest values, and the standing host
+    /// ceilings (F-13) cap the effective limits in every case — including an
+    /// operator override above the ceiling.
     pub limits_override: Option<runtime::LimitsOverride>,
 }
 
@@ -214,7 +216,23 @@ pub fn list_plugins() -> Result<Vec<DiscoveredPlugin>> {
     let entries = dvm_plugin_core::list_catalog()?;
     let mut out = Vec::with_capacity(entries.len());
     for e in entries {
-        let dir = catalog_dir()?.join(&e.name);
+        // F-12: the discovery join is confined EXACTLY like the run path
+        // (`plugin_dir`'s name check). `manifest.name` is a display field
+        // only — a manifest-controlled name containing path traversal
+        // (`..\x`, `../x`, absolute, or any non-safe character) is refused
+        // here (entry marked not-loadable with the confinement error) and is
+        // never joined onto the catalog path. The plugin is never read from
+        // outside the catalog.
+        let dir = match plugin_dir(&e.name) {
+            Ok(dir) => dir,
+            Err(reason) => {
+                let mut d: DiscoveredPlugin = e.into();
+                d.loadable = false;
+                d.load_error = Some(reason.to_string());
+                out.push(d);
+                continue;
+            }
+        };
         let (loadable, load_error) = match validate_plugin(&dir) {
             // The ABI policy gate is part of host loadability (F-06).
             Ok(info) => match check_abi_policy(&info.manifest) {
@@ -277,8 +295,10 @@ pub fn inspect_plugin(name: &str) -> Result<Inspection> {
                 tier: effective_tier(&manifest).to_string(),
                 mounts: manifest.mounts.clone(),
                 hosts: manifest.hosts.clone(),
-                timeout_ms: manifest.timeout_ms,
-                memory_max_mib: manifest.memory_max_mib,
+                // Declared bounds for display; 0 = not declared in manifest
+                // (F-13: the effective run limits are the host ceilings).
+                timeout_ms: manifest.timeout_ms.unwrap_or(0),
+                memory_max_mib: manifest.memory_max_mib.unwrap_or(0),
                 input_schema: manifest.input_schema.clone(),
                 output_schema: manifest.output_schema.clone(),
                 omega: manifest.omega.clone(),
@@ -311,8 +331,10 @@ pub fn inspect_plugin(name: &str) -> Result<Inspection> {
         tier: info.tier.to_string(),
         mounts: info.manifest.mounts.clone(),
         hosts: info.manifest.hosts.clone(),
-        timeout_ms: info.manifest.timeout_ms,
-        memory_max_mib: info.manifest.memory_max_mib,
+        // Declared bounds for display; 0 = not declared in manifest (F-13:
+        // the effective run limits are the host ceilings).
+        timeout_ms: info.manifest.timeout_ms.unwrap_or(0),
+        memory_max_mib: info.manifest.memory_max_mib.unwrap_or(0),
         input_schema: info.manifest.input_schema.clone(),
         output_schema: info.manifest.output_schema.clone(),
         omega: info.manifest.omega.clone(),
@@ -324,6 +346,37 @@ pub fn inspect_plugin(name: &str) -> Result<Inspection> {
 // ---------------------------------------------------------------------------
 // Execution (capability run)
 // ---------------------------------------------------------------------------
+
+/// Resolve the effective runtime limits for a run (F-13 / 03 §2.5).
+///
+/// Order: the operator `limits_override` takes precedence over the manifest
+/// claim; the STANDING HOST CEILING caps the result in every case. A manifest
+/// that omits a bound (or an operator that provides no override) defaults to
+/// the ceiling. The ceiling therefore binds manifest claims AND operator
+/// overrides — raising it is a host policy change, never a per-run argument.
+pub fn resolve_limits(
+    override_: Option<&runtime::LimitsOverride>,
+    manifest: &dvm_plugin_core::Manifest,
+) -> runtime::RuntimeLimits {
+    let requested_memory = override_
+        .and_then(|o| o.memory_max_mib)
+        .or(manifest.memory_max_mib);
+    let requested_timeout = override_
+        .and_then(|o| o.timeout_ms)
+        .or(manifest.timeout_ms);
+    runtime::RuntimeLimits {
+        memory_max_mib: requested_memory
+            .unwrap_or(HOST_MAX_MEMORY_MIB)
+            .min(HOST_MAX_MEMORY_MIB),
+        timeout_ms: requested_timeout
+            .unwrap_or(HOST_MAX_TIMEOUT_MS)
+            .min(HOST_MAX_TIMEOUT_MS),
+        // Fuel is operator-only (the manifest has no fuel field) and is
+        // bounded in wall-clock effect by the capped timeout's epoch hard
+        // kill (WP-M2b bounds implementation: fuel + epoch).
+        fuel_budget: override_.and_then(|o| o.fuel_budget),
+    }
+}
 
 /// `capability(operation: "run", plugin: ..., input: ...)`.
 ///
@@ -402,18 +455,10 @@ pub fn run_plugin(req: &RunRequest) -> Result<RunOutcome> {
         )));
     }
 
-    // Resolve effective limits: manifest values are the request, host caps the
-    // ceiling (03 §2.5).
-    let override_ = req.limits_override.as_ref();
-    let limits = runtime::RuntimeLimits {
-        memory_max_mib: override_
-            .and_then(|o| o.memory_max_mib)
-            .unwrap_or(manifest.memory_max_mib),
-        timeout_ms: override_
-            .and_then(|o| o.timeout_ms)
-            .unwrap_or(manifest.timeout_ms),
-        fuel_budget: override_.and_then(|o| o.fuel_budget),
-    };
+    // F-13 (03 §2.5): resolve effective limits — the operator override takes
+    // precedence over the manifest claim, and the STANDING HOST CEILING caps
+    // both. A manifest that omits a bound defaults to the ceiling.
+    let limits = resolve_limits(req.limits_override.as_ref(), manifest);
 
     let bytes = match artifact_bytes(&dir, manifest) {
         Ok(b) => b,

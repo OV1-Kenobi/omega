@@ -14,9 +14,12 @@
 //! `CODER_PLUGINS_DIR` pointing at the fixture installs.
 
 use dvm_plugin_host::{
-    Approval, RunOutcome, RunRequest, find_plugins, inspect_plugin, list_plugins, run_plugin,
+    Approval, RunOutcome, RunRequest, find_plugins, inspect_plugin, list_plugins,
+    resolve_limits, run_plugin,
     runtime::LimitsOverride,
 };
+use dvm_plugin_core::HOST_MAX_MEMORY_MIB;
+use dvm_plugin_core::HOST_MAX_TIMEOUT_MS;
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -78,6 +81,93 @@ fn install_into(catalog: &Path, src: &Path, name: &str) {
 
 fn temp_dir_cleanup(path: &Path) {
     let _ = std::fs::remove_dir_all(path);
+}
+
+/// Plant a seed-clone plugin (valid digest, ABI marker, zero imports) at
+/// `dest_dir` with the manifest `name` replaced by `manifest_name`. Used by
+/// the F-12 negative fixture: the manifest-controlled `name` is the attack
+/// surface, so the name is deliberately NOT confined at planting time.
+fn plant_seed_clone(dest_dir: &Path, manifest_name: &str) {
+    std::fs::create_dir_all(dest_dir).unwrap();
+    let seed_manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(seed_dir().join("manifest.json")).unwrap())
+            .unwrap();
+    let mut m = seed_manifest.as_object().unwrap().clone();
+    m.insert("name".into(), serde_json::json!(manifest_name));
+    std::fs::write(
+        dest_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&serde_json::Value::Object(m)).unwrap(),
+    )
+    .unwrap();
+    std::fs::copy(seed_dir().join("plugin.wasm"), dest_dir.join("plugin.wasm")).unwrap();
+}
+
+/// Plant a seed-clone plugin in the catalog with explicit manifest bounds
+/// (`None` = key OMITTED from the manifest, the F-13 omitted-bounds case).
+/// The fixture must pass the shared validator.
+fn plant_seed_with_bounds(
+    catalog: &Path,
+    dir_name: &str,
+    manifest_name: &str,
+    memory_max_mib: Option<u64>,
+    timeout_ms: Option<u64>,
+) {
+    let dest = catalog.join(dir_name);
+    std::fs::create_dir_all(&dest).unwrap();
+    let seed_manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(seed_dir().join("manifest.json")).unwrap())
+            .unwrap();
+    let mut m = seed_manifest.as_object().unwrap().clone();
+    m.insert("name".into(), serde_json::json!(manifest_name));
+    match memory_max_mib {
+        Some(v) => {
+            m.insert("memory_max_mib".into(), serde_json::json!(v));
+        }
+        None => {
+            m.remove("memory_max_mib");
+        }
+    }
+    match timeout_ms {
+        Some(v) => {
+            m.insert("timeout_ms".into(), serde_json::json!(v));
+        }
+        None => {
+            m.remove("timeout_ms");
+        }
+    }
+    std::fs::write(
+        dest.join("manifest.json"),
+        serde_json::to_string_pretty(&serde_json::Value::Object(m)).unwrap(),
+    )
+    .unwrap();
+    std::fs::copy(seed_dir().join("plugin.wasm"), dest.join("plugin.wasm")).unwrap();
+    dvm_plugin_core::validate_plugin(&dest).expect("bounds fixture must pass the shared validator");
+}
+
+/// Build a `Manifest` with chosen bounds for the F-13 resolution unit tests
+/// (`None` = key absent, as in a manifest that omits the bound).
+fn bounds_manifest(memory_max_mib: Option<u64>, timeout_ms: Option<u64>) -> dvm_plugin_core::Manifest {
+    let mut m = serde_json::json!({
+        "schema": "openagents.plugin/v0",
+        "name": "bounds_test",
+        "version": "0.1.0",
+        "description": "F-13 resolution fixture",
+        "artifact_path": "plugin.wasm",
+        "artifact_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "abi_entry": "_start",
+        "abi_alloc": "allocate",
+        "input_schema": { "type": "object" },
+        "output_schema": { "type": "object" },
+        "mounts": [],
+        "hosts": []
+    });
+    if let Some(v) = memory_max_mib {
+        m["memory_max_mib"] = serde_json::json!(v);
+    }
+    if let Some(v) = timeout_ms {
+        m["timeout_ms"] = serde_json::json!(v);
+    }
+    serde_json::from_value(m).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +563,216 @@ fn input_schema_validated_before_execution() {
             assert!(e.message.contains("missing required property 'text'"));
         }
         RunOutcome::Success(_) => panic!("input violating input_schema must not execute"),
+    }
+    temp_dir_cleanup(&catalog);
+}
+
+// ---------------------------------------------------------------------------
+// F-12 (Low, dated remediation): host discovery read-path confinement
+// ---------------------------------------------------------------------------
+
+/// A manifest-controlled `name` containing path traversal must be refused by
+/// discovery (`loadable:false` with the confinement error) and must NEVER
+/// cause a read outside the catalog. Mirrors the WP-M2 re-review's proof S:
+/// a catalog subdir whose manifest `name` escapes the catalog previously made
+/// `list` validate and report a plugin planted OUTSIDE the catalog.
+#[test]
+fn f12_discovery_refuses_traversal_name_and_never_reads_outside_catalog() {
+    let _guard = catalog_guard();
+    let catalog = setup_catalog("f12-traversal");
+    let pid = std::process::id();
+
+    // Outside-catalog victim planted at exactly the path the OLD join
+    // (`catalog_dir().join(name)`) would have resolved to: catalog\..\..\
+    // escapes into the temp root. If discovery ever joins the traversal name
+    // again, this victim validates and the evil entry reports loadable:true.
+    let escaped = catalog
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("escaped_read_f12_{pid}"));
+    if escaped.exists() {
+        std::fs::remove_dir_all(&escaped).unwrap();
+    }
+    plant_seed_clone(&escaped, "escaped_outside_plugin");
+
+    // Two in-catalog evil entries whose manifest `name` contains traversal:
+    // Windows backslash form and forward-slash form.
+    let evil_names = [
+        format!(r"..\..\escaped_read_f12_{pid}"),
+        format!("../escaped_read_f12_{pid}_fwd"),
+    ];
+    plant_seed_clone(&catalog.join("evil_entry_backslash"), &evil_names[0]);
+    plant_seed_clone(&catalog.join("evil_entry_slash"), &evil_names[1]);
+
+    let plugins = list_plugins().unwrap();
+
+    // Positive discovery still works: seed + spin loadable.
+    let seed = plugins
+        .iter()
+        .find(|p| p.name == "white_label_seed")
+        .expect("seed listed");
+    assert!(seed.loadable, "positive discovery must still work (F-12 regression)");
+    let spin = plugins
+        .iter()
+        .find(|p| p.name == "spin_plugin")
+        .expect("spin listed");
+    assert!(spin.loadable);
+
+    // The outside-catalog victim is NEVER discovered under its own name.
+    assert!(
+        !plugins.iter().any(|p| p.name == "escaped_outside_plugin"),
+        "outside-catalog plugin must never be discovered"
+    );
+
+    // Both traversal-named entries are REFUSED: loadable:false with the
+    // plugin_dir confinement error (the OLD code validated the escaped path
+    // and reported the evil entry loadable:true).
+    for evil in &evil_names {
+        let entry = plugins
+            .iter()
+            .find(|p| &p.name == evil)
+            .unwrap_or_else(|| panic!("evil entry {evil:?} must be surfaced (never silently dropped)"));
+        assert!(!entry.loadable, "traversal name {evil:?} must be refused by discovery");
+        let err = entry.load_error.as_deref().expect("refused entry must carry the confinement error");
+        assert!(
+            err.contains("plugin name") || err.contains("safe directory"),
+            "error should name the refusal: {err}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&escaped);
+    temp_dir_cleanup(&catalog);
+}
+
+// ---------------------------------------------------------------------------
+// F-13 (Medium, dated remediation): standing host-level default ceilings
+// ---------------------------------------------------------------------------
+
+/// A manifest declaring bounds ABOVE the standing host ceiling is capped at
+/// the ceiling (03 §2.5). Resolution-level proof (deterministic, instant):
+/// the effective limits ARE the host ceilings, not the manifest's claims.
+#[test]
+fn f13_resolution_caps_manifest_above_ceiling() {
+    let manifest = bounds_manifest(Some(1024), Some(3_600_000)); // 1 GiB / 1 hour claims
+    let limits = resolve_limits(None, &manifest);
+    assert_eq!(limits.memory_max_mib, HOST_MAX_MEMORY_MIB);
+    assert_eq!(limits.timeout_ms, HOST_MAX_TIMEOUT_MS);
+}
+
+/// A manifest declaring bounds BELOW the standing host ceiling passes
+/// through unchanged.
+#[test]
+fn f13_resolution_passes_manifest_below_ceiling() {
+    let manifest = bounds_manifest(Some(32), Some(500));
+    let limits = resolve_limits(None, &manifest);
+    assert_eq!(limits.memory_max_mib, 32);
+    assert_eq!(limits.timeout_ms, 500);
+}
+
+/// The ceiling applies even when the manifest OMITS a bound: the effective
+/// limit defaults to the standing host ceiling.
+#[test]
+fn f13_resolution_defaults_omitted_bounds_to_ceiling() {
+    let manifest = bounds_manifest(None, None);
+    let limits = resolve_limits(None, &manifest);
+    assert_eq!(limits.memory_max_mib, HOST_MAX_MEMORY_MIB);
+    assert_eq!(limits.timeout_ms, HOST_MAX_TIMEOUT_MS);
+}
+
+/// Operator override takes precedence over the manifest claim when below the
+/// ceiling, and is itself capped when above it (the ceiling binds both).
+#[test]
+fn f13_resolution_operator_override_precedence_and_cap() {
+    let manifest = bounds_manifest(Some(64), Some(1000));
+    // Override below the ceiling wins over the manifest claim.
+    let limits = resolve_limits(
+        Some(&LimitsOverride {
+            memory_max_mib: Some(32),
+            timeout_ms: Some(100),
+            fuel_budget: None,
+        }),
+        &manifest,
+    );
+    assert_eq!(limits.memory_max_mib, 32);
+    assert_eq!(limits.timeout_ms, 100);
+    // Override above the ceiling is capped at the standing host ceiling.
+    let limits = resolve_limits(
+        Some(&LimitsOverride {
+            memory_max_mib: Some(4096),
+            timeout_ms: Some(3_600_000),
+            fuel_budget: None,
+        }),
+        &manifest,
+    );
+    assert_eq!(limits.memory_max_mib, HOST_MAX_MEMORY_MIB);
+    assert_eq!(limits.timeout_ms, HOST_MAX_TIMEOUT_MS);
+}
+
+/// Integration: a plugin whose manifest declares bounds ABOVE the ceiling
+/// still executes correctly — under the capped host limits.
+#[test]
+fn f13_manifest_above_ceiling_executes_under_capped_limits() {
+    let _guard = catalog_guard();
+    let catalog = setup_catalog("f13-above");
+    plant_seed_with_bounds(&catalog, "above_plugin", "above_plugin", Some(1024), Some(3_600_000));
+    let req = RunRequest {
+        plugin: "above_plugin".into(),
+        input: serde_json::json!({ "text": "hello world\nsecond line" }),
+        approval: Approval::Auto,
+        limits_override: None,
+    };
+    match run_plugin(&req).unwrap() {
+        RunOutcome::Success(r) => {
+            assert!(r.ok);
+            assert_eq!(r.result["words"], 4);
+        }
+        RunOutcome::Failure(e) => {
+            panic!("above-cap plugin must run under capped limits, got: {} {}", e.code, e.message)
+        }
+    }
+    temp_dir_cleanup(&catalog);
+}
+
+/// Integration: a manifest declaring bounds below the ceiling passes through
+/// and the plugin runs.
+#[test]
+fn f13_manifest_below_ceiling_passes_through() {
+    let _guard = catalog_guard();
+    let catalog = setup_catalog("f13-below");
+    plant_seed_with_bounds(&catalog, "below_plugin", "below_plugin", Some(32), Some(500));
+    let req = RunRequest {
+        plugin: "below_plugin".into(),
+        input: serde_json::json!({ "text": "x" }),
+        approval: Approval::Auto,
+        limits_override: None,
+    };
+    match run_plugin(&req).unwrap() {
+        RunOutcome::Success(r) => assert!(r.ok),
+        RunOutcome::Failure(e) => panic!("below-ceiling plugin must run, got: {} {}", e.code, e.message),
+    }
+    temp_dir_cleanup(&catalog);
+}
+
+/// Integration: a manifest that OMITS the bounds parses (fields optional) and
+/// the plugin executes under the standing host ceilings.
+#[test]
+fn f13_ceiling_applies_when_manifest_omits_bounds() {
+    let _guard = catalog_guard();
+    let catalog = setup_catalog("f13-omitted");
+    plant_seed_with_bounds(&catalog, "omitted_plugin", "omitted_plugin", None, None);
+    let req = RunRequest {
+        plugin: "omitted_plugin".into(),
+        input: serde_json::json!({ "text": "x" }),
+        approval: Approval::Auto,
+        limits_override: None,
+    };
+    match run_plugin(&req).unwrap() {
+        RunOutcome::Success(r) => assert!(r.ok),
+        RunOutcome::Failure(e) => {
+            panic!("omitted-bounds plugin must run under the host ceiling, got: {} {}", e.code, e.message)
+        }
     }
     temp_dir_cleanup(&catalog);
 }

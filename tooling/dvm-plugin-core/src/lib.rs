@@ -21,6 +21,25 @@ use wasmi::{Engine, ExternType, Module};
 use wasmi::core::ValType;
 
 // ---------------------------------------------------------------------------
+// F-13: standing host-level default ceilings (03 §2.5 — host caps are the
+// ceiling regardless of manifest claims)
+// ---------------------------------------------------------------------------
+
+/// Standing host ceiling for linear memory (MiB). The host caps the effective
+/// limit at this value even when the manifest declares a higher bound, and a
+/// manifest that omits `memory_max_mib` defaults to this ceiling. Template
+/// plugins declare 64 MiB; 256 MiB is a generous but bounded ceiling against
+/// attacker-chosen multi-GiB/TiB claims (F-13 remediation, founder decision 7).
+pub const HOST_MAX_MEMORY_MIB: u64 = 256;
+
+/// Standing host ceiling for wall-clock execution time (ms). The host caps
+/// the effective limit at this value even when the manifest declares a longer
+/// timeout, and a manifest that omits `timeout_ms` defaults to this ceiling.
+/// 60 s bounds CPU resource use per run (the runtime's derived fuel budget is
+/// proportional to this ceiling; the epoch watchdog hard-kills at it).
+pub const HOST_MAX_TIMEOUT_MS: u64 = 60_000;
+
+// ---------------------------------------------------------------------------
 // Manifest model (openagents.plugin/v0 + omega delta)
 // ---------------------------------------------------------------------------
 
@@ -38,8 +57,18 @@ pub struct Manifest {
     pub output_schema: serde_json::Value,
     pub mounts: Vec<serde_json::Value>,
     pub hosts: Vec<String>,
-    pub timeout_ms: u64,
-    pub memory_max_mib: u64,
+    /// Execution time bound claimed by the manifest (the plugin's request).
+    /// Optional since F-13: when omitted, the host's standing ceiling
+    /// (`HOST_MAX_TIMEOUT_MS`) is the effective bound. Never a grant — the
+    /// host caps at the ceiling regardless (03 §2.5).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Linear-memory bound claimed by the manifest (the plugin's request).
+    /// Optional since F-13: when omitted, the host's standing ceiling
+    /// (`HOST_MAX_MEMORY_MIB`) is the effective bound. Never a grant — the
+    /// host caps at the ceiling regardless (03 §2.5).
+    #[serde(default)]
+    pub memory_max_mib: Option<u64>,
     #[serde(default)]
     pub omega: Option<OmegaDelta>,
 }
@@ -305,7 +334,13 @@ pub fn check_declared_memory_max(
         ExternType::Memory(mem_ty) => mem_ty.maximum_pages(),
         _ => bail!("'memory' export is not a memory"),
     };
-    let bound_bytes = manifest.memory_max_mib * 1024 * 1024;
+    // F-13: when the manifest omits `memory_max_mib` there is no declared
+    // bound to compare against; the runtime limiter (host ceiling) is the
+    // enforcement point. 0 = "no manifest-declared bound".
+    let Some(manifest_mib) = manifest.memory_max_mib else {
+        return Ok(0);
+    };
+    let bound_bytes = manifest_mib * 1024 * 1024;
     if let Some(max_pages) = declared_max_pages {
         let max_pages: u32 = max_pages.into();
         let max_bytes = u64::from(max_pages) * 65536;
@@ -314,7 +349,7 @@ pub fn check_declared_memory_max(
                 "module declares memory maximum {} bytes ({} pages), exceeding manifest memory_max_mib {} ({} bytes)",
                 max_bytes,
                 max_pages,
-                manifest.memory_max_mib,
+                manifest_mib,
                 bound_bytes
             );
         }
@@ -610,8 +645,8 @@ pub fn list_catalog() -> Result<Vec<CatalogEntry>> {
             cost_hint_msats,
             digest_verified,
             digest_error,
-            timeout_ms: manifest.timeout_ms,
-            memory_max_mib: manifest.memory_max_mib,
+            timeout_ms: manifest.timeout_ms.unwrap_or(0),
+            memory_max_mib: manifest.memory_max_mib.unwrap_or(0),
         });
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));

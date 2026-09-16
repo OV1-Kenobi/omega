@@ -423,8 +423,8 @@ fn cmd_inspect(dir: &Path, quiet: bool) -> Result<()> {
         println!("  tier           : {} (mounts={} hosts={})", info.tier, manifest.mounts.len(), manifest.hosts.len());
         println!("  capabilities   : {}", capabilities);
         println!("  cost_hint_msats: {}", manifest.omega.as_ref().and_then(|o| o.cost_hint_msats).unwrap_or(0));
-        println!("  timeout_ms     : {}", manifest.timeout_ms);
-        println!("  memory_max_mib : {}", manifest.memory_max_mib);
+        println!("  timeout_ms     : {}", manifest.timeout_ms.unwrap_or(0));
+        println!("  memory_max_mib : {}", manifest.memory_max_mib.unwrap_or(0));
         println!("  imports        : 0 (clean — no ambient capabilities)");
     }
     Ok(())
@@ -453,7 +453,12 @@ fn cmd_test(dir: &Path) -> Result<()> {
     }
 
     let mut failures = 0usize;
-    let memory_max = (manifest.memory_max_mib as usize) * 1024 * 1024;
+    let memory_max = (manifest
+        .memory_max_mib
+        .unwrap_or(dvm_plugin_core::HOST_MAX_MEMORY_MIB)
+        as usize)
+        * 1024
+        * 1024;
 
     for fixture_path in &fixtures {
         let fixture_text = fs::read_to_string(fixture_path)?;
@@ -605,11 +610,14 @@ fn run_module_once(
         .with_context(|| "plugin output is not valid JSON")?;
 
     let memory_used = memory.data(&store).len();
+    let effective_mib = manifest
+        .memory_max_mib
+        .unwrap_or(dvm_plugin_core::HOST_MAX_MEMORY_MIB);
     if memory_used > memory_max {
         bail!(
             "memory {} exceeds memory_max_mib {}",
             memory_used,
-            manifest.memory_max_mib
+            effective_mib
         );
     }
     Ok((output, out_len, memory_used))
@@ -627,7 +635,12 @@ fn execute_plugin_value(
     let bytes = artifact_bytes(dir, manifest)?;
     let (engine, module, _, exports) = load_module(&bytes)?;
     verify_abi_signatures(manifest, &exports)?;
-    let memory_max = (manifest.memory_max_mib as usize) * 1024 * 1024;
+    let memory_max = (manifest
+        .memory_max_mib
+        .unwrap_or(dvm_plugin_core::HOST_MAX_MEMORY_MIB)
+        as usize)
+        * 1024
+        * 1024;
     let (output, _, _) = run_module_once(&engine, &module, manifest, input, memory_max)?;
     Ok(output)
 }

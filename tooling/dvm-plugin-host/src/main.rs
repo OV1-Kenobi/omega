@@ -52,10 +52,12 @@ enum Commands {
         /// Explicitly deny (for testing the denial path).
         #[arg(long)]
         deny: bool,
-        /// Host-level memory ceiling in MiB (default: manifest value).
+        /// Host-level memory ceiling in MiB (overrides the manifest claim;
+        /// capped at the standing host ceiling HOST_MAX_MEMORY_MIB, F-13).
         #[arg(long)]
         memory_max_mib: Option<u64>,
-        /// Host-level time ceiling in ms (default: manifest value).
+        /// Host-level time ceiling in ms (overrides the manifest claim;
+        /// capped at the standing host ceiling HOST_MAX_TIMEOUT_MS, F-13).
         #[arg(long)]
         timeout_ms: Option<u64>,
         /// Explicit fuel budget (instructions) — overrides the derived budget.
