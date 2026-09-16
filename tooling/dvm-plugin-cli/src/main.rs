@@ -1,59 +1,32 @@
-//! dvm-plugin-cli — Omega DVM plugin authoring tool (WP-M1).
+//! dvm-plugin-cli — Omega DVM plugin authoring tool (WP-M1, hardened WP-M2).
 //!
 //! Command surface mirrors `coder-cli plugin`:
 //!   init / build / inspect / test / install / list
 //!
+//! WP-M2 hardening (all security-review conditions):
+//! - F-01: all manifest-controlled paths go through
+//!   `dvm_plugin_core::confine_artifact_path` (traversal refused).
+//! - F-02: `install` runs the SAME full validator as `inspect`
+//!   (`dvm_plugin_core::validate_plugin`) before copying; a malformed or
+//!   importing artifact never installs.
+//! - F-05: exact ABI signatures are verified by the shared validator.
+//! - F-07: fixture input/output are validated against the manifest schemas.
+//! - F-08: `cargo build --locked` enforces the committed lockfile.
+//! - F-10: `list` re-verifies installed digests.
+//! - F-11: `init` rejects non-ASCII plugin names.
+//!
 //! Contract source: openagents.plugin/v0 + Omega delta layer
-//! (see planning/2026/09-september/15-plan-omega-dvm-marketplace/wp-m1-output/).
+//! (see planning/2026/09-september/15-plan-omega-dvm-marketplace/).
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::env;
+use dvm_plugin_core::{
+    CatalogEntry, artifact_bytes, catalog_dir, confine_artifact_path, list_catalog, load_manifest,
+    sha256_hex, validate_json_schema, validate_plugin, verify_abi_signatures,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
-use wasmi::{Engine, ExternType, Linker, Module, Store};
-
-// ---------------------------------------------------------------------------
-// Manifest model (openagents.plugin/v0 + omega delta)
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Manifest {
-    schema: String,
-    name: String,
-    version: String,
-    description: String,
-    artifact_path: String,
-    artifact_digest: String,
-    abi_entry: String,
-    abi_alloc: String,
-    input_schema: serde_json::Value,
-    output_schema: serde_json::Value,
-    mounts: Vec<serde_json::Value>,
-    hosts: Vec<String>,
-    timeout_ms: u64,
-    memory_max_mib: u64,
-    #[serde(default)]
-    omega: Option<OmegaDelta>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-struct OmegaDelta {
-    #[serde(default)]
-    schema: Option<String>,
-    #[serde(default)]
-    capabilities: Option<Vec<String>>,
-    #[serde(default)]
-    cost_hint_msats: Option<u64>,
-    #[serde(default)]
-    service: Option<serde_json::Value>,
-    #[serde(default)]
-    tier: Option<String>,
-    #[serde(default)]
-    sdk: Option<serde_json::Value>,
-}
+use wasmi::{Linker, Store};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -63,7 +36,7 @@ struct OmegaDelta {
 #[command(
     name = "dvm-plugin-cli",
     version,
-    about = "Omega DVM plugin authoring tool (WP-M1): init/build/inspect/test/install/list"
+    about = "Omega DVM plugin authoring tool (WP-M1/M2): init/build/inspect/test/install/list"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -99,150 +72,6 @@ fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-fn catalog_dir() -> Result<PathBuf> {
-    if let Ok(dir) = env::var("CODER_PLUGINS_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    let home = if cfg!(windows) {
-        env::var("USERPROFILE").map_err(|_| anyhow!("USERPROFILE not set"))?
-    } else {
-        env::var("HOME").map_err(|_| anyhow!("HOME not set"))?
-    };
-    Ok(PathBuf::from(home).join(".openagents").join("plugins"))
-}
-
-fn load_manifest(dir: &Path) -> Result<Manifest> {
-    let manifest_path = dir.join("manifest.json");
-    let text = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("cannot read {}", manifest_path.display()))?;
-    let manifest: Manifest = serde_json::from_str(&text)
-        .with_context(|| format!("manifest.json is not valid: {}", manifest_path.display()))?;
-    if manifest.schema != "openagents.plugin/v0" {
-        bail!(
-            "schema '{}' is not 'openagents.plugin/v0'",
-            manifest.schema
-        );
-    }
-    Ok(manifest)
-}
-
-fn artifact_bytes(dir: &Path, manifest: &Manifest) -> Result<Vec<u8>> {
-    let artifact_path = dir.join(&manifest.artifact_path);
-    fs::read(&artifact_path)
-        .with_context(|| format!("cannot read artifact {}", artifact_path.display()))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    hex::encode(digest)
-}
-
-fn verify_digest(dir: &Path, manifest: &Manifest) -> Result<()> {
-    let expected = manifest
-        .artifact_digest
-        .strip_prefix("sha256:")
-        .ok_or_else(|| anyhow!("artifact_digest must be 'sha256:<hex>'"))?;
-    let bytes = artifact_bytes(dir, manifest)?;
-    let actual = sha256_hex(&bytes);
-    if actual != expected {
-        bail!(
-            "digest mismatch for {}: manifest claims sha256:{}, artifact is sha256:{}",
-            manifest.artifact_path,
-            expected,
-            actual
-        );
-    }
-    Ok(())
-}
-
-/// Load + validate the module, return (engine, module, imports, exports).
-fn load_module(bytes: &[u8]) -> Result<(Engine, Module, Vec<(String, String, ExternType)>, Vec<(String, ExternType)>)> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, bytes).context("wasm module failed validation")?;
-    let imports: Vec<(String, String, ExternType)> = module
-        .imports()
-        .map(|import| {
-            (
-                import.module().to_string(),
-                import.name().to_string(),
-                import.ty().clone(),
-            )
-        })
-        .collect();
-    let exports: Vec<(String, ExternType)> = module
-        .exports()
-        .map(|export| (export.name().to_string(), export.ty().clone()))
-        .collect();
-    Ok((engine, module, imports, exports))
-}
-
-fn effective_tier(manifest: &Manifest) -> &'static str {
-    if !manifest.hosts.is_empty() {
-        "Hosts"
-    } else if !manifest.mounts.is_empty() {
-        "Mounts"
-    } else {
-        "PureCompute"
-    }
-}
-
-fn validate_tier_and_imports(manifest: &Manifest, imports: &[(String, String, ExternType)]) -> Result<()> {
-    let tier = effective_tier(manifest);
-    match tier {
-        "Hosts" => bail!(
-            "Hosts tier is BLOCKED by Omega policy (WP-M1): manifest declares hosts but the capability sandbox denies all network"
-        ),
-        "Mounts" => {
-            for mount in &manifest.mounts {
-                let ro = mount
-                    .get("read_only")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if !ro {
-                    bail!("mounts must be read_only: true (found {mount})");
-                }
-            }
-        }
-        _ => {}
-    }
-    if let Some(omega) = &manifest.omega {
-        if let Some(declared) = &omega.tier {
-            if declared != tier {
-                bail!(
-                    "omega.tier '{declared}' understates effective tier '{tier}' — misdeclaration"
-                );
-            }
-        }
-    }
-    if !imports.is_empty() {
-        let names: Vec<String> = imports
-            .iter()
-            .map(|(m, n, _)| format!("{m}.{n}"))
-            .collect();
-        bail!(
-            "plugin imports ambient capabilities {:?}; PureCompute/Mounts plugins must have zero imports",
-            names
-        );
-    }
-    Ok(())
-}
-
-fn require_export<'a>(
-    exports: &'a [(String, ExternType)],
-    name: &str,
-    kind: &str,
-) -> Result<&'a ExternType> {
-    exports
-        .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, t)| t)
-        .ok_or_else(|| anyhow!("missing required export '{name}' ({kind})"))
-}
-
-// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -271,9 +100,19 @@ panic = "abort"
 const TEMPLATE_LIB_RS: &str = include_str!("template_lib.rs");
 
 fn cmd_init(name: &str) -> Result<()> {
+    // F-11: reject non-ASCII names (the old `is_alphanumeric()` accepted
+    // Unicode letters, producing non-ASCII directory ids).
+    for c in name.chars() {
+        if !c.is_ascii_alphanumeric() && c != '_' {
+            bail!(
+                "plugin name must contain only ASCII alphanumeric characters or '_' (got {c:?}); \
+                 non-ASCII names are rejected (F-11)"
+            );
+        }
+    }
     let normalized: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
         .collect::<String>()
         .to_lowercase();
     if normalized.is_empty() {
@@ -336,6 +175,8 @@ fn cmd_build(dir: &Path) -> Result<()> {
 
     // Ensure the wasm target is installed (idempotent; no-op when present).
     // Standard local toolchain operation — the build itself stays local.
+    // NOTE (F-08): rustup target add performs a network download on a fresh
+    // machine; documented in README.md as install-time egress.
     let target_status = std::process::Command::new("rustup")
         .args(["target", "add", "wasm32-unknown-unknown"])
         .current_dir(dir)
@@ -345,13 +186,33 @@ fn cmd_build(dir: &Path) -> Result<()> {
         bail!("rustup target add wasm32-unknown-unknown failed with status {target_status}");
     }
 
+    // F-08: --locked enforces the committed Cargo.lock (reproducibility).
+    // A fresh `init` scaffold has no Cargo.lock yet; generate it offline
+    // (from the local cargo cache, no network) so the locked build below
+    // can proceed and then stays reproducible for that scaffold.
+    if !dir.join("Cargo.lock").exists() {
+        let gen_status = std::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(dir)
+            .status()
+            .context("failed to run cargo generate-lockfile --offline")?;
+        if !gen_status.success() {
+            bail!("cargo generate-lockfile --offline failed with status {gen_status}");
+        }
+    }
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
         .current_dir(dir)
         .status()
         .context("failed to run cargo build")?;
     if !status.success() {
-        bail!("cargo build failed with status {status}");
+        bail!("cargo build --locked failed with status {status}");
     }
 
     let release_dir = dir.join("target").join("wasm32-unknown-unknown").join("release");
@@ -366,7 +227,8 @@ fn cmd_build(dir: &Path) -> Result<()> {
     }
     wasm_files.sort();
     let wasm_path = wasm_files.last().unwrap().clone();
-    let artifact_path = dir.join(&manifest.artifact_path);
+    // F-01: the artifact copy target must be confined (manifest-controlled).
+    let artifact_path = confine_artifact_path(dir, &manifest.artifact_path)?;
     fs::copy(&wasm_path, &artifact_path)
         .with_context(|| format!("copy {} -> {}", wasm_path.display(), artifact_path.display()))?;
 
@@ -384,21 +246,12 @@ fn cmd_build(dir: &Path) -> Result<()> {
 }
 
 fn cmd_inspect(dir: &Path, quiet: bool) -> Result<()> {
-    let manifest = load_manifest(dir)?;
-    verify_digest(dir, &manifest)?;
-    let bytes = artifact_bytes(dir, &manifest)?;
-    let (_, _, imports, exports) = load_module(&bytes)?;
-    validate_tier_and_imports(&manifest, &imports)?;
-
-    let entry_ty = require_export(&exports, &manifest.abi_entry, "entry")?;
-    if !matches!(entry_ty, ExternType::Func(_)) {
-        bail!("abi_entry '{}' is not a function", manifest.abi_entry);
-    }
-    let alloc_ty = require_export(&exports, &manifest.abi_alloc, "alloc")?;
-    if !matches!(alloc_ty, ExternType::Func(_)) {
-        bail!("abi_alloc '{}' is not a function", manifest.abi_alloc);
-    }
-    require_export(&exports, "memory", "memory")?;
+    // The FULL shared validator: digest, imports, exports + exact ABI
+    // signatures (F-05), declared memory maximum vs manifest bound (F-03),
+    // tier consistency, mounts read-only, hosts blocked, schema
+    // well-formedness (F-07).
+    let info = validate_plugin(dir)?;
+    let manifest = &info.manifest;
 
     if !quiet {
         let capabilities = manifest
@@ -414,7 +267,7 @@ fn cmd_inspect(dir: &Path, quiet: bool) -> Result<()> {
         println!("  schema         : {}", manifest.schema);
         println!("  artifact       : {} ({})", manifest.artifact_path, manifest.artifact_digest);
         println!("  abi            : entry={} alloc={}", manifest.abi_entry, manifest.abi_alloc);
-        println!("  tier           : {} (mounts={} hosts={})", effective_tier(&manifest), manifest.mounts.len(), manifest.hosts.len());
+        println!("  tier           : {} (mounts={} hosts={})", info.tier, manifest.mounts.len(), manifest.hosts.len());
         println!("  capabilities   : {}", capabilities);
         println!("  cost_hint_msats: {}", manifest.omega.as_ref().and_then(|o| o.cost_hint_msats).unwrap_or(0));
         println!("  timeout_ms     : {}", manifest.timeout_ms);
@@ -425,13 +278,12 @@ fn cmd_inspect(dir: &Path, quiet: bool) -> Result<()> {
 }
 
 fn cmd_test(dir: &Path) -> Result<()> {
-    let manifest = load_manifest(dir)?;
-    verify_digest(dir, &manifest)?;
-    let bytes = artifact_bytes(dir, &manifest)?;
-    let (engine, module, imports, exports) = load_module(&bytes)?;
-    validate_tier_and_imports(&manifest, &imports)?;
-    require_export(&exports, &manifest.abi_entry, "entry")?;
-    require_export(&exports, &manifest.abi_alloc, "alloc")?;
+    // Shared validator first — same gate the host load path uses.
+    let info = validate_plugin(dir)?;
+    let manifest = &info.manifest;
+    let bytes = artifact_bytes(dir, manifest)?;
+    let (engine, module, _, _) = dvm_plugin_core::load_module(&bytes)?;
+    verify_abi_signatures(manifest, &info.exports)?;
 
     let fixtures_dir = dir.join("tests").join("fixtures");
     if !fixtures_dir.exists() {
@@ -458,6 +310,15 @@ fn cmd_test(dir: &Path) -> Result<()> {
             .get("input")
             .ok_or_else(|| anyhow!("fixture {} missing 'input'", fixture_path.display()))?;
         let expect = fixture.get("expect");
+
+        // F-07: fixture input must satisfy the manifest's input_schema.
+        validate_json_schema(input, &manifest.input_schema).with_context(|| {
+            format!(
+                "fixture {} input fails input_schema: {}",
+                fixture_path.display(),
+                fixture_path.display()
+            )
+        })?;
 
         let mut store = Store::new(&engine, ());
         let linker = Linker::<()>::new(&engine);
@@ -515,6 +376,11 @@ fn cmd_test(dir: &Path) -> Result<()> {
             .map_err(|e| anyhow!("memory.read output failed: {e}"))?;
         let output: serde_json::Value = serde_json::from_slice(&out_buf)
             .with_context(|| format!("plugin output is not valid JSON (fixture {})", fixture_path.display()))?;
+
+        // F-07: plugin output must satisfy the manifest's output_schema.
+        validate_json_schema(&output, &manifest.output_schema).with_context(|| {
+            format!("fixture {} output fails output_schema", fixture_path.display())
+        })?;
 
         let memory_used = memory.data(&store).len();
         if memory_used > memory_max {
@@ -581,19 +447,43 @@ fn cmd_test(dir: &Path) -> Result<()> {
 }
 
 fn cmd_install(dir: &Path) -> Result<()> {
-    let manifest = load_manifest(dir)?;
-    verify_digest(dir, &manifest)?;
+    // F-02 (mandatory): install runs the SAME full validator as inspect
+    // (digest, imports, exports + ABI signatures, tier consistency,
+    // memory-max declaration, schema well-formedness). A malformed or
+    // importing artifact NEVER installs.
+    let info = validate_plugin(dir)?;
+    let manifest = &info.manifest;
+
+    // F-01 (mandatory): resolve the artifact through the confined path; the
+    // manifest-controlled artifact_path can never escape the plugin dir.
+    let src_artifact = confine_artifact_path(dir, &manifest.artifact_path)?;
     let catalog = catalog_dir()?;
     let dest = catalog.join(&manifest.name);
+
+    // Manifest name confinement: `name` is also manifest-controlled and joins
+    // into the catalog path — it must be a plain directory name.
+    let plugin_name = &manifest.name;
+    for c in plugin_name.chars() {
+        if !c.is_ascii_alphanumeric() && c != '_' && c != '-' {
+            bail!(
+                "plugin name '{plugin_name}' contains non-ASCII-alphanumeric character {c:?}; \
+                 install refused (name confinement, F-01)"
+            );
+        }
+    }
+    if plugin_name.is_empty() || plugin_name == "." || plugin_name == ".." {
+        bail!("plugin name is not a safe directory name; install refused");
+    }
+
     fs::create_dir_all(&dest)?;
     fs::copy(dir.join("manifest.json"), dest.join("manifest.json"))?;
-    fs::copy(dir.join(&manifest.artifact_path), dest.join(&manifest.artifact_path))?;
+    fs::copy(&src_artifact, dest.join(&manifest.artifact_path))?;
 
     // Re-verify digest at the destination.
     let installed = load_manifest(&dest)?;
-    verify_digest(&dest, &installed)?;
+    dvm_plugin_core::verify_digest(&dest, &installed)?;
     println!(
-        "install: {} v{} -> {} (digest verified)",
+        "install: {} v{} -> {} (full validation OK, digest verified)",
         installed.name,
         installed.version,
         dest.display()
@@ -603,48 +493,32 @@ fn cmd_install(dir: &Path) -> Result<()> {
 
 fn cmd_list() -> Result<()> {
     let catalog = catalog_dir()?;
-    if !catalog.exists() {
-        println!("list: catalog {} does not exist yet", catalog.display());
-        return Ok(());
-    }
-    let mut entries: Vec<(String, String, String, String, u64)> = Vec::new();
-    for entry in fs::read_dir(&catalog)? {
-        let entry = entry?;
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let manifest_path = dir.join("manifest.json");
-        if !manifest_path.exists() {
-            continue;
-        }
-        if let Ok(text) = fs::read_to_string(&manifest_path) {
-            if let Ok(manifest) = serde_json::from_str::<Manifest>(&text) {
-                let tier = effective_tier(&manifest);
-                let capabilities = manifest
-                    .omega
-                    .as_ref()
-                    .and_then(|o| o.capabilities.as_ref())
-                    .cloned()
-                    .unwrap_or_default()
-                    .join(",");
-                let cost = manifest
-                    .omega
-                    .as_ref()
-                    .and_then(|o| o.cost_hint_msats)
-                    .unwrap_or(0);
-                entries.push((manifest.name, manifest.version, tier.to_string(), capabilities, cost));
-            }
-        }
-    }
-    entries.sort();
+    let entries: Vec<CatalogEntry> = list_catalog()?;
     if entries.is_empty() {
-        println!("list: no plugins installed in {}", catalog.display());
+        if !catalog.exists() {
+            println!("list: catalog {} does not exist yet", catalog.display());
+        } else {
+            println!("list: no plugins installed in {}", catalog.display());
+        }
         return Ok(());
     }
     println!("list: {} plugin(s) in {}", entries.len(), catalog.display());
-    for (name, version, tier, capabilities, cost) in entries {
-        println!("  {name} v{version} [tier={tier}, cost={cost} msats, caps={capabilities}]");
+    for e in &entries {
+        // F-10: list surfaces digest re-verification failures explicitly.
+        let digest_state = if e.digest_verified {
+            "digest OK".to_string()
+        } else {
+            format!("DIGEST FAILED ({})", e.digest_error.as_deref().unwrap_or("re-verification failed"))
+        };
+        println!(
+            "  {} v{} [tier={}, cost={} msats, caps={}, {}]",
+            e.name,
+            e.version,
+            e.tier,
+            e.cost_hint_msats,
+            e.capabilities.join(","),
+            digest_state
+        );
     }
     Ok(())
 }

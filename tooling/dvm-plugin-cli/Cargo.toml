@@ -2,11 +2,12 @@
 name = "dvm-plugin-cli"
 version = "0.1.0"
 edition = "2021"
-description = "Omega DVM plugin authoring tool: init/build/inspect/test/install/list (WP-M1)"
+description = "Omega DVM plugin authoring tool: init/build/inspect/test/install/list (WP-M1, hardened WP-M2)"
 license = "GPL-3.0-or-later"
 
 # Detach from the Omega workspace: this is a standalone tool crate. The
-# validator logic is intentionally portable so WP-M2 can share it in the host.
+# validator logic lives in dvm-plugin-core (shared with the host by
+# construction — WP-M2 condition CH-01/F-02).
 [workspace]
 
 [dependencies]
@@ -17,6 +18,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 wasmi = "0.32"
+dvm-plugin-core = { path = "../dvm-plugin-core" }
 
 [profile.release]
 opt-level = 2

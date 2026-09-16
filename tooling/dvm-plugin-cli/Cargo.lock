@@ -184,6 +184,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dvm-plugin-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wasmi",
+]
+
+[[package]]
+name = "dvm-plugin-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "hex",
  "serde",
  "serde_json",

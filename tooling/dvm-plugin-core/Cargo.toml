@@ -1,0 +1,22 @@
+[package]
+name = "dvm-plugin-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared DVM plugin manifest model, validator, and catalog reader — used by dvm-plugin-cli and the Omega host (tool and host share one validator by construction)."
+license = "GPL-3.0-or-later"
+
+# Detach from the Omega workspace: standalone library crate. The CLI and the
+# host both depend on this crate by path so they cannot disagree (WP-M2
+# condition CH-01 / F-02).
+[workspace]
+
+[dependencies]
+anyhow = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+wasmi = "0.32"
+
+[profile.release]
+opt-level = 2
