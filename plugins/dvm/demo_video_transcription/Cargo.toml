@@ -1,0 +1,20 @@
+[package]
+name = "demo-video-transcription"
+version = "0.1.0"
+edition = "2021"
+description = "DVM plugin scaffolded from white-label-seed (WP-M1)"
+license = "GPL-3.0-or-later"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

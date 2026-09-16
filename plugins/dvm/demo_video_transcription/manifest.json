@@ -1,0 +1,83 @@
+{
+  "schema": "openagents.plugin/v0",
+  "name": "demo_video_transcription",
+  "version": "0.1.0",
+  "description": "Deterministic gateable video-transcription demo plugin (WP-M5a): DVM service identity carrier for the two-machine L-402 demo. PureCompute text-stats envelope + service identity.",
+  "artifact_path": "plugin.wasm",
+  "artifact_digest": "sha256:1cb9b1cf9eed1ab225517dbbd960764b8d2e8a3826d880e63c0fc379766c42eb",
+  "abi_entry": "_start",
+  "abi_alloc": "allocate",
+  "input_schema": {
+    "properties": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "text"
+    ],
+    "type": "object"
+  },
+  "output_schema": {
+    "properties": {
+      "chars": {
+        "type": "integer"
+      },
+      "lines": {
+        "type": "integer"
+      },
+      "service": {
+        "properties": {
+          "kind": {
+            "type": "integer"
+          },
+          "npub": {
+            "type": "string"
+          },
+          "relays": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "words": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "words",
+      "lines",
+      "chars",
+      "service"
+    ],
+    "type": "object"
+  },
+  "mounts": [],
+  "hosts": [],
+  "timeout_ms": 1000,
+  "memory_max_mib": 64,
+  "omega": {
+    "schema": "omega.dvm-plugin/delta-v0",
+    "capabilities": [
+      "video/transcription",
+      "dvm/service-identity"
+    ],
+    "cost_hint_msats": 21000,
+    "service": {
+      "kind": 5900,
+      "npub": "a722bee76dba3e94be00ff5e755d8adbc2a7cc3ec58f68dd60e88536f61282a2",
+      "relays": [
+        "wss://relay.example.com"
+      ]
+    },
+    "tier": "PureCompute",
+    "sdk": {
+      "abi": "omega-plugin-abi-v0",
+      "lang": "rust",
+      "target": "wasm32-unknown-unknown"
+    }
+  }
+}

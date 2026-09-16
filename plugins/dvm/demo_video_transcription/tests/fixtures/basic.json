@@ -1,0 +1,1 @@
+{ "input": { "text": "hello world\nsecond line" }, "expect": { "words": 4, "lines": 2, "chars": 23 } }

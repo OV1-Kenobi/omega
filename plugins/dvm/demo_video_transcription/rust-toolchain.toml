@@ -1,0 +1,8 @@
+# F-14 toolchain pin (WP-M4): the white-label template builds under a
+# PINNED Rust compiler so duplicators produce reproducible digests regardless
+# of the machine's default toolchain. Recorded pin: Rust 1.95.0.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt"]
+targets = ["wasm32-unknown-unknown"]

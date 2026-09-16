@@ -1,0 +1,22 @@
+[package]
+name = "dvm-conformance-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Omega ABI v0 conformance harness: runs a template plugin against ANY runtime implementing the declared Omega ABI v0 (decision 13, agent track)"
+license = "GPL-3.0-or-later"
+
+# Detach from the Omega workspace: standalone tool crate (same pattern as
+# dvm-plugin-cli / dvm-plugin-core / dvm-plugin-host). Shares the validator
+# with the tooling via dvm-plugin-core by path.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasmi = "0.32"
+dvm-plugin-core = { path = "../dvm-plugin-core" }
+
+[profile.release]
+opt-level = 2
