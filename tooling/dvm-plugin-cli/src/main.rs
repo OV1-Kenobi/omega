@@ -21,12 +21,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use dvm_plugin_core::{
-    CatalogEntry, artifact_bytes, catalog_dir, confine_artifact_path, list_catalog, load_manifest,
-    sha256_hex, validate_json_schema, validate_plugin, verify_abi_signatures,
+    CatalogEntry, Manifest, artifact_bytes, catalog_dir, confine_artifact_path, list_catalog,
+    load_manifest, load_module, sha256_hex, validate_json_schema, validate_plugin,
+    verify_abi_signatures,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
-use wasmi::{Linker, Store};
+use wasmi::{Engine, Linker, Module, Store};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -57,6 +58,29 @@ enum Commands {
     Install { dir: PathBuf },
     /// List installed plugins in the catalog.
     List,
+    /// Publish with a real service identity (F-04): write the identity into
+    /// the manifest AND the plugin source's single substitution point, then
+    /// rebuild + re-pin the digest, then run the mandatory identity-consistency
+    /// assertion. Fails the publish if the pinned artifact's reported identity
+    /// does not match the manifest's omega.service, or if the identity is the
+    /// all-zero placeholder.
+    Publish {
+        dir: PathBuf,
+        /// DVM service npub: exactly 64 hex characters (public, never a secret).
+        #[arg(long)]
+        npub: String,
+        /// Nostr relay URL (wss:// or ws://). Repeatable; at least one required.
+        #[arg(long)]
+        relay: Vec<String>,
+        /// NIP-90 job-request kind this DVM serves (default 5900).
+        #[arg(long, default_value_t = 5900)]
+        kind: u32,
+    },
+    /// Re-run the mandatory identity-consistency assertion on an existing
+    /// build (no writes, no rebuild): the pinned artifact's reported
+    /// `result.service` must equal the manifest's `omega.service` and the npub
+    /// must not be the placeholder. Fails (exit 1) on any inconsistency.
+    VerifyIdentity { dir: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -68,6 +92,8 @@ fn main() -> Result<()> {
         Commands::Test { dir } => cmd_test(&dir),
         Commands::Install { dir } => cmd_install(&dir),
         Commands::List => cmd_list(),
+        Commands::Publish { dir, npub, relay, kind } => cmd_publish(&dir, &npub, &relay, kind),
+        Commands::VerifyIdentity { dir } => cmd_verify_identity(&dir),
     }
 }
 
@@ -95,6 +121,99 @@ serde_json = { version = "1", default-features = false, features = ["alloc"] }
 opt-level = "s"
 lto = true
 panic = "abort"
+"#;
+
+// F-14 (WP-M2b security review): the scaffold ships a rust-toolchain.toml so
+// duplicators build under the SAME pinned compiler as the Omega repo (Rust
+// 1.95.0) regardless of the machine's default toolchain. Digests are then
+// reproducible for the same source + toolchain.
+const TEMPLATE_RUST_TOOLCHAIN: &str = r#"# F-14 toolchain pin (WP-M4): the white-label template builds under a
+# PINNED Rust compiler so duplicators produce reproducible digests regardless
+# of the machine's default toolchain. Recorded pin: Rust 1.95.0.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt"]
+targets = ["wasm32-unknown-unknown"]
+"#;
+
+// The template's SINGLE service-identity substitution point (F-04 / WP-M2b
+// design §4.2). `dvm-plugin-cli publish` rewrites this file from the
+// manifest's omega.service block and rebuilds. Hand-editing is unsupported.
+const TEMPLATE_SERVICE_IDENTITY_RS: &str = r#"// GENERATED FILE — owned by `dvm-plugin-cli publish`. Do not hand-edit.
+//
+// This file is the template's SINGLE service-identity substitution point
+// (WP-M4 F-04; WP-M2b service-identity design §4.2). `dvm-plugin-cli
+// publish` rewrites this file from the manifest's `omega.service` block and
+// rebuilds the artifact, so the manifest value and the compiled-in value
+// cannot diverge. Hand-editing is unsupported.
+//
+// The placeholder below is the TEMPLATE default. A published artifact never
+// carries the all-zero placeholder npub: `dvm-plugin-cli publish` refuses it
+// and `dvm-plugin-cli verify-identity` fails it.
+
+pub const SERVICE_NPUB: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+pub const SERVICE_RELAYS: &[&str] = &[];
+pub const SERVICE_KIND: u32 = 5900;
+"#;
+
+// The white-label duplicator README (identical in spirit to the repo template
+// README at plugins/dvm/white-label-seed/README.md). Documented in WP-M4:
+// what a duplicator changes (capability name, tools, pricing, service
+// identity) and what must NOT change (permission tier, no secrets, ABI v0).
+const TEMPLATE_README: &str = r#"# <name> — DVM Plugin (white-label template duplicate)
+
+Created by `dvm-plugin-cli init` from the Omega white-label DVM template.
+
+## What to change before publishing
+
+1. **Capability name** — already set at `init` (this directory + manifest name).
+   To rename, change `manifest.json` -> `name` AND `Cargo.toml` -> `package.name`.
+2. **Tools / capability tags** — `manifest.json` -> `omega.capabilities`
+   (e.g. `text/stats`). Tags drive discovery and the `capability` tool's `find`.
+3. **Pricing** — `manifest.json` -> `omega.cost_hint_msats` (0 = free hint;
+   never a commitment; the L-402 gate is the real payment path).
+4. **Description** — `manifest.json` -> `description` (used verbatim in the
+   catalog and the DVM service listing).
+5. **Service identity** — publish-time, pipeline-owned:
+
+   ```sh
+   dvm-plugin-cli publish <dir> --npub <64-hex> --relay wss://relay.example [--relay wss://...] [--kind 5900]
+   ```
+
+   `publish` writes the identity into `manifest.json` -> `omega.service`,
+   rewrites `src/service_identity.rs` (the single substitution point) with the
+   SAME identity, rebuilds + re-pins the digest, and runs the mandatory
+   identity-consistency assertion (artifact-reported identity == manifest
+   identity; mismatch fails publish). `dvm-plugin-cli verify-identity <dir>`
+   re-runs the assertion on an existing build.
+
+6. **Plugin logic + schemas** — `src/lib.rs` (`run`) and `manifest.json`
+   `input_schema`/`output_schema`. Keep the ABI exports untouched.
+
+## What must NOT change
+
+- **Permission tier** — stay PureCompute: `mounts: []`, `hosts: []`, zero
+  imports, no WASI, no network. The host refuses anything else.
+- **No secrets** — manifest, Wasm, and service identity contain PUBLIC data
+  only. Never put credentials or keys in the artifact or the listing.
+- **ABI v0** — do not change `abi_entry`/`abi_alloc`/`memory`/result-header
+  convention; the host's shared validator and ABI policy gate enforce it.
+- **`omega.sdk`** — leave `lang`/`target`/`abi` as the template declares them.
+- **Digest pinning** — `artifact_digest` is written by `build`, never by hand.
+
+## Build / pin / inspect / test / install
+
+```sh
+dvm-plugin-cli build <dir>
+dvm-plugin-cli inspect <dir>
+dvm-plugin-cli test <dir>
+dvm-plugin-cli install <dir>
+dvm-plugin-cli list
+```
+
+Toolchain: Rust 1.95.0 pinned by `rust-toolchain.toml` (F-14); builds are
+offline with `--locked`.
 "#;
 
 const TEMPLATE_LIB_RS: &str = include_str!("template_lib.rs");
@@ -131,24 +250,58 @@ fn cmd_init(name: &str) -> Result<()> {
     let cargo_toml = TEMPLATE_CARGO_TOML.replace("{{pkg_name}}", &pkg_name);
     fs::write(dir.join("Cargo.toml"), cargo_toml)?;
     fs::write(src_dir.join("lib.rs"), TEMPLATE_LIB_RS)?;
+    // F-04 single substitution point (generated-style template placeholder;
+    // `publish` rewrites it from the manifest's omega.service block).
+    fs::write(src_dir.join("service_identity.rs"), TEMPLATE_SERVICE_IDENTITY_RS)?;
+    // F-14 toolchain pin: scaffolded duplicates build under Rust 1.95.0.
+    fs::write(dir.join("rust-toolchain.toml"), TEMPLATE_RUST_TOOLCHAIN)?;
+    // White-label duplicator README (what to change / what must NOT change).
+    fs::write(dir.join("README.md"), TEMPLATE_README.replace("<name>", &normalized))?;
     fs::write(
         dir.join("manifest.json"),
         serde_json::to_string_pretty(&serde_json::json!({
             "schema": "openagents.plugin/v0",
             "name": normalized,
             "version": "0.1.0",
-            "description": "DVM plugin scaffolded from the white-label seed (WP-M1).",
+            "description": "DVM plugin scaffolded from the white-label seed (WP-M1): text statistics + DVM service identity.",
             "artifact_path": "plugin.wasm",
             "artifact_digest": "sha256:<set-by-build>",
             "abi_entry": "_start",
             "abi_alloc": "allocate",
             "input_schema": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] },
-            "output_schema": { "type": "object", "properties": { "words": { "type": "integer" }, "lines": { "type": "integer" }, "chars": { "type": "integer" } }, "required": ["words", "lines", "chars"] },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "words": { "type": "integer" },
+                    "lines": { "type": "integer" },
+                    "chars": { "type": "integer" },
+                    "service": {
+                        "type": "object",
+                        "properties": {
+                            "npub": { "type": "string" },
+                            "relays": { "type": "array", "items": { "type": "string" } },
+                            "kind": { "type": "integer" }
+                        }
+                    }
+                },
+                "required": ["words", "lines", "chars", "service"]
+            },
             "mounts": [],
             "hosts": [],
             "timeout_ms": 1000,
             "memory_max_mib": 64,
-            "omega": { "schema": "omega.dvm-plugin/delta-v0", "capabilities": ["text/stats"], "cost_hint_msats": 0, "tier": "PureCompute", "sdk": { "lang": "rust", "target": "wasm32-unknown-unknown", "abi": "omega-plugin-abi-v0" } }
+            "omega": {
+                "schema": "omega.dvm-plugin/delta-v0",
+                "capabilities": ["text/stats", "dvm/service-identity"],
+                "cost_hint_msats": 0,
+                "service": {
+                    "npub": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "relays": [],
+                    "kind": 5900
+                },
+                "tier": "PureCompute",
+                "sdk": { "lang": "rust", "target": "wasm32-unknown-unknown", "abi": "omega-plugin-abi-v0" }
+            }
         }))
         .with_context(|| "serialize manifest template")?,
     )?;
@@ -320,77 +473,13 @@ fn cmd_test(dir: &Path) -> Result<()> {
             )
         })?;
 
-        let mut store = Store::new(&engine, ());
-        let linker = Linker::<()>::new(&engine);
-        let instance_pre = linker
-            .instantiate(&mut store, &module)
-            .map_err(|e| anyhow!("instantiate failed: {e}"))?;
-        let instance = instance_pre
-            .start(&mut store)
-            .map_err(|e| anyhow!("start failed: {e}"))?;
-
-        let alloc = instance.get_typed_func::<i32, i32>(&mut store, &manifest.abi_alloc)?;
-        let entry = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, &manifest.abi_entry)?;
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| anyhow!("module does not export 'memory'"))?;
-
-        let input_json = serde_json::to_vec(input)?;
-        let len = input_json.len() as i32;
-        let ptr = alloc
-            .call(&mut store, len)
-            .map_err(|e| anyhow!("allocate failed: {e}"))?;
-        if ptr == 0 {
-            bail!("allocate returned 0 (out of memory) for fixture {}", fixture_path.display());
-        }
-        memory
-            .write(&mut store, ptr as usize, &input_json)
-            .map_err(|e| anyhow!("memory.write failed: {e}"))?;
-
-        let header_ptr = entry
-            .call(&mut store, (ptr, len))
-            .map_err(|e| anyhow!("_start trapped: {e}"))?;
-        let mut header = [0u8; 8];
-        memory
-            .read(&store, header_ptr as usize, &mut header)
-            .map_err(|e| anyhow!("memory.read header failed: {e}"))?;
-        let out_ptr = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-        let out_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-        if out_len == 0 {
-            let mut err_body = [0u8; 512];
-            let read_len = err_body.len().min(memory.data(&store).len().saturating_sub(out_ptr));
-            memory
-                .read(&store, out_ptr, &mut err_body[..read_len])
-                .ok();
-            let err_text = String::from_utf8_lossy(&err_body[..read_len]);
-            bail!(
-                "fixture {}: plugin returned zero-length result (error body: {})",
-                fixture_path.display(),
-                err_text
-            );
-        }
-        let mut out_buf = vec![0u8; out_len];
-        memory
-            .read(&store, out_ptr, &mut out_buf)
-            .map_err(|e| anyhow!("memory.read output failed: {e}"))?;
-        let output: serde_json::Value = serde_json::from_slice(&out_buf)
-            .with_context(|| format!("plugin output is not valid JSON (fixture {})", fixture_path.display()))?;
+        let (output, out_len, memory_used) = run_module_once(&engine, &module, manifest, input, memory_max)
+            .with_context(|| format!("executing fixture {}", fixture_path.display()))?;
 
         // F-07: plugin output must satisfy the manifest's output_schema.
         validate_json_schema(&output, &manifest.output_schema).with_context(|| {
             format!("fixture {} output fails output_schema", fixture_path.display())
         })?;
-
-        let memory_used = memory.data(&store).len();
-        if memory_used > memory_max {
-            bail!(
-                "fixture {}: memory {} exceeds memory_max_mib {}",
-                fixture_path.display(),
-                memory_used,
-                manifest.memory_max_mib
-            );
-        }
 
         let mut ok = true;
         if let Some(expect) = expect {
@@ -443,6 +532,308 @@ fn cmd_test(dir: &Path) -> Result<()> {
         bail!("test: {failures} fixture(s) failed");
     }
     println!("test: OK — {} fixture(s) passed", fixtures.len());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared single-execution helper (wasmi test runtime)
+// ---------------------------------------------------------------------------
+
+/// Run one JSON input against a loaded, ABI-verified module and return
+/// `(output_json, out_len, memory_used)`. Shared by the `test` fixture loop
+/// and the F-04 publish identity assertion so both exercise the identical
+/// execution path (instantiate -> allocate -> write input -> `_start` -> read
+/// result header -> read output).
+fn run_module_once(
+    engine: &Engine,
+    module: &Module,
+    manifest: &Manifest,
+    input: &serde_json::Value,
+    memory_max: usize,
+) -> Result<(serde_json::Value, usize, usize)> {
+    let mut store = Store::new(engine, ());
+    let linker = Linker::<()>::new(engine);
+    let instance_pre = linker
+        .instantiate(&mut store, module)
+        .map_err(|e| anyhow!("instantiate failed: {e}"))?;
+    let instance = instance_pre
+        .start(&mut store)
+        .map_err(|e| anyhow!("start failed: {e}"))?;
+
+    let alloc = instance.get_typed_func::<i32, i32>(&mut store, &manifest.abi_alloc)?;
+    let entry = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, &manifest.abi_entry)?;
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .ok_or_else(|| anyhow!("module does not export 'memory'"))?;
+
+    let input_json = serde_json::to_vec(input)?;
+    let len = input_json.len() as i32;
+    let ptr = alloc
+        .call(&mut store, len)
+        .map_err(|e| anyhow!("allocate failed: {e}"))?;
+    if ptr == 0 {
+        bail!("allocate returned 0 (out of memory)");
+    }
+    memory
+        .write(&mut store, ptr as usize, &input_json)
+        .map_err(|e| anyhow!("memory.write failed: {e}"))?;
+
+    let header_ptr = entry
+        .call(&mut store, (ptr, len))
+        .map_err(|e| anyhow!("_start trapped: {e}"))?;
+    let mut header = [0u8; 8];
+    memory
+        .read(&store, header_ptr as usize, &mut header)
+        .map_err(|e| anyhow!("memory.read header failed: {e}"))?;
+    let out_ptr = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    let out_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    if out_len == 0 {
+        let mut err_body = [0u8; 512];
+        let read_len = err_body.len().min(memory.data(&store).len().saturating_sub(out_ptr));
+        memory
+            .read(&store, out_ptr, &mut err_body[..read_len])
+            .ok();
+        let err_text = String::from_utf8_lossy(&err_body[..read_len]);
+        bail!("plugin returned zero-length result (error body: {})", err_text);
+    }
+    let mut out_buf = vec![0u8; out_len];
+    memory
+        .read(&store, out_ptr, &mut out_buf)
+        .map_err(|e| anyhow!("memory.read output failed: {e}"))?;
+    let output: serde_json::Value = serde_json::from_slice(&out_buf)
+        .with_context(|| "plugin output is not valid JSON")?;
+
+    let memory_used = memory.data(&store).len();
+    if memory_used > memory_max {
+        bail!(
+            "memory {} exceeds memory_max_mib {}",
+            memory_used,
+            manifest.memory_max_mib
+        );
+    }
+    Ok((output, out_len, memory_used))
+}
+
+/// Execute a plugin with a JSON input through the shared wasmi test runtime
+/// after the FULL shared validator (digest, imports, tier, schemas, ABI
+/// signatures). Returns the plugin's structured answer.
+fn execute_plugin_value(
+    dir: &Path,
+    manifest: &Manifest,
+    input: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let _info = validate_plugin(dir)?;
+    let bytes = artifact_bytes(dir, manifest)?;
+    let (engine, module, _, exports) = load_module(&bytes)?;
+    verify_abi_signatures(manifest, &exports)?;
+    let memory_max = (manifest.memory_max_mib as usize) * 1024 * 1024;
+    let (output, _, _) = run_module_once(&engine, &module, manifest, input, memory_max)?;
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// F-04 service-identity pipeline (WP-M4): publish + verify-identity
+// ---------------------------------------------------------------------------
+
+/// Validate publish-time identity inputs. `npub` is exactly 64 hex chars and
+/// NOT the all-zero placeholder; at least one `wss://`/`ws://` relay is
+/// required; `kind` is in the NIP-90 job-request range 5000-5999.
+fn validate_identity_inputs(npub: &str, relays: &[String], kind: u32) -> Result<()> {
+    let npub = npub.trim();
+    if npub.len() != 64 || !npub.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!(
+            "--npub must be exactly 64 hex characters (got {} characters)",
+            npub.len()
+        );
+    }
+    if npub.chars().all(|c| c == '0') {
+        bail!("--npub is the all-zero placeholder; a real DVM npub is required to publish");
+    }
+    if relays.is_empty() {
+        bail!("at least one --relay is required (a published DVM must be reachable on a relay)");
+    }
+    for r in relays {
+        if !(r.starts_with("wss://") || r.starts_with("ws://")) {
+            bail!("--relay '{}' must be a wss:// or ws:// URL", r);
+        }
+        if r.contains('"') || r.contains('\\') || r.contains('\n') || r.contains('\r') {
+            bail!(
+                "--relay '{}' contains characters that cannot be embedded in the plugin source; use a plain URL",
+                r
+            );
+        }
+    }
+    if !(5000..=5999).contains(&kind) {
+        bail!(
+            "--kind {} is outside the NIP-90 job-request kind range 5000-5999",
+            kind
+        );
+    }
+    Ok(())
+}
+
+/// Write the SAME identity into the plugin source's single substitution point
+/// (`src/service_identity.rs`). This is the step that makes the manifest value
+/// the input to the artifact rather than an independent compiled-in constant
+/// (F-04 / WP-M2b design §4.2).
+fn write_service_identity_rs(dir: &Path, npub: &str, relays: &[String], kind: u32) -> Result<()> {
+    let rust_str = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let npub = npub.trim().to_lowercase();
+    let relays_lit: Vec<String> = relays.iter().map(|r| rust_str(r)).collect();
+    let content = format!(
+        "// GENERATED FILE — owned by `dvm-plugin-cli publish`. Do not hand-edit.\n\
+         //\n\
+         // Rewritten by the publish pipeline from the manifest's `omega.service`\n\
+         // block (F-04 single substitution point). The manifest value and the\n\
+         // compiled-in value are the same publish-time input.\n\n\
+         pub const SERVICE_NPUB: &str = {};\n\
+         pub const SERVICE_RELAYS: &[&str] = &[{}];\n\
+         pub const SERVICE_KIND: u32 = {};\n",
+        rust_str(&npub),
+        relays_lit.join(", "),
+        kind
+    );
+    let dest = dir.join("src").join("service_identity.rs");
+    fs::write(&dest, content)
+        .with_context(|| format!("cannot write {}", dest.display()))?;
+    Ok(())
+}
+
+/// Mandatory identity-consistency assertion: the manifest's `omega.service`
+/// (expected) must equal the pinned artifact's reported `result.service`
+/// (reported) on npub, relays, and kind. Any mismatch FAILS the publish.
+fn assert_identity_consistent(
+    expected: &serde_json::Value,
+    reported: &serde_json::Value,
+) -> Result<()> {
+    let mut problems = Vec::new();
+    for field in ["npub", "relays", "kind"] {
+        let e = expected.get(field).cloned().unwrap_or(serde_json::Value::Null);
+        let r = reported.get(field).cloned().unwrap_or(serde_json::Value::Null);
+        if e != r {
+            problems.push(format!("{field}: manifest={e} artifact={r}"));
+        }
+    }
+    if !problems.is_empty() {
+        bail!(
+            "identity-consistency assertion FAILED: {} — the pinned artifact does not report the \
+             manifest's omega.service (F-04). Re-run `dvm-plugin-cli publish` to rebuild the \
+             identity-bearing artifact.",
+            problems.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// No placeholder identity may reach a published artifact: `omega.service.npub`
+/// must be a real (non-empty, non-all-zero) npub.
+fn assert_not_placeholder(service: &serde_json::Value) -> Result<()> {
+    let npub = service.get("npub").and_then(|v| v.as_str()).unwrap_or("");
+    if npub.is_empty() || npub.chars().all(|c| c == '0') {
+        bail!(
+            "omega.service.npub is the all-zero placeholder; no placeholder identity may reach a \
+             published artifact (F-04). Run `dvm-plugin-cli publish` with a real npub."
+        );
+    }
+    Ok(())
+}
+
+/// Execute the built artifact and return its reported `result.service`.
+fn execute_and_report_service(dir: &Path, manifest: &Manifest) -> Result<serde_json::Value> {
+    let output = execute_plugin_value(dir, manifest, &serde_json::json!({ "text": "" }))?;
+    let service = output.get("service").cloned().ok_or_else(|| {
+        anyhow!(
+            "plugin output has no 'service' object (the dvm/service-identity capability is \
+             required for marketplace plugins)"
+        )
+    })?;
+    Ok(service)
+}
+
+/// Publish pipeline (F-04 / WP-M2b design §4.1), ordered and mandatory:
+/// 1. operator supplies identity -> 2. manifest write -> 3. source substitution
+/// -> 4. build + pin -> 5. mandatory identity-consistency assertion (fails the
+/// publish on mismatch) -> 6. placeholder guard.
+fn cmd_publish(dir: &Path, npub: &str, relays: &[String], kind: u32) -> Result<()> {
+    validate_identity_inputs(npub, relays, kind)?;
+
+    // 1/2. Load the template manifest and write the identity into
+    // `omega.service` (the discovery source of truth).
+    let mut manifest = load_manifest(dir)?;
+    {
+        let omega = manifest.omega.as_mut().ok_or_else(|| {
+            anyhow!(
+                "manifest has no omega delta block; publish requires the white-label template \
+                 shape (omega.schema + omega.service)"
+            )
+        })?;
+        omega.service = Some(serde_json::json!({
+            "npub": npub.trim().to_lowercase(),
+            "relays": relays,
+            "kind": kind
+        }));
+    }
+    let manifest_path = dir.join("manifest.json");
+    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+        .with_context(|| format!("cannot write {}", manifest_path.display()))?;
+
+    // 3. Substitute the SAME identity into the plugin source at the single
+    // substitution point.
+    write_service_identity_rs(dir, npub, relays, kind)?;
+
+    // 4. Rebuild + pin: the artifact now carries the identity-bearing bytes,
+    // and the digest is re-pinned over them.
+    cmd_build(dir)?;
+
+    // 5. Mandatory identity-consistency assertion on the pinned artifact.
+    let manifest = load_manifest(dir)?;
+    let expected = manifest
+        .omega
+        .as_ref()
+        .and_then(|o| o.service.as_ref())
+        .ok_or_else(|| anyhow!("omega.service missing after publish write"))?;
+    let reported = execute_and_report_service(dir, &manifest)?;
+    assert_identity_consistent(expected, &reported)?;
+
+    // 6. Placeholder guard: the artifact reports a real npub.
+    assert_not_placeholder(&reported)?;
+
+    let npub = reported.get("npub").and_then(|v| v.as_str()).unwrap_or("");
+    println!(
+        "publish: OK — {} v{} pinned {}",
+        manifest.name, manifest.version, manifest.artifact_digest
+    );
+    println!(
+        "publish: identity consistent (manifest omega.service == artifact-reported service) \
+         npub={} kind={} relays={:?}",
+        npub,
+        reported.get("kind").cloned().unwrap_or_default(),
+        reported.get("relays").cloned().unwrap_or_default(),
+    );
+    Ok(())
+}
+
+/// Assertion-only re-verification on an existing build (no writes, no
+/// rebuild). Fail-closed: exit 1 on any inconsistency or placeholder.
+fn cmd_verify_identity(dir: &Path) -> Result<()> {
+    let manifest = load_manifest(dir)?;
+    let expected = manifest
+        .omega
+        .as_ref()
+        .and_then(|o| o.service.as_ref())
+        .ok_or_else(|| {
+            anyhow!("manifest has no omega.service block; not a white-label template plugin")
+        })?;
+    assert_not_placeholder(expected)?;
+    let reported = execute_and_report_service(dir, &manifest)?;
+    assert_identity_consistent(expected, &reported)?;
+    let npub = reported.get("npub").and_then(|v| v.as_str()).unwrap_or("");
+    println!(
+        "verify-identity: OK — artifact-reported service identity matches manifest omega.service \
+         (npub={})",
+        npub
+    );
     Ok(())
 }
 

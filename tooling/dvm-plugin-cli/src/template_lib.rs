@@ -1,5 +1,6 @@
-//! White-label seed plugin template (WP-M1) — embedded in dvm-plugin-cli
-//! `init` scaffolding.
+//! White-label seed plugin template (WP-M1/WP-M4) — embedded in dvm-plugin-cli
+//! `init` scaffolding. KEEP IN SYNC with
+//! `plugins/dvm/white-label-seed/src/lib.rs` (the repo template source).
 //!
 //! Implements the Omega Plugin ABI v0 (`allocate` + `_start`) as a PureCompute
 //! plugin: no filesystem, no network, no ambient imports. Stateless — a fresh
@@ -12,6 +13,14 @@
 //!   `[ptr, ptr+len)`, computes, writes the JSON output, and returns a pointer
 //!   to an 8-byte result header `[out_ptr: i32, out_len: i32]` in linear
 //!   memory. A header with `out_len == 0` signals an execution error.
+//!
+//! Service identity (F-04): the DVM identity the plugin reports comes from
+//! `service_identity.rs` — the template's SINGLE machine-substitutable
+//! substitution point, owned by `dvm-plugin-cli publish`. The manifest's
+//! `omega.service` block and this compiled-in constant are produced from the
+//! same publish-time input, and the publish pipeline's identity-consistency
+//! assertion proves they match in the pinned artifact. Hand-editing
+//! `service_identity.rs` is unsupported.
 
 #![no_std]
 #![no_main]
@@ -154,13 +163,18 @@ struct ServiceIdentity {
     kind: u32,
 }
 
-const SERVICE_NPUB: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-const SERVICE_RELAYS: &[&str] = &[];
-const SERVICE_KIND: u32 = 5900;
+// ---------------------------------------------------------------------------
+// Single service-identity substitution point (F-04)
+// ---------------------------------------------------------------------------
 
-/// The white-label seed's service identity is a placeholder. The marketplace
-/// (WP-M4) replaces it with the publisher's real DVM npub at publish time;
-/// the manifest's `omega.service` block is the source of truth.
+// The DVM service identity lives in exactly one machine-substitutable place:
+// the generated file below. The publish pipeline (`dvm-plugin-cli publish`)
+// rewrites this file from the manifest's `omega.service` block, then rebuilds
+// and pins the artifact, so the compiled-in identity and the manifest identity
+// are the same publish-time input. The mandatory identity-consistency
+// assertion (`dvm-plugin-cli verify-identity`) proves it in the artifact.
+include!("service_identity.rs");
+
 const SERVICE: ServiceIdentity = ServiceIdentity {
     npub: SERVICE_NPUB,
     relays: SERVICE_RELAYS,

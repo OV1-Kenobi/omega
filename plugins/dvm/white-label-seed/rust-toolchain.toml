@@ -1,0 +1,15 @@
+# F-14 toolchain pin (WP-M2b security review condition, WP-M4): the white-label
+# template builds under a PINNED Rust compiler so duplicators produce
+# reproducible digests regardless of the machine's default toolchain.
+#
+# dvm-plugin-cli `init` scaffolds copy this file into every duplicate. The
+# repo root rust-toolchain.toml (Omega) pins the same version; this file makes
+# the pin travel with the template when a duplicator copies the plugin
+# directory outside the repo.
+#
+# Recorded pin: Rust 1.95.0 (F-14; matches the Omega repo pin).
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt"]
+targets = ["wasm32-unknown-unknown"]
