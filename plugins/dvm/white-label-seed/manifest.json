@@ -1,0 +1,81 @@
+{
+  "schema": "openagents.plugin/v0",
+  "name": "white_label_seed",
+  "version": "0.1.0",
+  "description": "Minimal DVM white-label seed: returns text statistics (words, lines, chars) and its DVM service identity placeholder for marketplace discovery.",
+  "artifact_path": "plugin.wasm",
+  "artifact_digest": "sha256:f83da24b74d55a37b53f3a7137c99ae110da7b2eb51bf6b10a7159180b86b7e9",
+  "abi_entry": "_start",
+  "abi_alloc": "allocate",
+  "input_schema": {
+    "properties": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "text"
+    ],
+    "type": "object"
+  },
+  "output_schema": {
+    "properties": {
+      "chars": {
+        "type": "integer"
+      },
+      "lines": {
+        "type": "integer"
+      },
+      "service": {
+        "properties": {
+          "kind": {
+            "type": "integer"
+          },
+          "npub": {
+            "type": "string"
+          },
+          "relays": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "words": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "words",
+      "lines",
+      "chars",
+      "service"
+    ],
+    "type": "object"
+  },
+  "mounts": [],
+  "hosts": [],
+  "timeout_ms": 1000,
+  "memory_max_mib": 64,
+  "omega": {
+    "schema": "omega.dvm-plugin/delta-v0",
+    "capabilities": [
+      "text/stats",
+      "dvm/service-identity"
+    ],
+    "cost_hint_msats": 0,
+    "service": {
+      "kind": 5900,
+      "npub": "0000000000000000000000000000000000000000000000000000000000000000",
+      "relays": []
+    },
+    "tier": "PureCompute",
+    "sdk": {
+      "abi": "omega-plugin-abi-v0",
+      "lang": "rust",
+      "target": "wasm32-unknown-unknown"
+    }
+  }
+}

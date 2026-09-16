@@ -1,0 +1,3 @@
+# The pinned plugin artifact is part of this template: manifest.json's
+# artifact_digest commits to these exact bytes. Do not ignore it.
+!plugin.wasm

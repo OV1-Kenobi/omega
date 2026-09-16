@@ -1,0 +1,22 @@
+[package]
+name = "white-label-seed"
+version = "0.1.0"
+edition = "2021"
+description = "DVM white-label seed plugin: PureCompute text statistics + service identity placeholder"
+license = "GPL-3.0-or-later"
+
+# Detach from the Omega workspace: this crate is built standalone for
+# wasm32-unknown-unknown by the dvm-plugin-cli `build` command.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

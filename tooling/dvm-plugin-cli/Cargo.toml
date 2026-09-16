@@ -1,0 +1,22 @@
+[package]
+name = "dvm-plugin-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Omega DVM plugin authoring tool: init/build/inspect/test/install/list (WP-M1)"
+license = "GPL-3.0-or-later"
+
+# Detach from the Omega workspace: this is a standalone tool crate. The
+# validator logic is intentionally portable so WP-M2 can share it in the host.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+wasmi = "0.32"
+
+[profile.release]
+opt-level = 2
