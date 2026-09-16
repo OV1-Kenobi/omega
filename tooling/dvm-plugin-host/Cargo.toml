@@ -1,0 +1,26 @@
+[package]
+name = "dvm-plugin-host"
+version = "0.1.0"
+edition = "2021"
+description = "Omega DVM plugin host: catalog discovery, capability tool surface, and wasmtime runtime with enforced memory/time bounds (WP-M2b)"
+license = "GPL-3.0-or-later"
+
+# Detach from the Omega workspace: standalone host crate. Shares the validator
+# with dvm-plugin-cli by construction through dvm-plugin-core (WP-M2 condition
+# CH-01/F-02 — the tool and the host cannot disagree).
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dvm-plugin-core = { path = "../dvm-plugin-core" }
+# wasmtime 36.0.12 vendored in the local cargo cache; offline build only.
+# Minimal feature set: runtime (Store/StoreLimits/fuel/epoch), cranelift (JIT),
+# std. Default features would require crates not in the offline cache
+# (wat, wasm-wave, fxprof-processed-profile, ittapi, wasmtime-internal-cache).
+wasmtime = { version = "=36.0.12", default-features = false, features = ["runtime", "cranelift", "std"] }
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,18 @@
+[package]
+name = "spin-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "DVM test fixture: CPU-bound spin loop for host time/fuel bound evidence (WP-M2b)"
+license = "GPL-3.0-or-later"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

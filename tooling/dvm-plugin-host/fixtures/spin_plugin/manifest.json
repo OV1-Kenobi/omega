@@ -1,0 +1,46 @@
+{
+  "schema": "openagents.plugin/v0",
+  "name": "spin_plugin",
+  "version": "0.1.0",
+  "description": "WP-M2b test fixture: CPU-bound spin loop used to prove host time/fuel bound enforcement. NOT a marketplace plugin.",
+  "artifact_path": "plugin.wasm",
+  "artifact_digest": "sha256:7a1e324b312a8e7dfb0f401a84200a287eb0cb8f703d6eeff7cca984a4441b1c",
+  "abi_entry": "_start",
+  "abi_alloc": "allocate",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "text"
+    ]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "never": {
+        "type": "string"
+      }
+    }
+  },
+  "mounts": [],
+  "hosts": [],
+  "timeout_ms": 200,
+  "memory_max_mib": 64,
+  "omega": {
+    "schema": "omega.dvm-plugin/delta-v0",
+    "capabilities": [
+      "test/spin"
+    ],
+    "cost_hint_msats": 0,
+    "tier": "PureCompute",
+    "sdk": {
+      "lang": "rust",
+      "target": "wasm32-unknown-unknown",
+      "abi": "omega-plugin-abi-v0"
+    }
+  }
+}

@@ -1,0 +1,3 @@
+# The pinned fixture artifact is part of the evidence: manifest.json's
+# artifact_digest commits to these exact bytes. Do not ignore it.
+!plugin.wasm
