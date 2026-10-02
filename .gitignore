@@ -46,6 +46,9 @@ crates/docs_preprocessor/actions.json
 .env.*.local
 .env.secret.toml
 
+# Backup files never enter git (Livingry Standard D)
+*.bak-*
+
 # `nix build` output
 /result
 

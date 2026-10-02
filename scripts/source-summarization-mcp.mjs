@@ -7,6 +7,13 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createCredentialStoreSigner } from "./source-summarization-signer.mjs";
+import {
+  acquireLock,
+  updateLockfile,
+  deleteLockfile,
+  startHeartbeat,
+  setQuiet,
+} from "./lib/singleton-guard.mjs";
 
 export const PROTOCOL_VERSION = "2025-11-25";
 export const SERVER_NAME = "omega-source-summarization";
@@ -1278,4 +1285,49 @@ export function runStdio(server = createServer({ signer: createCredentialStoreSi
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (isMain) runStdio();
+if (isMain) {
+  // Singleton guard (WP2 wiring): this file is BOTH the entry point and the
+  // server (OpenCode spawns it directly), so the guard runs at startup HERE,
+  // not inside runStdio — runStdio stays import-safe for the test suite. A
+  // healthy instance already holding the lock means another window runs this
+  // server: exit 42 (reuse protocol). Info logging is quiet by default because
+  // the MCP server's stderr is load-bearing (the test suite asserts it stays
+  // empty); set SINGLETON_GUARD_VERBOSE=1 to see routine guard info. Warnings
+  // always surface.
+  setQuiet(process.env.SINGLETON_GUARD_VERBOSE !== "1");
+  const SERVICE = "source-summarization-mcp";
+  const lock = await acquireLock(SERVICE);
+  if (!lock.acquired && !lock.degraded) {
+    console.error(
+      `source-summarization-mcp: singleton lock held by PID ${lock.existingLock?.pid ?? "unknown"}; exiting for reuse (code 42)`,
+    );
+    process.exit(42);
+  }
+  let lockPath = lock.lockPath;
+  let stopHeartbeat = null;
+  if (lockPath) {
+    await updateLockfile(lockPath, { pid: process.pid });
+    stopHeartbeat = startHeartbeat(lockPath);
+  }
+  const shutdown = async () => {
+    if (stopHeartbeat) stopHeartbeat();
+    if (lockPath) {
+      try {
+        await deleteLockfile(lockPath);
+      } catch {
+        // best-effort release; crash-path stale locks self-heal on next acquire
+      }
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => {
+    void shutdown();
+  });
+  process.on("SIGINT", () => {
+    void shutdown();
+  });
+  process.stdin.on("end", () => {
+    void shutdown();
+  });
+  runStdio();
+}
